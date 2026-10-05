@@ -26,6 +26,10 @@ iOSの画面時間制御、AppleのFamily Controls配布許可、広告配信SDK
 
 使用状況へのアクセスが未許可でも、広告表示や別の権限付与を要求せず、制御が動かないことを画面に示します。
 
+設定、選択アプリ、日ごとの記録、休憩の終了時刻はアプリ専用の保存先へ書き込みます。一時ファイルの書き込みと同期が成功した後に置き換えるため、途中で終了しても以前の正常な記録を残します。休憩中に日付が変わっても、元の休憩時間を短くしません。
+
+取得するのはAndroidが集計した前面利用時間です。動画を再生していた時間そのものではありません。OSが集計範囲を日単位へ広げる場合があるため、厳密な視聴時間の判定には別の計測実装が必要です。
+
 ## Androidの仕様資料
 
 - [UsageStatsManager](https://developer.android.com/reference/android/app/usage/UsageStatsManager)
@@ -41,7 +45,38 @@ PC上の画面プレビューは次のコマンドで起動します。
 cargo run --features desktop-preview --bin phone-friction-control-preview
 ```
 
-Android APKの作成にはAndroid NDKと `cargo-apk2` が必要です。配布用の署名鍵、広告SDK、APIキーはリポジトリへ置きません。
+Android APKはAndroid SDKのAAPT2、zipalign、apksignerとNDKで作成できます。配布用の署名鍵、広告SDK、APIキーはリポジトリへ置きません。
+
+### arm64の試用APKを作る
+
+Rustの `aarch64-linux-android` ターゲット、SDK Platform 36、Build Tools 36.1.0、NDK、JDKを用意します。以下はPowerShellでの一回の作成例です。`$out` は新しい作業用フォルダー、`$target` はCargoの生成先を指定してください。デバッグ鍵はAndroid Studioが作成した試験用のものを使用し、公開用の署名には使用しません。
+
+```powershell
+$ndk = "$env:ANDROID_HOME/ndk/30.0.14904198/toolchains/llvm/prebuilt/windows-x86_64/bin"
+$tools = "$env:ANDROID_HOME/build-tools/36.1.0"
+$env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = "$ndk/aarch64-linux-android26-clang.cmd"
+cargo build --locked --target aarch64-linux-android --lib
+New-Item -ItemType Directory -Path "$out/staging/lib/arm64-v8a" -Force
+Copy-Item "$target/aarch64-linux-android/debug/libphone_friction_control.so" "$out/staging/lib/arm64-v8a/libphone_friction_control.so"
+& "$ndk/llvm-strip.exe" --strip-unneeded "$out/staging/lib/arm64-v8a/libphone_friction_control.so"
+& "$tools/aapt2.exe" link -o "$out/unsigned.apk" --manifest android/AndroidManifest.xml -I "$env:ANDROID_HOME/platforms/android-36/android.jar" --version-code 1 --version-name 0.1.0 --debug-mode
+& "$env:JAVA_HOME/bin/jar.exe" --update --file "$out/unsigned.apk" --no-compress -C "$out/staging" lib/arm64-v8a/libphone_friction_control.so
+& "$tools/zipalign.exe" -P 16 -f 4 "$out/unsigned.apk" "$out/aligned.apk"
+& "$env:JAVA_HOME/bin/java.exe" -jar "$tools/lib/apksigner.jar" sign --ks "$env:USERPROFILE/.android/debug.keystore" --ks-key-alias androiddebugkey --ks-pass pass:android --key-pass pass:android --out "$out/phone-friction-control-arm64-debug.apk" "$out/aligned.apk"
+& "$env:JAVA_HOME/bin/java.exe" -jar "$tools/lib/apksigner.jar" verify --verbose "$out/phone-friction-control-arm64-debug.apk"
+& "$tools/zipalign.exe" -c -P 16 4 "$out/phone-friction-control-arm64-debug.apk"
+```
+
+各コマンドの終了コードが0であることを確認してから次へ進みます。APKはデバッグ可能な試用版です。正式配布の署名、広告配信、iOS版、実端末の検証は別途必要です。
+
+### 回帰検査
+
+```powershell
+cargo test --locked --features desktop-preview --lib
+cargo clippy --locked --target aarch64-linux-android --lib --no-deps -- -D warnings
+```
+
+日付をまたぐ休憩、14日分の記録、権限解除時の記録保持、休憩終了後の再利用、保存内容の往復、途中の書き込み失敗と再保存を検査します。
 
 ## フォント
 

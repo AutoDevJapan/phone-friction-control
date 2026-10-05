@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "android")]
@@ -90,7 +89,9 @@ enum Screen {
 pub struct ControlApp {
     saved: SavedState,
     last_persisted: Option<SavedState>,
-    state_path: Option<PathBuf>,
+    state_store: Option<crate::persistence::StateStore>,
+    storage_error: Option<String>,
+    last_state_reload: Instant,
     screen: Screen,
     permission_granted: bool,
     usage_by_package_ms: HashMap<String, u64>,
@@ -130,25 +131,27 @@ impl ControlApp {
             .and_then(|storage| eframe::get_value(storage, SAVE_KEY))
             .unwrap_or_default();
         #[cfg(target_os = "android")]
-        let state_path = android_app
+        let mut state_store = android_app
             .as_ref()
             .and_then(|app| app.internal_data_path())
-            .map(|path| path.join("usage-state.ron"));
+            .map(|path| crate::persistence::StateStore::new(path.join("usage-state.ron")));
         #[cfg(not(target_os = "android"))]
-        let state_path: Option<PathBuf> = None;
-        let mut initial_notice = None;
-        if let Some(path) = &state_path {
-            match crate::persistence::load(path) {
+        let mut state_store: Option<crate::persistence::StateStore> = None;
+        let mut storage_error = None;
+        if let Some(store) = &mut state_store {
+            match store.load() {
                 Ok(Some(state)) => saved = state,
                 Ok(None) => {}
-                Err(_) => initial_notice = Some("端末内の記録を読み込めませんでした。".to_owned()),
+                Err(_) => storage_error = Some("記録を読み込めないため保存を止めています。元の記録を保持して、もう一度読み込みます。".to_owned()),
             }
         }
         #[cfg(target_os = "android")]
         let (events_tx, events_rx) = mpsc::channel();
         let mut app = Self {
             last_persisted: None,
-            state_path,
+            state_store,
+            storage_error,
+            last_state_reload: Instant::now(),
             saved,
             screen: Screen::Home,
             permission_granted: false,
@@ -158,7 +161,7 @@ impl ControlApp {
             apps_loading: false,
             usage_loading: false,
             app_filter: String::new(),
-            notice: initial_notice,
+            notice: None,
             last_refresh: Instant::now() - Duration::from_secs(120),
             #[cfg(target_os = "android")]
             events_tx,
@@ -368,11 +371,17 @@ impl ControlApp {
         if self.last_persisted.as_ref() == Some(&self.saved) {
             return;
         }
-        if let Some(path) = &self.state_path {
-            match crate::persistence::save(path, &self.saved) {
-                Ok(()) => self.last_persisted = Some(self.saved.clone()),
+        if let Some(store) = &self.state_store {
+            if !store.is_ready() {
+                return;
+            }
+            match store.save(&self.saved) {
+                Ok(()) => {
+                    self.last_persisted = Some(self.saved.clone());
+                    self.storage_error = None;
+                }
                 Err(_) => {
-                    self.notice = Some(
+                    self.storage_error = Some(
                         "設定と休憩状態を保存できません。端末の空き容量を確認してください。"
                             .to_owned(),
                     )
@@ -892,6 +901,9 @@ impl ControlApp {
     }
 
     fn draw_break(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if let Some(error) = &self.storage_error {
+            ui.colored_label(ORANGE, error);
+        }
         let remaining = self.break_remaining_ms().unwrap_or_default();
         let duration = Duration::from_millis(remaining as u64);
         let total_seconds = duration.as_secs();
@@ -946,6 +958,9 @@ impl ControlApp {
     }
 
     fn show_notice(&self, ui: &mut egui::Ui) {
+        if let Some(error) = &self.storage_error {
+            ui.colored_label(ORANGE, error);
+        }
         if let Some(notice) = &self.notice {
             ui.add_space(8.0);
             ui.colored_label(ORANGE, notice);
@@ -1056,6 +1071,20 @@ impl eframe::App for ControlApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.last_state_reload.elapsed() >= Duration::from_secs(5)
+            && let Some(store) = &mut self.state_store
+            && !store.is_ready()
+        {
+            self.last_state_reload = Instant::now();
+            if let Ok(state) = store.load() {
+                if let Some(state) = state {
+                    self.saved = state;
+                }
+                self.storage_error = None;
+                self.last_persisted = None;
+                self.last_refresh = Instant::now() - Duration::from_secs(120);
+            }
+        }
         self.drain_platform_events(ctx);
     }
 
@@ -1127,8 +1156,8 @@ impl eframe::App for ControlApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        if let Some(path) = &self.state_path {
-            if crate::persistence::save(path, &self.saved).is_ok() {
+        if let Some(store) = &self.state_store {
+            if store.save(&self.saved).is_ok() {
                 self.last_persisted = Some(self.saved.clone());
                 storage.remove_string(SAVE_KEY);
             }
@@ -1152,7 +1181,9 @@ mod tests {
                 ..SavedState::default()
             },
             last_persisted: None,
-            state_path: None,
+            state_store: None,
+            storage_error: None,
+            last_state_reload: Instant::now(),
             screen: Screen::Home,
             permission_granted: false,
             usage_by_package_ms: HashMap::new(),

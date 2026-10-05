@@ -1,8 +1,36 @@
 use std::fs::{self, File};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-pub fn load<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
+pub struct StateStore {
+    path: PathBuf,
+    ready: bool,
+}
+
+impl StateStore {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path, ready: false }
+    }
+
+    pub fn load<T: serde::de::DeserializeOwned>(&mut self) -> io::Result<Option<T>> {
+        let result = load(&self.path);
+        self.ready = result.is_ok();
+        result
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready
+    }
+
+    pub fn save<T: serde::Serialize>(&self, state: &T) -> io::Result<()> {
+        if !self.ready {
+            return Err(io::Error::other("State has not been read successfully"));
+        }
+        save(&self.path, state)
+    }
+}
+
+fn load<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
     match fs::read_to_string(path) {
         Ok(text) => ron::from_str(&text)
             .map(Some)
@@ -12,7 +40,7 @@ pub fn load<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>
     }
 }
 
-pub fn save<T: serde::Serialize>(path: &Path, state: &T) -> io::Result<()> {
+fn save<T: serde::Serialize>(path: &Path, state: &T) -> io::Result<()> {
     let text = ron::to_string(state).map_err(io::Error::other)?;
     replace_with(path, |file| file.write_all(text.as_bytes()))
 }
@@ -88,5 +116,40 @@ mod tests {
         );
         save(&fixture.path(), &vec![60_u64]).unwrap();
         assert_eq!(load::<Vec<u64>>(&fixture.path()).unwrap(), Some(vec![60]));
+    }
+
+    #[test]
+    fn failed_load_prevents_overwrite_until_successful_reload() {
+        let fixture = Fixture::new();
+        save(&fixture.path(), &vec![120_u64, 30, 2_800_000]).unwrap();
+        let valid = fs::read(fixture.path()).unwrap();
+        fs::write(fixture.path(), b"[120,").unwrap();
+        let unreadable = fs::read(fixture.path()).unwrap();
+        let mut store = StateStore::new(fixture.path());
+        assert!(store.save(&vec![0_u64]).is_err());
+        assert!(store.load::<Vec<u64>>().is_err());
+        assert!(!store.is_ready());
+        assert!(store.save(&vec![0_u64]).is_err());
+        assert_eq!(fs::read(fixture.path()).unwrap(), unreadable);
+        fs::write(fixture.path(), valid).unwrap();
+        assert_eq!(
+            store.load::<Vec<u64>>().unwrap(),
+            Some(vec![120, 30, 2_800_000])
+        );
+        store.save(&vec![60_u64]).unwrap();
+        assert_eq!(load::<Vec<u64>>(&fixture.path()).unwrap(), Some(vec![60]));
+    }
+
+    #[test]
+    fn missing_file_and_read_io_failure_are_distinct() {
+        let fixture = Fixture::new();
+        let mut store = StateStore::new(fixture.path());
+        assert_eq!(store.load::<Vec<u64>>().unwrap(), None);
+        store.save(&vec![120_u64]).unwrap();
+        fs::remove_file(fixture.path()).unwrap();
+        fs::create_dir(fixture.path()).unwrap();
+        assert!(store.load::<Vec<u64>>().is_err());
+        assert!(store.save(&vec![0_u64]).is_err());
+        assert!(fixture.path().is_dir());
     }
 }
