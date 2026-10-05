@@ -1,4 +1,5 @@
 mod app;
+mod persistence;
 
 #[cfg(target_os = "android")]
 mod platform;

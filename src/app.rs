@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "android")]
@@ -88,7 +89,8 @@ enum Screen {
 
 pub struct ControlApp {
     saved: SavedState,
-    last_persisted: SavedState,
+    last_persisted: Option<SavedState>,
+    state_path: Option<PathBuf>,
     screen: Screen,
     permission_granted: bool,
     usage_by_package_ms: HashMap<String, u64>,
@@ -109,6 +111,8 @@ pub struct ControlApp {
     insets_loading: bool,
     #[cfg(target_os = "android")]
     window_insets: Option<[i32; 4]>,
+    #[cfg(target_os = "android")]
+    last_inset_refresh: Instant,
 }
 
 impl ControlApp {
@@ -121,14 +125,30 @@ impl ControlApp {
     ) -> Self {
         configure_fonts_and_style(creation_context);
 
-        let saved: SavedState = creation_context
+        let mut saved: SavedState = creation_context
             .storage
             .and_then(|storage| eframe::get_value(storage, SAVE_KEY))
             .unwrap_or_default();
         #[cfg(target_os = "android")]
+        let state_path = android_app
+            .as_ref()
+            .and_then(|app| app.internal_data_path())
+            .map(|path| path.join("usage-state.ron"));
+        #[cfg(not(target_os = "android"))]
+        let state_path: Option<PathBuf> = None;
+        let mut initial_notice = None;
+        if let Some(path) = &state_path {
+            match crate::persistence::load(path) {
+                Ok(Some(state)) => saved = state,
+                Ok(None) => {}
+                Err(_) => initial_notice = Some("端末内の記録を読み込めませんでした。".to_owned()),
+            }
+        }
+        #[cfg(target_os = "android")]
         let (events_tx, events_rx) = mpsc::channel();
         let mut app = Self {
-            last_persisted: saved.clone(),
+            last_persisted: None,
+            state_path,
             saved,
             screen: Screen::Home,
             permission_granted: false,
@@ -138,7 +158,7 @@ impl ControlApp {
             apps_loading: false,
             usage_loading: false,
             app_filter: String::new(),
-            notice: None,
+            notice: initial_notice,
             last_refresh: Instant::now() - Duration::from_secs(120),
             #[cfg(target_os = "android")]
             events_tx,
@@ -150,6 +170,8 @@ impl ControlApp {
             insets_loading: false,
             #[cfg(target_os = "android")]
             window_insets: None,
+            #[cfg(target_os = "android")]
+            last_inset_refresh: Instant::now() - Duration::from_secs(120),
         };
 
         #[cfg(target_os = "android")]
@@ -343,12 +365,23 @@ impl ControlApp {
     }
 
     fn persist_changed_state(&mut self, frame: &mut eframe::Frame) {
-        if self.saved != self.last_persisted
-            && let Some(storage) = frame.storage_mut()
-        {
+        if self.last_persisted.as_ref() == Some(&self.saved) {
+            return;
+        }
+        if let Some(path) = &self.state_path {
+            match crate::persistence::save(path, &self.saved) {
+                Ok(()) => self.last_persisted = Some(self.saved.clone()),
+                Err(_) => {
+                    self.notice = Some(
+                        "設定と休憩状態を保存できません。端末の空き容量を確認してください。"
+                            .to_owned(),
+                    )
+                }
+            }
+        } else if let Some(storage) = frame.storage_mut() {
             eframe::set_value(storage, SAVE_KEY, &self.saved);
             storage.flush();
-            self.last_persisted = self.saved.clone();
+            self.last_persisted = Some(self.saved.clone());
         }
     }
 
@@ -552,7 +585,7 @@ impl ControlApp {
                         .strong(),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new("◷").size(23.0).color(MUTED));
+                    ui.label(RichText::new("上限").size(14.0).color(MUTED));
                 });
             });
             ui.add_space(6.0);
@@ -989,11 +1022,13 @@ fn now_epoch_ms() -> i64 {
 impl eframe::App for ControlApp {
     #[cfg(target_os = "android")]
     fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
-        if self.window_insets.is_none()
+        if (self.window_insets.is_none()
+            || self.last_inset_refresh.elapsed() >= Duration::from_secs(1))
             && !self.insets_loading
             && let Some(app) = &self.android_app
         {
             self.insets_loading = true;
+            self.last_inset_refresh = Instant::now();
             crate::platform::request_insets(app.clone(), self.events_tx.clone(), ctx.clone());
         }
         if let Some(app) = &self.android_app
@@ -1029,65 +1064,77 @@ impl eframe::App for ControlApp {
         let is_break = self.screen == Screen::Break;
         let background = if is_break { DARK } else { PAPER };
 
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(background)
-                    .inner_margin(egui::Margin::same(17)),
-            )
-            .show(root_ui, |ui| {
-                if self.screen == Screen::Break {
-                    self.draw_break(ui, &ctx);
-                    return;
-                }
-
-                self.draw_header(ui);
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .max_height((ui.available_height() - 72.0).max(100.0))
-                    .show(ui, |ui| match self.screen {
-                        Screen::Home => self.draw_home(ui, &ctx),
-                        Screen::Records => self.draw_records(ui),
-                        Screen::Settings => self.draw_settings(ui, &ctx),
-                        Screen::SelectApps => self.draw_app_selector(ui, &ctx),
-                        Screen::Disclosure => self.draw_disclosure(ui, &ctx),
-                        Screen::Break => {}
-                    });
-
-                ui.add_space(6.0);
-                ui.separator();
-                ui.horizontal(|ui| {
-                    let item_width = ui.available_width() / 3.0;
-                    for (screen, label, symbol) in [
-                        (Screen::Home, "ホーム", "⌂"),
-                        (Screen::Records, "記録", "▥"),
-                        (Screen::Settings, "設定", "●"),
-                    ] {
-                        let selected = self.screen == screen;
-                        let color = if selected { ORANGE } else { MUTED };
-                        let response = ui.add_sized(
-                            [item_width, 48.0],
-                            egui::Button::new(
-                                RichText::new(format!("{symbol}\n{label}"))
-                                    .size(13.0)
-                                    .color(color),
-                            )
-                            .fill(Color32::TRANSPARENT)
-                            .stroke(Stroke::NONE),
-                        );
-                        if response.clicked() {
-                            self.screen = screen;
+        root_ui.scope_builder(
+            egui::UiBuilder::new().max_rect(ctx.content_rect()),
+            |root_ui| {
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::new()
+                            .fill(background)
+                            .inner_margin(egui::Margin::same(17)),
+                    )
+                    .show(root_ui, |ui| {
+                        if self.screen == Screen::Break {
+                            self.draw_break(ui, &ctx);
+                            return;
                         }
-                    }
-                });
-            });
+
+                        self.draw_header(ui);
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .max_height((ui.available_height() - 72.0).max(100.0))
+                            .show(ui, |ui| match self.screen {
+                                Screen::Home => self.draw_home(ui, &ctx),
+                                Screen::Records => self.draw_records(ui),
+                                Screen::Settings => self.draw_settings(ui, &ctx),
+                                Screen::SelectApps => self.draw_app_selector(ui, &ctx),
+                                Screen::Disclosure => self.draw_disclosure(ui, &ctx),
+                                Screen::Break => {}
+                            });
+
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            let item_width = ui.available_width() / 3.0;
+                            for (screen, label, symbol) in [
+                                (Screen::Home, "ホーム", "○"),
+                                (Screen::Records, "記録", "▥"),
+                                (Screen::Settings, "設定", "●"),
+                            ] {
+                                let selected = self.screen == screen;
+                                let color = if selected { ORANGE } else { MUTED };
+                                let response = ui.add_sized(
+                                    [item_width, 48.0],
+                                    egui::Button::new(
+                                        RichText::new(format!("{symbol}\n{label}"))
+                                            .size(13.0)
+                                            .color(color),
+                                    )
+                                    .fill(Color32::TRANSPARENT)
+                                    .stroke(Stroke::NONE),
+                                );
+                                if response.clicked() {
+                                    self.screen = screen;
+                                }
+                            }
+                        });
+                    });
+            },
+        );
 
         self.persist_changed_state(frame);
         ctx.request_repaint_after(Duration::from_secs(1));
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, SAVE_KEY, &self.saved);
+        if let Some(path) = &self.state_path {
+            if crate::persistence::save(path, &self.saved).is_ok() {
+                self.last_persisted = Some(self.saved.clone());
+                storage.remove_string(SAVE_KEY);
+            }
+        } else {
+            eframe::set_value(storage, SAVE_KEY, &self.saved);
+        }
     }
 }
 
@@ -1104,7 +1151,8 @@ mod tests {
                 }],
                 ..SavedState::default()
             },
-            last_persisted: SavedState::default(),
+            last_persisted: None,
+            state_path: None,
             screen: Screen::Home,
             permission_granted: false,
             usage_by_package_ms: HashMap::new(),
@@ -1183,5 +1231,17 @@ mod tests {
         app.apply_usage_snapshot(snapshot(1, 130));
         assert_eq!(app.saved.cooldown_until_ms, None);
         assert_eq!(app.screen, Screen::Home);
+    }
+
+    #[test]
+    fn saved_state_round_trip_preserves_an_active_break_and_history() {
+        let mut app = app();
+        app.apply_usage_snapshot(snapshot(1, 120));
+        let encoded = ron::to_string(&app.saved).unwrap();
+        let restored: SavedState = ron::from_str(&encoded).unwrap();
+        assert_eq!(restored, app.saved);
+        assert_eq!(restored.cooldown_until_ms, Some(2_800_000));
+        assert_eq!(restored.target_apps[0].package, "test.video");
+        assert_eq!(restored.daily_records[0].used_ms, 120 * 60_000);
     }
 }
