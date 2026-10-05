@@ -1,0 +1,1018 @@
+use std::collections::HashMap;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(target_os = "android")]
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+
+use eframe::egui::{self, Align, Color32, Layout, RichText, Stroke};
+use serde::{Deserialize, Serialize};
+
+const SAVE_KEY: &str = "phone-friction-control-v1";
+const ORANGE: Color32 = Color32::from_rgb(239, 96, 34);
+const PAPER: Color32 = Color32::from_rgb(247, 244, 238);
+const INK: Color32 = Color32::from_rgb(37, 36, 34);
+const MUTED: Color32 = Color32::from_rgb(104, 101, 96);
+const DARK: Color32 = Color32::from_rgb(31, 31, 32);
+const DEFAULT_LIMIT_MINUTES: u32 = 120;
+const DEFAULT_BREAK_MINUTES: u32 = 30;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TrackedApp {
+    pub label: String,
+    pub package: String,
+}
+
+#[cfg(target_os = "android")]
+#[derive(Clone, Debug)]
+pub struct UsageSnapshot {
+    pub permission_granted: bool,
+    pub day_key: String,
+    pub day_label: String,
+    pub now_ms: i64,
+    pub usage_by_package_ms: HashMap<String, u64>,
+}
+
+#[cfg(target_os = "android")]
+pub enum PlatformEvent {
+    AppsLoaded(Result<Vec<TrackedApp>, String>),
+    UsageLoaded(Result<UsageSnapshot, String>),
+    ActionDone {
+        label: String,
+        result: Result<(), String>,
+    },
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct DailyRecord {
+    day_key: String,
+    label: String,
+    used_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct SavedState {
+    target_apps: Vec<TrackedApp>,
+    daily_limit_minutes: u32,
+    break_minutes: u32,
+    cooldown_until_ms: Option<i64>,
+    limit_triggered_day: Option<String>,
+    current_day_key: String,
+    daily_records: Vec<DailyRecord>,
+}
+
+impl Default for SavedState {
+    fn default() -> Self {
+        Self {
+            target_apps: Vec::new(),
+            daily_limit_minutes: DEFAULT_LIMIT_MINUTES,
+            break_minutes: DEFAULT_BREAK_MINUTES,
+            cooldown_until_ms: None,
+            limit_triggered_day: None,
+            current_day_key: String::new(),
+            daily_records: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Screen {
+    Home,
+    Records,
+    Settings,
+    SelectApps,
+    Disclosure,
+    Break,
+}
+
+pub struct ControlApp {
+    saved: SavedState,
+    screen: Screen,
+    permission_granted: bool,
+    usage_by_package_ms: HashMap<String, u64>,
+    today_label: String,
+    available_apps: Vec<TrackedApp>,
+    apps_loading: bool,
+    usage_loading: bool,
+    app_filter: String,
+    notice: Option<String>,
+    last_refresh: Instant,
+    #[cfg(target_os = "android")]
+    events_tx: Sender<PlatformEvent>,
+    #[cfg(target_os = "android")]
+    events_rx: Receiver<PlatformEvent>,
+    #[cfg(target_os = "android")]
+    android_app: Option<android_activity::AndroidApp>,
+}
+
+impl ControlApp {
+    pub fn new(
+        creation_context: &eframe::CreationContext<'_>,
+        #[cfg_attr(not(target_os = "android"), allow(unused_variables))]
+        #[cfg(target_os = "android")]
+        android_app: Option<android_activity::AndroidApp>,
+        #[cfg(not(target_os = "android"))] _android_app: Option<()>,
+    ) -> Self {
+        configure_fonts_and_style(creation_context);
+
+        let saved = creation_context
+            .storage
+            .and_then(|storage| eframe::get_value(storage, SAVE_KEY))
+            .unwrap_or_default();
+        #[cfg(target_os = "android")]
+        let (events_tx, events_rx) = mpsc::channel();
+        let mut app = Self {
+            saved,
+            screen: Screen::Home,
+            permission_granted: false,
+            usage_by_package_ms: HashMap::new(),
+            today_label: "今日".to_owned(),
+            available_apps: Vec::new(),
+            apps_loading: false,
+            usage_loading: false,
+            app_filter: String::new(),
+            notice: None,
+            last_refresh: Instant::now() - Duration::from_secs(120),
+            #[cfg(target_os = "android")]
+            events_tx,
+            #[cfg(target_os = "android")]
+            events_rx,
+            #[cfg(target_os = "android")]
+            android_app,
+        };
+
+        #[cfg(target_os = "android")]
+        {
+            app.refresh_apps(creation_context.egui_ctx.clone());
+            app.refresh_usage(creation_context.egui_ctx.clone());
+        }
+
+        #[cfg(not(target_os = "android"))]
+        app.load_preview_data();
+
+        app
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn load_preview_data(&mut self) {
+        self.permission_granted = true;
+        self.today_label = "日".to_owned();
+        if self.saved.target_apps.is_empty() {
+            self.saved.target_apps = vec![
+                TrackedApp {
+                    label: "動画アプリ（プレビュー）".to_owned(),
+                    package: "preview.video".to_owned(),
+                },
+                TrackedApp {
+                    label: "SNS（プレビュー）".to_owned(),
+                    package: "preview.social".to_owned(),
+                },
+            ];
+        }
+        if self.usage_by_package_ms.is_empty() {
+            self.usage_by_package_ms
+                .insert("preview.video".to_owned(), 102 * 60_000);
+            self.usage_by_package_ms
+                .insert("preview.social".to_owned(), 0);
+        }
+        self.saved.current_day_key = "preview".to_owned();
+        if self.saved.daily_records.is_empty() {
+            self.saved.daily_records = [
+                ("月", 205),
+                ("火", 142),
+                ("水", 96),
+                ("木", 82),
+                ("金", 71),
+                ("土", 126),
+                ("日", 102),
+            ]
+            .into_iter()
+            .map(|(label, minutes)| DailyRecord {
+                day_key: label.to_owned(),
+                label: label.to_owned(),
+                used_ms: minutes * 60_000,
+            })
+            .collect();
+        }
+    }
+
+    fn drain_platform_events(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "android")]
+        loop {
+            match self.events_rx.try_recv() {
+                Ok(PlatformEvent::AppsLoaded(result)) => {
+                    self.apps_loading = false;
+                    match result {
+                        Ok(apps) => {
+                            self.available_apps = apps;
+                            self.notice = None;
+                        }
+                        Err(error) => self.notice = Some(error),
+                    }
+                }
+                Ok(PlatformEvent::UsageLoaded(result)) => {
+                    self.usage_loading = false;
+                    match result {
+                        Ok(snapshot) => self.apply_usage_snapshot(snapshot),
+                        Err(error) => self.notice = Some(error),
+                    }
+                }
+                Ok(PlatformEvent::ActionDone { label, result }) => match result {
+                    Ok(()) => {
+                        self.notice =
+                            Some(format!("{label}を開きました。戻ると状態を更新します。"));
+                        self.last_refresh = Instant::now() - Duration::from_secs(120);
+                    }
+                    Err(error) => self.notice = Some(error),
+                },
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+
+        #[cfg(not(target_os = "android"))]
+        let _ = ctx;
+
+        let now_ms = now_epoch_ms();
+        if self
+            .saved
+            .cooldown_until_ms
+            .is_some_and(|until| until <= now_ms)
+        {
+            self.saved.cooldown_until_ms = None;
+            self.screen = Screen::Home;
+            self.notice = Some("休憩時間が終わりました。アプリをもう一度開けます。".to_owned());
+        } else if self.saved.cooldown_until_ms.is_some() {
+            self.screen = Screen::Break;
+        }
+
+        if self.last_refresh.elapsed() >= Duration::from_secs(60) {
+            self.refresh_usage(ctx.clone());
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    fn apply_usage_snapshot(&mut self, snapshot: UsageSnapshot) {
+        self.permission_granted = snapshot.permission_granted;
+        self.usage_by_package_ms = snapshot.usage_by_package_ms;
+        self.today_label = snapshot.day_label.clone();
+
+        if !self.saved.current_day_key.is_empty() && self.saved.current_day_key != snapshot.day_key
+        {
+            self.saved.cooldown_until_ms = None;
+            self.saved.limit_triggered_day = None;
+        }
+        self.saved.current_day_key = snapshot.day_key.clone();
+
+        let used_ms = self.today_usage_ms();
+        if let Some(record) = self
+            .saved
+            .daily_records
+            .iter_mut()
+            .find(|record| record.day_key == snapshot.day_key)
+        {
+            record.label = snapshot.day_label;
+            record.used_ms = used_ms;
+        } else {
+            self.saved.daily_records.push(DailyRecord {
+                day_key: snapshot.day_key.clone(),
+                label: snapshot.day_label,
+                used_ms,
+            });
+        }
+        self.saved.daily_records.truncate(14);
+
+        let limit_ms = u64::from(self.saved.daily_limit_minutes) * 60_000;
+        if snapshot.permission_granted
+            && used_ms >= limit_ms
+            && self.saved.limit_triggered_day.as_deref() != Some(snapshot.day_key.as_str())
+        {
+            self.begin_break(snapshot.now_ms, snapshot.day_key);
+        }
+    }
+
+    fn begin_break(&mut self, now_ms: i64, day_key: String) {
+        self.saved.limit_triggered_day = Some(day_key);
+        self.saved.cooldown_until_ms =
+            Some(now_ms + i64::from(self.saved.break_minutes.max(1)) * 60_000);
+        self.screen = Screen::Break;
+        self.notice = None;
+    }
+
+    fn today_usage_ms(&self) -> u64 {
+        self.saved
+            .target_apps
+            .iter()
+            .map(|app| {
+                self.usage_by_package_ms
+                    .get(&app.package)
+                    .copied()
+                    .unwrap_or_default()
+            })
+            .sum()
+    }
+
+    fn break_remaining_ms(&self) -> Option<i64> {
+        self.saved
+            .cooldown_until_ms
+            .map(|until| until.saturating_sub(now_epoch_ms()).max(0))
+    }
+
+    fn refresh_apps(&mut self, ctx: egui::Context) {
+        #[cfg(target_os = "android")]
+        if let Some(android_app) = &self.android_app {
+            self.apps_loading = true;
+            crate::platform::request_apps(android_app.clone(), self.events_tx.clone(), ctx);
+        }
+        #[cfg(not(target_os = "android"))]
+        let _ = ctx;
+    }
+
+    fn refresh_usage(&mut self, ctx: egui::Context) {
+        self.last_refresh = Instant::now();
+        #[cfg(target_os = "android")]
+        if let Some(android_app) = &self.android_app {
+            self.usage_loading = true;
+            let selected_packages = self
+                .saved
+                .target_apps
+                .iter()
+                .map(|app| app.package.clone())
+                .collect();
+            crate::platform::request_usage(
+                android_app.clone(),
+                selected_packages,
+                self.events_tx.clone(),
+                ctx,
+            );
+        }
+        #[cfg(not(target_os = "android"))]
+        let _ = ctx;
+    }
+
+    fn request_usage_settings(&mut self, ctx: egui::Context) {
+        self.screen = Screen::Home;
+        self.notice = None;
+        #[cfg(target_os = "android")]
+        if let Some(android_app) = &self.android_app {
+            crate::platform::open_usage_settings(android_app.clone(), self.events_tx.clone(), ctx);
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = ctx;
+            self.permission_granted = true;
+            self.notice = Some("プレビューでは使用状況へのアクセスを許可した状態です。".to_owned());
+        }
+    }
+
+    fn request_home_settings(&mut self, ctx: egui::Context) {
+        #[cfg(target_os = "android")]
+        if let Some(android_app) = &self.android_app {
+            crate::platform::open_home_settings(android_app.clone(), self.events_tx.clone(), ctx);
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = ctx;
+            self.notice = Some("Androidではホーム画面の選択を開きます。".to_owned());
+        }
+    }
+
+    fn return_to_device_home(&mut self, ctx: egui::Context) {
+        #[cfg(target_os = "android")]
+        if let Some(android_app) = &self.android_app {
+            crate::platform::return_to_home(android_app.clone(), self.events_tx.clone(), ctx);
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = ctx;
+            self.screen = Screen::Home;
+        }
+    }
+
+    fn toggle_app(&mut self, app: &TrackedApp, ctx: &egui::Context) {
+        if let Some(index) = self
+            .saved
+            .target_apps
+            .iter()
+            .position(|selected| selected.package == app.package)
+        {
+            self.saved.target_apps.remove(index);
+            self.usage_by_package_ms.remove(&app.package);
+        } else {
+            self.saved.target_apps.push(app.clone());
+        }
+        self.saved
+            .target_apps
+            .sort_by(|left, right| left.label.to_lowercase().cmp(&right.label.to_lowercase()));
+        self.refresh_usage(ctx.clone());
+    }
+
+    fn open_target_app(&mut self, target: TrackedApp, ctx: egui::Context) {
+        if self.saved.cooldown_until_ms.is_some() {
+            self.screen = Screen::Break;
+            return;
+        }
+
+        if self.permission_granted
+            && self.today_usage_ms() >= u64::from(self.saved.daily_limit_minutes) * 60_000
+            && self.saved.limit_triggered_day.as_deref()
+                != Some(self.saved.current_day_key.as_str())
+        {
+            self.begin_break(now_epoch_ms(), self.saved.current_day_key.clone());
+            return;
+        }
+
+        self.notice = None;
+        #[cfg(target_os = "android")]
+        if let Some(android_app) = &self.android_app {
+            crate::platform::launch_package(
+                android_app.clone(),
+                target.package,
+                target.label,
+                self.events_tx.clone(),
+                ctx,
+            );
+            return;
+        }
+
+        self.notice = Some(format!("プレビュー: 「{}」を開く操作です。", target.label));
+        self.screen = Screen::Home;
+        #[cfg(not(target_os = "android"))]
+        let _ = ctx;
+    }
+
+    fn draw_header(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading(RichText::new("利用制限").size(28.0).strong());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button(RichText::new("⚙").size(24.0)).clicked() {
+                    self.screen = Screen::Settings;
+                }
+            });
+        });
+        ui.add_space(8.0);
+    }
+
+    fn draw_home(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if !self.permission_granted {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label(RichText::new("利用時間の記録がオフです").strong());
+                ui.label("選んだアプリの前面利用時間を端末内で調べます。");
+                if ui.button("説明を読んで設定する").clicked() {
+                    self.screen = Screen::Disclosure;
+                }
+            });
+            ui.add_space(10.0);
+        }
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("▶").size(24.0).color(ORANGE));
+                ui.label(RichText::new("対象アプリ").size(18.0).strong());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("変更 ›").clicked() {
+                        self.screen = Screen::SelectApps;
+                        if self.available_apps.is_empty() && !self.apps_loading {
+                            self.refresh_apps(ctx.clone());
+                        }
+                    }
+                });
+            });
+            if self.saved.target_apps.is_empty() {
+                ui.label("制限するアプリを選んでください。");
+                if ui.button("アプリを選ぶ").clicked() {
+                    self.screen = Screen::SelectApps;
+                    if self.available_apps.is_empty() && !self.apps_loading {
+                        self.refresh_apps(ctx.clone());
+                    }
+                }
+            } else {
+                for target in self.saved.target_apps.clone() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&target.label).strong());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let used = self
+                                .usage_by_package_ms
+                                .get(&target.package)
+                                .copied()
+                                .unwrap_or_default();
+                            if ui
+                                .button(format!("開く  ›  {}", format_usage(used)))
+                                .clicked()
+                            {
+                                self.open_target_app(target.clone(), ctx.clone());
+                            }
+                        });
+                    });
+                }
+            }
+        });
+
+        ui.add_space(10.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(RichText::new("1日の利用上限").size(16.0));
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format_limit(self.saved.daily_limit_minutes))
+                        .size(30.0)
+                        .strong(),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(RichText::new("◷").size(23.0).color(MUTED));
+                });
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("今日の利用時間").color(MUTED));
+                if self.usage_loading {
+                    ui.spinner();
+                }
+            });
+            ui.label(
+                RichText::new(format_usage(self.today_usage_ms()))
+                    .size(31.0)
+                    .strong(),
+            );
+            let limit_ms = u64::from(self.saved.daily_limit_minutes) * 60_000;
+            let fraction = if limit_ms == 0 {
+                0.0
+            } else {
+                self.today_usage_ms() as f32 / limit_ms as f32
+            };
+            ui.add(
+                egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
+                    .desired_width(ui.available_width())
+                    .fill(ORANGE),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new(format_limit(self.saved.daily_limit_minutes)).color(MUTED));
+            });
+        });
+
+        ui.add_space(10.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("☕").size(20.0));
+                ui.label(
+                    RichText::new(format!("上限後は{}分休憩", self.saved.break_minutes)).strong(),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("変更 ›").clicked() {
+                        self.screen = Screen::Settings;
+                    }
+                });
+            });
+        });
+
+        ui.add_space(10.0);
+        egui::Frame::new()
+            .fill(Color32::from_rgb(235, 232, 227))
+            .inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| {
+                ui.label("使いすぎを防いで、やりたいことに集中できる毎日へ。");
+            });
+
+        ui.add_space(10.0);
+        egui::Frame::new()
+            .fill(Color32::from_rgb(225, 220, 211))
+            .inner_margin(egui::Margin::same(12))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("広告").strong());
+                        ui.label(RichText::new("任意表示の枠（配信準備中）").color(MUTED));
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new("›").size(24.0).color(ORANGE));
+                    });
+                });
+                ui.label(
+                    RichText::new("休憩時間の解除条件には使いません。")
+                        .size(12.0)
+                        .color(MUTED),
+                );
+            });
+
+        self.show_notice(ui);
+    }
+
+    fn draw_records(&mut self, ui: &mut egui::Ui) {
+        ui.heading("今日の記録");
+        ui.add_space(8.0);
+
+        egui::Frame::new()
+            .fill(Color32::from_rgb(252, 235, 222))
+            .inner_margin(egui::Margin::same(15))
+            .show(ui, |ui| {
+                ui.label(format!("{}の利用時間", self.today_label));
+                ui.label(
+                    RichText::new(format_usage(self.today_usage_ms()))
+                        .size(30.0)
+                        .strong()
+                        .color(ORANGE),
+                );
+                ui.label("今日の合計利用時間");
+            });
+
+        ui.add_space(10.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(RichText::new("1週間の利用時間").strong());
+            let records: Vec<DailyRecord> = self
+                .saved
+                .daily_records
+                .iter()
+                .rev()
+                .take(7)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let max_ms = records
+                .iter()
+                .map(|record| record.used_ms)
+                .max()
+                .unwrap_or(60_000)
+                .max(60_000);
+            if records.is_empty() {
+                ui.label("記録はまだありません。");
+            }
+            for record in records {
+                ui.horizontal(|ui| {
+                    ui.add_sized([54.0, 20.0], egui::Label::new(&record.label));
+                    let fill = if record.day_key == self.saved.current_day_key {
+                        ORANGE
+                    } else {
+                        Color32::from_rgb(154, 158, 160)
+                    };
+                    ui.add(
+                        egui::ProgressBar::new(record.used_ms as f32 / max_ms as f32)
+                            .desired_width(ui.available_width() - 76.0)
+                            .fill(fill),
+                    );
+                    ui.label(format_usage(record.used_ms));
+                });
+            }
+        });
+
+        ui.add_space(10.0);
+        egui::Frame::new()
+            .fill(Color32::from_rgb(225, 220, 211))
+            .inner_margin(egui::Margin::same(12))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("広告").strong());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new("任意表示・配信準備中").color(MUTED));
+                    });
+                });
+            });
+
+        ui.add_space(10.0);
+        ui.label("記録はこの端末内に保存します。アプリ名や利用時間を外部へ送信しません。");
+        self.show_notice(ui);
+    }
+
+    fn draw_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.heading("設定");
+        ui.add_space(8.0);
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(RichText::new("1日の利用上限").strong());
+            ui.add(
+                egui::Slider::new(&mut self.saved.daily_limit_minutes, 30..=360)
+                    .step_by(30.0)
+                    .suffix("分"),
+            );
+            ui.label(
+                RichText::new(format_limit(self.saved.daily_limit_minutes))
+                    .size(20.0)
+                    .strong(),
+            );
+
+            ui.add_space(8.0);
+            ui.label(RichText::new("上限後の休憩時間").strong());
+            ui.add(
+                egui::Slider::new(&mut self.saved.break_minutes, 5..=120)
+                    .step_by(5.0)
+                    .suffix("分"),
+            );
+            ui.label(
+                RichText::new(format!("{}分", self.saved.break_minutes))
+                    .size(20.0)
+                    .strong(),
+            );
+        });
+
+        ui.add_space(10.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(RichText::new("利用時間へのアクセス").strong());
+            ui.label("選んだアプリの前面利用時間を読み取り、端末内だけに記録します。");
+            ui.label(if self.permission_granted {
+                "現在: 許可されています"
+            } else {
+                "現在: 未許可です。制限は動作しません。"
+            });
+            if ui.button("説明を確認して設定を開く").clicked() {
+                self.screen = Screen::Disclosure;
+            }
+        });
+
+        ui.add_space(10.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(RichText::new("ホーム画面に設定").strong());
+            ui.label(
+                "ホームボタンからこのアプリに戻ると、利用時間を確認して休憩画面を表示します。",
+            );
+            ui.label("通知や外部リンクから対象アプリを直接開く操作は、この試作では制御しません。");
+            if ui.button("Androidのホーム画面を選ぶ").clicked() {
+                self.request_home_settings(ctx.clone());
+            }
+        });
+
+        ui.add_space(10.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(RichText::new("広告").strong());
+            ui.label("広告はこのアプリ内だけに表示する想定です。休憩画面には出さず、広告を断っても制限機能は変わりません。");
+            ui.label("現在は枠だけの試作で、広告配信は接続していません。");
+        });
+
+        self.show_notice(ui);
+    }
+
+    fn draw_app_selector(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            if ui.button("‹ 戻る").clicked() {
+                self.screen = Screen::Home;
+            }
+            ui.heading("対象アプリを選ぶ");
+        });
+        ui.label("この端末でホーム画面から起動できるアプリを表示します。");
+        ui.add_space(8.0);
+
+        ui.horizontal(|ui| {
+            ui.label("検索");
+            ui.text_edit_singleline(&mut self.app_filter);
+        });
+
+        if self.apps_loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("アプリ一覧を読み込んでいます…");
+            });
+        }
+        if self.available_apps.is_empty() && !self.apps_loading {
+            ui.label("起動できるアプリが見つかりませんでした。");
+            if ui.button("一覧を再読み込み").clicked() {
+                self.refresh_apps(ctx.clone());
+            }
+        }
+
+        let filter = self.app_filter.trim().to_lowercase();
+        let apps: Vec<TrackedApp> = self
+            .available_apps
+            .iter()
+            .filter(|app| app.label.to_lowercase().contains(&filter))
+            .cloned()
+            .collect();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for app in apps {
+                let mut selected = self
+                    .saved
+                    .target_apps
+                    .iter()
+                    .any(|target| target.package == app.package);
+                let response = ui.checkbox(&mut selected, RichText::new(&app.label).size(17.0));
+                if response.changed() {
+                    self.toggle_app(&app, ctx);
+                }
+                ui.add_space(4.0);
+            }
+        });
+
+        ui.add_space(6.0);
+        if ui.button("選択を保存して戻る").clicked() {
+            self.screen = Screen::Home;
+            self.refresh_usage(ctx.clone());
+        }
+        self.show_notice(ui);
+    }
+
+    fn draw_disclosure(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.heading("利用時間の読み取りについて");
+        ui.add_space(10.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(
+                "このアプリは、あなたが選んだアプリの前面利用時間を読み取り、設定した上限と休憩時間を動かします。",
+            );
+            ui.add_space(8.0);
+            ui.label("利用時間と対象アプリ名はこの端末内に保存します。外部サーバーや広告事業者には送りません。");
+            ui.add_space(8.0);
+            ui.label("許可は端末設定からいつでも解除できます。許可しない場合、時間の記録と休憩制御は動きません。");
+        });
+        ui.add_space(12.0);
+        if full_width_button(ui, "内容を確認して使用状況を設定", ORANGE) {
+            self.request_usage_settings(ctx.clone());
+        }
+        if ui.button("今は設定しない").clicked() {
+            self.screen = Screen::Settings;
+        }
+        self.show_notice(ui);
+    }
+
+    fn draw_break(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let remaining = self.break_remaining_ms().unwrap_or_default();
+        let duration = Duration::from_millis(remaining as u64);
+        let total_seconds = duration.as_secs();
+        let countdown = format!("{:02}:{:02}", total_seconds / 60, total_seconds % 60);
+        ui.with_layout(Layout::top_down(Align::Center), |ui| {
+            ui.add_space((ui.available_height() * 0.08).max(24.0));
+            ui.label(RichText::new("Ⅱ").size(70.0).strong().color(ORANGE));
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("休憩中")
+                    .size(42.0)
+                    .strong()
+                    .color(Color32::WHITE),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("対象アプリは休止中")
+                    .size(21.0)
+                    .color(Color32::WHITE),
+            );
+
+            if !self.saved.target_apps.is_empty() {
+                ui.add_space(8.0);
+                let names = self
+                    .saved
+                    .target_apps
+                    .iter()
+                    .map(|app| app.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join("・");
+                ui.label(RichText::new(names).color(Color32::from_rgb(207, 207, 207)));
+            }
+
+            ui.add_space(25.0);
+            egui::Frame::new()
+                .fill(Color32::from_rgb(45, 45, 47))
+                .inner_margin(egui::Margin::same(18))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("残り").size(22.0).color(Color32::WHITE));
+                        ui.label(RichText::new(countdown).size(43.0).strong().color(ORANGE));
+                    });
+                });
+            ui.add_space(18.0);
+            ui.label(RichText::new("休憩が終わると、もう一度開けます").color(Color32::WHITE));
+
+            ui.add_space(32.0);
+            if full_width_button(ui, "ホームへ戻る", ORANGE) {
+                self.return_to_device_home(ctx.clone());
+            }
+        });
+    }
+
+    fn show_notice(&self, ui: &mut egui::Ui) {
+        if let Some(notice) = &self.notice {
+            ui.add_space(8.0);
+            ui.colored_label(ORANGE, notice);
+        }
+    }
+}
+
+fn configure_fonts_and_style(creation_context: &eframe::CreationContext<'_>) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "noto-sans-jp".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/NotoSansJP[wght].ttf"
+        ))),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "noto-sans-jp".to_owned());
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .insert(0, "noto-sans-jp".to_owned());
+    creation_context.egui_ctx.set_fonts(fonts);
+
+    let mut style = (*creation_context.egui_ctx.style_of(egui::Theme::Light)).clone();
+    style.visuals = egui::Visuals::light();
+    style.visuals.override_text_color = Some(INK);
+    style.spacing.item_spacing = egui::vec2(9.0, 10.0);
+    creation_context
+        .egui_ctx
+        .set_style_of(egui::Theme::Light, style);
+    creation_context.egui_ctx.set_theme(egui::Theme::Light);
+}
+
+fn full_width_button(ui: &mut egui::Ui, label: &str, fill: Color32) -> bool {
+    let width = ui.available_width();
+    ui.add_sized(
+        [width, 56.0],
+        egui::Button::new(RichText::new(label).strong().color(Color32::WHITE)).fill(fill),
+    )
+    .clicked()
+}
+
+fn format_limit(minutes: u32) -> String {
+    if minutes >= 60 && minutes % 60 == 0 {
+        format!("{}時間", minutes / 60)
+    } else if minutes >= 60 {
+        format!("{}時間{}分", minutes / 60, minutes % 60)
+    } else {
+        format!("{minutes}分")
+    }
+}
+
+fn format_usage(milliseconds: u64) -> String {
+    let total_minutes = milliseconds / 60_000;
+    if total_minutes >= 60 {
+        format!("{}時間{}分", total_minutes / 60, total_minutes % 60)
+    } else {
+        format!("{total_minutes}分")
+    }
+}
+
+fn now_epoch_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+impl eframe::App for ControlApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.drain_platform_events(ctx);
+    }
+
+    fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = root_ui.ctx().clone();
+        let is_break = self.screen == Screen::Break;
+        let background = if is_break { DARK } else { PAPER };
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(background)
+                    .inner_margin(egui::Margin::same(17)),
+            )
+            .show(root_ui, |ui| {
+                if self.screen == Screen::Break {
+                    self.draw_break(ui, &ctx);
+                    return;
+                }
+
+                self.draw_header(ui);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| match self.screen {
+                        Screen::Home => self.draw_home(ui, &ctx),
+                        Screen::Records => self.draw_records(ui),
+                        Screen::Settings => self.draw_settings(ui, &ctx),
+                        Screen::SelectApps => self.draw_app_selector(ui, &ctx),
+                        Screen::Disclosure => self.draw_disclosure(ui, &ctx),
+                        Screen::Break => {}
+                    });
+
+                ui.add_space(6.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let item_width = ui.available_width() / 3.0;
+                    for (screen, label, symbol) in [
+                        (Screen::Home, "ホーム", "⌂"),
+                        (Screen::Records, "記録", "▥"),
+                        (Screen::Settings, "設定", "●"),
+                    ] {
+                        let selected = self.screen == screen;
+                        let color = if selected { ORANGE } else { MUTED };
+                        let response = ui.add_sized(
+                            [item_width, 48.0],
+                            egui::Button::new(
+                                RichText::new(format!("{symbol}\n{label}"))
+                                    .size(13.0)
+                                    .color(color),
+                            )
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::NONE),
+                        );
+                        if response.clicked() {
+                            self.screen = screen;
+                        }
+                    }
+                });
+            });
+
+        ctx.request_repaint_after(Duration::from_secs(1));
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, SAVE_KEY, &self.saved);
+    }
+}
