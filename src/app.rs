@@ -16,13 +16,13 @@ const DARK: Color32 = Color32::from_rgb(31, 31, 32);
 const DEFAULT_LIMIT_MINUTES: u32 = 120;
 const DEFAULT_BREAK_MINUTES: u32 = 30;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrackedApp {
     pub label: String,
     pub package: String,
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 #[derive(Clone, Debug)]
 pub struct UsageSnapshot {
     pub permission_granted: bool,
@@ -34,6 +34,7 @@ pub struct UsageSnapshot {
 
 #[cfg(target_os = "android")]
 pub enum PlatformEvent {
+    InsetsLoaded(Result<Option<[i32; 4]>, String>),
     AppsLoaded(Result<Vec<TrackedApp>, String>),
     UsageLoaded(Result<UsageSnapshot, String>),
     ActionDone {
@@ -42,14 +43,14 @@ pub enum PlatformEvent {
     },
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct DailyRecord {
     day_key: String,
     label: String,
     used_ms: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 struct SavedState {
     target_apps: Vec<TrackedApp>,
@@ -87,6 +88,7 @@ enum Screen {
 
 pub struct ControlApp {
     saved: SavedState,
+    last_persisted: SavedState,
     screen: Screen,
     permission_granted: bool,
     usage_by_package_ms: HashMap<String, u64>,
@@ -103,6 +105,10 @@ pub struct ControlApp {
     events_rx: Receiver<PlatformEvent>,
     #[cfg(target_os = "android")]
     android_app: Option<android_activity::AndroidApp>,
+    #[cfg(target_os = "android")]
+    insets_loading: bool,
+    #[cfg(target_os = "android")]
+    window_insets: Option<[i32; 4]>,
 }
 
 impl ControlApp {
@@ -115,13 +121,14 @@ impl ControlApp {
     ) -> Self {
         configure_fonts_and_style(creation_context);
 
-        let saved = creation_context
+        let saved: SavedState = creation_context
             .storage
             .and_then(|storage| eframe::get_value(storage, SAVE_KEY))
             .unwrap_or_default();
         #[cfg(target_os = "android")]
         let (events_tx, events_rx) = mpsc::channel();
         let mut app = Self {
+            last_persisted: saved.clone(),
             saved,
             screen: Screen::Home,
             permission_granted: false,
@@ -139,6 +146,10 @@ impl ControlApp {
             events_rx,
             #[cfg(target_os = "android")]
             android_app,
+            #[cfg(target_os = "android")]
+            insets_loading: false,
+            #[cfg(target_os = "android")]
+            window_insets: None,
         };
 
         #[cfg(target_os = "android")]
@@ -200,6 +211,12 @@ impl ControlApp {
         #[cfg(target_os = "android")]
         loop {
             match self.events_rx.try_recv() {
+                Ok(PlatformEvent::InsetsLoaded(result)) => {
+                    self.insets_loading = false;
+                    if let Ok(insets) = result {
+                        self.window_insets = insets;
+                    }
+                }
                 Ok(PlatformEvent::AppsLoaded(result)) => {
                     self.apps_loading = false;
                     match result {
@@ -250,15 +267,19 @@ impl ControlApp {
         }
     }
 
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", test))]
     fn apply_usage_snapshot(&mut self, snapshot: UsageSnapshot) {
         self.permission_granted = snapshot.permission_granted;
         self.usage_by_package_ms = snapshot.usage_by_package_ms;
         self.today_label = snapshot.day_label.clone();
+        if !snapshot.permission_granted {
+            // Losing access does not turn an already recorded day into zero usage.
+            return;
+        }
 
         if !self.saved.current_day_key.is_empty() && self.saved.current_day_key != snapshot.day_key
         {
-            self.saved.cooldown_until_ms = None;
+            // A break started before midnight still has to run for its full duration.
             self.saved.limit_triggered_day = None;
         }
         self.saved.current_day_key = snapshot.day_key.clone();
@@ -279,11 +300,15 @@ impl ControlApp {
                 used_ms,
             });
         }
-        self.saved.daily_records.truncate(14);
+        if self.saved.daily_records.len() > 14 {
+            let excess = self.saved.daily_records.len() - 14;
+            self.saved.daily_records.drain(..excess);
+        }
 
         let limit_ms = u64::from(self.saved.daily_limit_minutes) * 60_000;
         if snapshot.permission_granted
             && used_ms >= limit_ms
+            && self.saved.cooldown_until_ms.is_none()
             && self.saved.limit_triggered_day.as_deref() != Some(snapshot.day_key.as_str())
         {
             self.begin_break(snapshot.now_ms, snapshot.day_key);
@@ -315,6 +340,16 @@ impl ControlApp {
         self.saved
             .cooldown_until_ms
             .map(|until| until.saturating_sub(now_epoch_ms()).max(0))
+    }
+
+    fn persist_changed_state(&mut self, frame: &mut eframe::Frame) {
+        if self.saved != self.last_persisted
+            && let Some(storage) = frame.storage_mut()
+        {
+            eframe::set_value(storage, SAVE_KEY, &self.saved);
+            storage.flush();
+            self.last_persisted = self.saved.clone();
+        }
     }
 
     fn refresh_apps(&mut self, ctx: egui::Context) {
@@ -402,7 +437,7 @@ impl ControlApp {
         }
         self.saved
             .target_apps
-            .sort_by(|left, right| left.label.to_lowercase().cmp(&right.label.to_lowercase()));
+            .sort_by_key(|app| app.label.to_lowercase());
         self.refresh_usage(ctx.clone());
     }
 
@@ -543,8 +578,12 @@ impl ControlApp {
                     .desired_width(ui.available_width())
                     .fill(ORANGE),
             );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new(format_limit(self.saved.daily_limit_minutes)).color(MUTED));
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format_limit(self.saved.daily_limit_minutes)).color(MUTED),
+                    );
+                });
             });
         });
 
@@ -921,7 +960,7 @@ fn full_width_button(ui: &mut egui::Ui, label: &str, fill: Color32) -> bool {
 }
 
 fn format_limit(minutes: u32) -> String {
-    if minutes >= 60 && minutes % 60 == 0 {
+    if minutes >= 60 && minutes.is_multiple_of(60) {
         format!("{}時間", minutes / 60)
     } else if minutes >= 60 {
         format!("{}時間{}分", minutes / 60, minutes % 60)
@@ -948,11 +987,44 @@ fn now_epoch_ms() -> i64 {
 }
 
 impl eframe::App for ControlApp {
+    #[cfg(target_os = "android")]
+    fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        if self.window_insets.is_none()
+            && !self.insets_loading
+            && let Some(app) = &self.android_app
+        {
+            self.insets_loading = true;
+            crate::platform::request_insets(app.clone(), self.events_tx.clone(), ctx.clone());
+        }
+        if let Some(app) = &self.android_app
+            && let Some(window) = app.native_window()
+        {
+            let rect = app.content_rect();
+            let width = window.width();
+            let height = window.height();
+            let insets = self.window_insets.unwrap_or_default();
+            if rect.right > rect.left && rect.bottom > rect.top {
+                let scale = input
+                    .viewports
+                    .get(&input.viewport_id)
+                    .and_then(|info| info.native_pixels_per_point)
+                    .unwrap_or(1.0)
+                    * ctx.zoom_factor();
+                input.safe_area_insets = Some(egui::SafeAreaInsets(egui::epaint::MarginF32 {
+                    left: rect.left.max(insets[0]).max(0) as f32 / scale,
+                    top: rect.top.max(insets[1]).max(0) as f32 / scale,
+                    right: (width - rect.right).max(insets[2]).max(0) as f32 / scale,
+                    bottom: (height - rect.bottom).max(insets[3]).max(0) as f32 / scale,
+                }));
+            }
+        }
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_platform_events(ctx);
     }
 
-    fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root_ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = root_ui.ctx().clone();
         let is_break = self.screen == Screen::Break;
         let background = if is_break { DARK } else { PAPER };
@@ -972,6 +1044,7 @@ impl eframe::App for ControlApp {
                 self.draw_header(ui);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
+                    .max_height((ui.available_height() - 72.0).max(100.0))
                     .show(ui, |ui| match self.screen {
                         Screen::Home => self.draw_home(ui, &ctx),
                         Screen::Records => self.draw_records(ui),
@@ -1009,10 +1082,106 @@ impl eframe::App for ControlApp {
                 });
             });
 
+        self.persist_changed_state(frame);
         ctx.request_repaint_after(Duration::from_secs(1));
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, SAVE_KEY, &self.saved);
+    }
+}
+
+#[cfg(all(test, not(target_os = "android")))]
+mod tests {
+    use super::*;
+
+    fn app() -> ControlApp {
+        ControlApp {
+            saved: SavedState {
+                target_apps: vec![TrackedApp {
+                    label: "架空動画".into(),
+                    package: "test.video".into(),
+                }],
+                ..SavedState::default()
+            },
+            last_persisted: SavedState::default(),
+            screen: Screen::Home,
+            permission_granted: false,
+            usage_by_package_ms: HashMap::new(),
+            today_label: String::new(),
+            available_apps: Vec::new(),
+            apps_loading: false,
+            usage_loading: false,
+            app_filter: String::new(),
+            notice: None,
+            last_refresh: Instant::now(),
+        }
+    }
+
+    fn snapshot(day: u32, minutes: u64) -> UsageSnapshot {
+        UsageSnapshot {
+            permission_granted: true,
+            day_key: format!("2026-10-{day:02}"),
+            day_label: format!("10月{day}日"),
+            now_ms: 1_000_000,
+            usage_by_package_ms: HashMap::from([("test.video".into(), minutes * 60_000)]),
+        }
+    }
+
+    #[test]
+    fn history_keeps_the_latest_fourteen_days() {
+        let mut app = app();
+        for day in 1..=16 {
+            app.apply_usage_snapshot(snapshot(day, u64::from(day)));
+        }
+        assert_eq!(app.saved.daily_records.len(), 14);
+        assert_eq!(
+            app.saved.daily_records.first().unwrap().day_key,
+            "2026-10-03"
+        );
+        assert_eq!(
+            app.saved.daily_records.last().unwrap().day_key,
+            "2026-10-16"
+        );
+        app.apply_usage_snapshot(snapshot(16, 22));
+        assert_eq!(app.saved.daily_records.len(), 14);
+        assert_eq!(app.saved.daily_records.last().unwrap().used_ms, 22 * 60_000);
+    }
+
+    #[test]
+    fn midnight_does_not_cancel_or_extend_an_active_break() {
+        let mut app = app();
+        app.apply_usage_snapshot(snapshot(1, 120));
+        let deadline = app.saved.cooldown_until_ms;
+        assert_eq!(deadline, Some(2_800_000));
+        app.apply_usage_snapshot(snapshot(2, 120));
+        assert_eq!(app.saved.cooldown_until_ms, deadline);
+        assert_eq!(app.screen, Screen::Break);
+    }
+
+    #[test]
+    fn denied_usage_access_preserves_previous_history() {
+        let mut app = app();
+        app.apply_usage_snapshot(snapshot(1, 44));
+        let saved = app.saved.clone();
+        let mut denied = snapshot(1, 0);
+        denied.permission_granted = false;
+        app.apply_usage_snapshot(denied);
+        assert!(!app.permission_granted);
+        assert_eq!(app.saved, saved);
+    }
+
+    #[test]
+    fn an_expired_break_is_not_restarted_for_the_same_day() {
+        let mut app = app();
+        app.apply_usage_snapshot(snapshot(1, 119));
+        assert_eq!(app.saved.cooldown_until_ms, None);
+        app.apply_usage_snapshot(snapshot(1, 120));
+        assert_eq!(app.screen, Screen::Break);
+        app.saved.cooldown_until_ms = None;
+        app.screen = Screen::Home;
+        app.apply_usage_snapshot(snapshot(1, 130));
+        assert_eq!(app.saved.cooldown_until_ms, None);
+        assert_eq!(app.screen, Screen::Home);
     }
 }

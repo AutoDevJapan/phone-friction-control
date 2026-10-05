@@ -11,6 +11,71 @@ use crate::app::{PlatformEvent, UsageSnapshot};
 
 const OWN_PACKAGE: &str = "com.autodevjapan.phonefrictioncontrol";
 
+pub fn request_insets(app: AndroidApp, events: Sender<PlatformEvent>, repaint: Context) {
+    let callback_app = app.clone();
+    app.run_on_java_main_thread(Box::new(move || {
+        let result = with_activity(&callback_app, |env, activity| {
+            let window = env
+                .call_method(activity, "getWindow", "()Landroid/view/Window;", &[])?
+                .l()?;
+            let view = env
+                .call_method(&window, "getDecorView", "()Landroid/view/View;", &[])?
+                .l()?;
+            let insets = env
+                .call_method(
+                    &view,
+                    "getRootWindowInsets",
+                    "()Landroid/view/WindowInsets;",
+                    &[],
+                )?
+                .l()?;
+            if insets.is_null() {
+                return Ok(None);
+            }
+            let sdk = env
+                .get_static_field("android/os/Build$VERSION", "SDK_INT", "I")?
+                .i()?;
+            let mut edges = [0; 4];
+            if sdk >= 30 {
+                let bars = env
+                    .call_static_method("android/view/WindowInsets$Type", "systemBars", "()I", &[])?
+                    .i()?;
+                let cutout = env
+                    .call_static_method(
+                        "android/view/WindowInsets$Type",
+                        "displayCutout",
+                        "()I",
+                        &[],
+                    )?
+                    .i()?;
+                let bounds = env
+                    .call_method(
+                        &insets,
+                        "getInsetsIgnoringVisibility",
+                        "(I)Landroid/graphics/Insets;",
+                        &[JValue::Int(bars | cutout)],
+                    )?
+                    .l()?;
+                for (edge, name) in edges.iter_mut().zip(["left", "top", "right", "bottom"]) {
+                    *edge = env.get_field(&bounds, name, "I")?.i()?;
+                }
+            } else {
+                for (edge, name) in edges.iter_mut().zip([
+                    "getSystemWindowInsetLeft",
+                    "getSystemWindowInsetTop",
+                    "getSystemWindowInsetRight",
+                    "getSystemWindowInsetBottom",
+                ]) {
+                    *edge = env.call_method(&insets, name, "()I", &[])?.i()?;
+                }
+            }
+            Ok(Some(edges))
+        });
+        let _ = events.send(PlatformEvent::InsetsLoaded(result));
+        repaint.request_repaint();
+    }));
+}
+
 pub fn request_apps(app: AndroidApp, events: Sender<PlatformEvent>, repaint: Context) {
     let callback_app = app.clone();
     app.run_on_java_main_thread(Box::new(move || {
@@ -108,19 +173,26 @@ fn with_activity<T>(
     let mut env = vm
         .attach_current_thread()
         .map_err(|error| format!("Androidへ接続できません: {error}"))?;
-    let env_raw = env.get_raw();
-    let env_table = unsafe { *env_raw };
-    let new_local_ref = unsafe { (*env_table).NewLocalRef }
-        .ok_or_else(|| "JNIの参照変換を利用できません".to_owned())?;
-    let activity_global = app.activity_as_ptr().cast::<jni::sys::_jobject>();
-    // SAFETY: android_activity owns this global reference for the lifetime of `app`.
-    let activity_local = unsafe { new_local_ref(env_raw, activity_global) };
-    if activity_local.is_null() {
-        return Err("Android Activityの参照を取得できません".to_owned());
+    let result = env.with_local_frame(64, |env| {
+        let env_raw = env.get_raw();
+        let env_table = unsafe { *env_raw };
+        let new_local_ref = unsafe { (*env_table).NewLocalRef }
+            .ok_or(jni::errors::Error::NullPtr("JNI NewLocalRef"))?;
+        let activity_global = app.activity_as_ptr().cast::<jni::sys::_jobject>();
+        // SAFETY: android_activity owns this global reference for the lifetime of `app`.
+        let activity_local = unsafe { new_local_ref(env_raw, activity_global) };
+        if activity_local.is_null() {
+            return Err(jni::errors::Error::NullPtr("Android Activity"));
+        }
+        // SAFETY: NewLocalRef returned a reference inside this local frame.
+        let activity = unsafe { JObject::from_raw(activity_local) };
+        call(env, &activity)
+    });
+    if result.is_err() {
+        // A caught Java exception must not leak into later callbacks on the UI thread.
+        let _ = env.exception_clear();
     }
-    // SAFETY: NewLocalRef returned a local reference in this attached thread.
-    let activity = unsafe { JObject::from_raw(activity_local) };
-    call(&mut env, &activity).map_err(|error| format!("Androidの操作に失敗しました: {error}"))
+    result.map_err(|error| format!("Androidの操作に失敗しました: {error}"))
 }
 
 fn query_launcher_apps(app: &AndroidApp) -> Result<Vec<TrackedApp>, String> {
@@ -207,7 +279,7 @@ fn query_launcher_apps(app: &AndroidApp) -> Result<Vec<TrackedApp>, String> {
             }
         }
 
-        apps.sort_by(|left, right| left.label.to_lowercase().cmp(&right.label.to_lowercase()));
+        apps.sort_by_key(|app| app.label.to_lowercase());
         Ok(apps)
     })
 }

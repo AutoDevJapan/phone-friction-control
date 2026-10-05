@@ -8,15 +8,15 @@ pub use app::ControlApp;
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 fn android_main(android_app: android_activity::AndroidApp) {
-    use egui_winit::winit::platform::android::EventLoopBuilderExtAndroid;
-
-    let event_loop_app = android_app.clone();
+    let Some(data_dir) = android_app.internal_data_path() else {
+        eprintln!("端末内の保存先を取得できないため起動を中止しました");
+        return;
+    };
     let app_for_ui = android_app.clone();
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
-        event_loop_builder: Some(Box::new(move |builder| {
-            builder.with_android_app(event_loop_app);
-        })),
+        android_app: Some(android_app),
+        persistence_path: Some(data_dir.join("control-state.ron")),
         ..Default::default()
     };
 
