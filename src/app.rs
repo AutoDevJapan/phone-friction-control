@@ -394,6 +394,20 @@ impl ControlApp {
         }
     }
 
+    fn restore_saved_state(&mut self, state: SavedState) {
+        self.screen = if state
+            .cooldown_until_ms
+            .is_some_and(|until| until > now_epoch_ms())
+        {
+            Screen::Break
+        } else {
+            Screen::Home
+        };
+        self.saved = state;
+        self.last_persisted = None;
+        self.last_refresh = Instant::now() - Duration::from_secs(120);
+    }
+
     fn refresh_apps(&mut self, ctx: egui::Context) {
         #[cfg(target_os = "android")]
         if let Some(android_app) = &self.android_app {
@@ -1078,7 +1092,7 @@ impl eframe::App for ControlApp {
             self.last_state_reload = Instant::now();
             if let Ok(state) = store.load() {
                 if let Some(state) = state {
-                    self.saved = state;
+                    self.restore_saved_state(state);
                 }
                 self.storage_error = None;
                 self.last_persisted = None;
@@ -1274,5 +1288,31 @@ mod tests {
         assert_eq!(restored.cooldown_until_ms, Some(2_800_000));
         assert_eq!(restored.target_apps[0].package, "test.video");
         assert_eq!(restored.daily_records[0].used_ms, 120 * 60_000);
+    }
+
+    #[test]
+    fn restored_completed_break_returns_to_home() {
+        let mut app = app();
+        app.apply_usage_snapshot(snapshot(1, 120));
+        assert_eq!(app.screen, Screen::Break);
+        let mut restored = app.saved.clone();
+        restored.cooldown_until_ms = None;
+        app.restore_saved_state(restored);
+        assert_eq!(app.screen, Screen::Home);
+        assert_eq!(app.saved.cooldown_until_ms, None);
+        app.apply_usage_snapshot(snapshot(1, 130));
+        assert_eq!(app.screen, Screen::Home);
+    }
+
+    #[test]
+    fn restored_active_break_opens_break_screen() {
+        let mut app = app();
+        let restored = SavedState {
+            cooldown_until_ms: Some(now_epoch_ms() + 30 * 60_000),
+            ..SavedState::default()
+        };
+        app.restore_saved_state(restored.clone());
+        assert_eq!(app.screen, Screen::Break);
+        assert_eq!(app.saved, restored);
     }
 }
