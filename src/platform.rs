@@ -190,7 +190,7 @@ pub fn launch_package(
     }));
 }
 
-fn with_activity<T>(
+pub(crate) fn with_activity<T>(
     app: &AndroidApp,
     call: impl FnOnce(&mut jni::JNIEnv<'_>, &JObject<'_>) -> jni::errors::Result<T>,
 ) -> Result<T, String> {

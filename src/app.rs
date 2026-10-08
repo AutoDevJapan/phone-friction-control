@@ -132,6 +132,12 @@ enum Screen {
 }
 
 pub struct ControlApp {
+    #[cfg(all(target_os = "android", feature = "ads-test"))]
+    ads_ui: Option<crate::ads::AdsUi>,
+    #[cfg(all(target_os = "android", feature = "ads-test"))]
+    ad_bounds: Option<[i32; 4]>,
+    #[cfg(all(target_os = "android", feature = "ads-test"))]
+    ad_pending: bool,
     saved: SavedState,
     last_persisted: Option<SavedState>,
     last_persist_at: Instant,
@@ -198,6 +204,12 @@ impl ControlApp {
         #[cfg(target_os = "android")]
         let (events_tx, events_rx) = mpsc::channel();
         let mut app = Self {
+            #[cfg(all(target_os = "android", feature = "ads-test"))]
+            ads_ui: android_app.as_ref().cloned().map(crate::ads::AdsUi::new),
+            #[cfg(all(target_os = "android", feature = "ads-test"))]
+            ad_bounds: None,
+            #[cfg(all(target_os = "android", feature = "ads-test"))]
+            ad_pending: false,
             last_persisted: None,
             last_persist_at: Instant::now(),
             #[cfg(target_os = "android")]
@@ -868,6 +880,34 @@ impl ControlApp {
             .fill(Color32::from_rgb(225, 220, 211))
             .inner_margin(egui::Margin::same(12))
             .show(ui, |ui| {
+                #[cfg(all(target_os = "android", feature = "ads-test"))]
+                if let Some(ads) = &self.ads_ui {
+                    ui.label(RichText::new("広告（試験用）").strong());
+                    ui.label("表示を選ぶとGoogleへ端末情報などを通信します。選んだアプリ名と利用時間は渡しません。");
+                    ui.horizontal(|ui| {
+                        if ads.is_requested() {
+                            if ui.button("広告を閉じる").clicked() { ads.close(); }
+                        } else if ui.button("任意の試験広告を表示").clicked() { self.ad_pending = true; }
+                        if ui.button("広告の同意設定").clicked() { ads.privacy(); }
+                    });
+                    ui.label(ads.status());
+                    let (slot, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 65.0), egui::Sense::hover());
+                    if ui.clip_rect().contains_rect(slot) {
+                        let scale = ctx.pixels_per_point();
+                        self.ad_bounds = Some([(slot.left()*scale).round() as i32, (slot.top()*scale).round() as i32, (slot.width()*scale).floor() as i32, (slot.height()*scale).floor() as i32]);
+                        if self.ad_pending {
+                            self.ad_pending = false;
+                            ads.request();
+                        }
+                    } else if self.ad_pending {
+                        // 広告欄が画面外のまま読み込むと直ちに閉じられるため、先に見える位置へ動かす。
+                        ui.scroll_to_rect(slot.expand(16.0), Some(Align::Center));
+                        ctx.request_repaint();
+                    }
+                    ui.label(RichText::new("広告を閉じても休憩や制限は変わりません。").size(12.0).color(MUTED));
+                }
+                #[cfg(not(all(target_os = "android", feature = "ads-test")))]
+                {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(RichText::new("広告").strong());
@@ -882,6 +922,7 @@ impl ControlApp {
                         .size(12.0)
                         .color(MUTED),
                 );
+                }
             });
 
         self.show_notice(ui);
@@ -1051,7 +1092,10 @@ impl ControlApp {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(RichText::new("広告").strong());
             ui.label("広告はこのアプリ内だけに表示する想定です。休憩画面には出さず、広告を断っても制限機能は変わりません。");
-            ui.label("現在は枠だけの試作で、広告配信は接続していません。");
+            #[cfg(all(target_os = "android", feature = "ads-test"))]
+            ui.label("この試験版はGoogleの試験広告に接続します。ホームで表示を選んだときだけ同意を確認し、広告を読み込みます。");
+            #[cfg(not(all(target_os = "android", feature = "ads-test")))]
+            ui.label("この版は広告枠だけで、広告配信には接続しません。");
         });
 
         self.show_notice(ui);
@@ -1330,6 +1374,10 @@ impl eframe::App for ControlApp {
     }
 
     fn ui(&mut self, root_ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        #[cfg(all(target_os = "android", feature = "ads-test"))]
+        {
+            self.ad_bounds = None;
+        }
         let ctx = root_ui.ctx().clone();
         let is_break = self.screen == Screen::Break;
         let background = if is_break { DARK } else { PAPER };
@@ -1392,6 +1440,16 @@ impl eframe::App for ControlApp {
             },
         );
 
+        #[cfg(all(target_os = "android", feature = "ads-test"))]
+        if let Some(ads) = &self.ads_ui {
+            if self.screen != Screen::Home || self.break_remaining_ms().is_some() {
+                self.ad_pending = false;
+            }
+            ads.sync(
+                self.screen == Screen::Home && self.break_remaining_ms().is_none(),
+                self.ad_bounds,
+            );
+        }
         self.persist_changed_state(frame);
         ctx.request_repaint_after(Duration::from_secs(1));
     }

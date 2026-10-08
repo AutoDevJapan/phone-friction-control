@@ -25,11 +25,11 @@
 
 ## 保存と広告
 
-アプリ名、利用者の設定、日ごとの合計利用時間と合計再生時間、休憩期限を端末内だけに保存します。画面の文字・画像・操作内容、通知本文、動画の題名を読みません。インターネット権限や広告SDKは追加していません。
+アプリ名、利用者の設定、日ごとの合計利用時間と合計再生時間、休憩期限を端末内だけに保存します。画面の文字・画像・操作内容、通知本文、動画の題名を読みません。通常版はインターネット権限や広告SDKを含みません。
 
 利用時間の更新は10秒ごと、休憩期限や設定変更はすぐに保存します。サービスと画面は別の保存先を使い、画面の更新には同一プロセス内の共有状態を使います。保存に失敗した場合もメモリ上の休憩は続け、失敗を画面へ示します。読めないファイルを空の状態で上書きしません。状態を読めない間も、新しく観測した時間と設定に残った休憩はメモリ上で制御します。合計は取得不能として表示し、5秒ごとに読み直します。読み取りが回復した場合は、重複するOS利用時間と、新しく観測した再生時間を区別して前の記録へ統合します。
 
-広告枠は任意表示で、このアプリ内に限ります。休憩画面へ置かず、広告視聴・拒否・読み込み失敗によって休憩を解除しません。広告配信・広告事業者との接続は未実装です。
+広告枠は任意表示で、このアプリ内に限ります。休憩画面へ置かず、広告視聴・拒否・読み込み失敗によって休憩を解除しません。`ads-test` 版だけGoogle GMA Next-Gen 1.5.0とUMP 4.0.0を接続します。ホームで表示を選んだ後に同意状況を更新し、`canRequestAds` の確認後に公式の試験広告を要求します。SDKはGoogleへ端末・通信情報などを送るため、操作前に説明します。選択アプリ名や利用時間はSDKへ渡しません。広告の個人向け最適化・SDKのクラッシュ報告・媒介初期化を無効にします。製品用の広告ユニットによる実配信は未完了です。
 
 iOS版、Family Controls配布許可、正式配布の署名、実端末での検証も未完了です。Androidの制御範囲をiOSへ当てはめません。これらは共有ToDo1614の未達条件として保持しています。
 
@@ -63,7 +63,10 @@ cargo run --locked -p android-bridge -- pack . target/aarch64-linux-android/debu
 
 ## 一次資料
 
+試験広告版は `cargo build --locked --target <Androidターゲット> --lib --features ads-test` の後、`android-bridge pack-ads <プロジェクト> <ライブラリ.so> <ABI> <新しい出力フォルダー> <Gradle実行ファイル>` で作ります。Gradle 8.14.3、AGP 8.13.2を使用し、AARの依存・DEX・リソースを統合します。作成器はSOのコピーだけをstripし、署名と16KB配置を確認します。Googleの試験IDを組み込むデバッグ版のため、製品配布には使いません。
+
 - [UsageStatsManager](https://developer.android.com/reference/android/app/usage/UsageStatsManager)
+- [GMA Next-Genのバナー広告](https://developers.google.com/admob/android/next-gen/banner)
 - [UsageEvents.Event](https://developer.android.com/reference/android/app/usage/UsageEvents.Event)
 - [MediaSessionManager](https://developer.android.com/reference/android/media/session/MediaSessionManager)
 - [AccessibilityService](https://developer.android.com/reference/android/accessibilityservice/AccessibilityService)

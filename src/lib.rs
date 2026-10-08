@@ -10,6 +10,11 @@ mod platform;
 #[cfg(target_os = "android")]
 mod service;
 
+#[cfg(all(target_os = "android", feature = "ads-test"))]
+mod ads;
+#[cfg(any(all(target_os = "android", feature = "ads-test"), test))]
+mod ads_state;
+
 pub use app::ControlApp;
 
 #[cfg(target_os = "android")]
