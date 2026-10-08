@@ -1,83 +1,71 @@
 # 利用制限
 
-成人が自分で決めたアプリ利用の上限と休憩時間を管理する、Android向けRust試作です。承認済みの画面案に合わせ、ホーム、記録、設定、休憩中の画面を用意しています。
+成人が自分で選んだアプリの利用上限と休憩時間を管理する、Rust製のAndroid試作です。別製品 `phone-friction` のランチャーとは別に開発しています。画面の基準は `mockups/usage-break-ui.png` です。
 
-## できること
+## Androidの設定
 
-- ホーム画面から起動できるアプリを選び、端末内で前面利用時間を集計する
-- 1日の上限を超えた後、休憩画面を設定時間表示する
-- Androidのホーム画面に設定した場合、ホームボタンで戻った時点で利用時間を確認する
-- 選んだアプリ名と日ごとの合計時間、休憩時間を端末内へ保存する
-- 広告枠は制御アプリ内だけに置く想定とし、休憩画面には広告を出さない
+1. 利用時間の説明を読み、「使用状況へのアクセス」をAndroid設定で許可します。
+2. 対象アプリ、1日の上限、休憩時間を選びます。
+3. 使用中の中断を使う場合は、設定画面の説明を読んで「ユーザー補助」で利用制限を有効にします。上限を超えた対象アプリが前面にある場合、休憩画面へ切り替えます。
+4. 再生時間だけを数える場合は、そのモードを選び、「通知へのアクセス」も許可します。
 
-## いまの制御範囲
+ユーザー補助の許可がなければ、ホームにこのアプリを設定し、ホームへ戻った時に上限を確認する方式です。許可した場合も、システム設定からの権限解除、アプリの強制停止・削除を妨げません。非対象のアプリを止めません。
 
-この試作は、Androidのホーム画面から対象アプリを開く使い方を前提にしています。ホームボタンで戻った時に上限を確認するため、上限を超えた瞬間に対象アプリの上へ画面を重ねる機能はありません。通知や外部リンクから直接開いたアプリも制御しません。
+## 計測と中断の範囲
 
-AndroidのUsageStats APIは利用時間を取得します。一般アプリから他社アプリを停止するDevicePolicyManager APIは使えないため、現段階ではホーム画面に戻った時点で休憩画面を表示します。Accessibility Serviceを使う強い制御は、Playの申告・開示要件を確認した別の実装段階が必要です。
+前面利用のモードは、AndroidのUsageEventsをRustで集計します。日付の境界、アプリの切替、複数Activity、画面消灯、端末再起動を扱います。履歴は初回に読み、その後は前回からの差分を取得します。遅れて追加される履歴のため直近10秒を繰り返し確認し、確定分だけを利用時間へ加えます。表示と発動には約10秒の遅れがあります。
 
-iOSの画面時間制御、AppleのFamily Controls配布許可、広告配信SDKと広告契約は含みません。広告配信は接続しておらず、インターネット権限も宣言していません。
+再生時間のモードは、選んだアプリが前面にあり、MediaSessionがPLAYINGを通知した間だけを数えます。停止、読み込み待ち、画面消灯、別アプリへ切り替えた間は数えません。取得できない場合は「取得できません」と表示し、利用時間で置き換えたり、その日をゼロで上書きしたりしません。利用時間と再生時間の記録は分けて保存します。
 
-## Androidの準備
+再生状態は動画と音声を区別せず、本人が画面を見ていたことも証明できません。MediaSessionを公開しないアプリには対応しません。TikTokやYouTubeを含むすべてのアプリで動くとは説明しません。アプリごとの実際の対応状況は別途確認が必要です。
 
-1. アプリの設定画面で利用時間の説明を確認し、Androidの「使用状況へのアクセス」を許可します。
-2. 休憩をホームボタンから適用するには、Androidの「ホームアプリ」設定でこのアプリを選びます。
-3. 制限するアプリと、1日の上限、休憩時間を設定します。
+その日の上限で休憩を開始し、同じ日の休憩は一度だけです。日をまたぐ既存の休憩を短くしません。期限は端末の時刻を使います。時計の変更を阻止する製品ではありません。休憩中の選択アプリへの再入場も、サービスが前面のアプリを検出して休憩画面へ切り替えます。OSや機種によるサービスの再接続・背景起動の違いは実機検証が必要です。
 
-使用状況へのアクセスが未許可でも、広告表示や別の権限付与を要求せず、制御が動かないことを画面に示します。
+## 保存と広告
 
-設定、選択アプリ、日ごとの記録、休憩の終了時刻はアプリ専用の保存先へ書き込みます。一時ファイルの書き込みと同期が成功した後に置き換えるため、途中で終了しても以前の正常な記録を残します。休憩中に日付が変わっても、元の休憩時間を短くしません。
+アプリ名、利用者の設定、日ごとの合計利用時間と合計再生時間、休憩期限を端末内だけに保存します。画面の文字・画像・操作内容、通知本文、動画の題名を読みません。インターネット権限や広告SDKは追加していません。
 
-取得するのはAndroidが集計した前面利用時間です。動画を再生していた時間そのものではありません。OSが集計範囲を日単位へ広げる場合があるため、厳密な視聴時間の判定には別の計測実装が必要です。
+利用時間の更新は10秒ごと、休憩期限や設定変更はすぐに保存します。サービスと画面は別の保存先を使い、画面の更新には同一プロセス内の共有状態を使います。保存に失敗した場合もメモリ上の休憩は続け、失敗を画面へ示します。読めないファイルを空の状態で上書きしません。
 
-## Androidの仕様資料
+広告枠は任意表示で、このアプリ内に限ります。休憩画面へ置かず、広告視聴・拒否・読み込み失敗によって休憩を解除しません。広告配信・広告事業者との接続は未実装です。
 
-- [UsageStatsManager](https://developer.android.com/reference/android/app/usage/UsageStatsManager)
-- [DevicePolicyManager.setPackagesSuspended](https://developer.android.com/reference/android/app/admin/DevicePolicyManager#setPackagesSuspended(android.content.ComponentName,java.lang.String[],boolean))
-- [Google Play: AccessibilityService API の利用条件](https://support.google.com/googleplay/android-developer/answer/10964491?hl=en)
-- [Apple: Family Controls entitlement の申請](https://developer.apple.com/documentation/familycontrols/requesting-the-family-controls-entitlement)
+iOS版、Family Controls配布許可、正式配布の署名、実端末での検証も未完了です。Androidの制御範囲をiOSへ当てはめません。これらは共有ToDo1614の未達条件として保持しています。
 
-## プレビュー
+## 検査とAPKの作成
 
-PC上の画面プレビューは次のコマンドで起動します。
+PC上の画面:
 
 ```powershell
-cargo run --features desktop-preview --bin phone-friction-control-preview
+cargo run --locked --features desktop-preview --bin phone-friction-control-preview
 ```
 
-Android APKはAndroid SDKのAAPT2、zipalign、apksignerとNDKで作成できます。配布用の署名鍵、広告SDK、APIキーはリポジトリへ置きません。
-
-### arm64の試用APKを作る
-
-Rustの `aarch64-linux-android` ターゲット、SDK Platform 36、Build Tools 36.1.0、NDK、JDKを用意します。以下はPowerShellでの一回の作成例です。`$out` は新しい作業用フォルダー、`$target` はCargoの生成先を指定してください。デバッグ鍵はAndroid Studioが作成した試験用のものを使用し、公開用の署名には使用しません。
+検査:
 
 ```powershell
-$ndk = "$env:ANDROID_HOME/ndk/30.0.14904198/toolchains/llvm/prebuilt/windows-x86_64/bin"
-$tools = "$env:ANDROID_HOME/build-tools/36.1.0"
-$env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = "$ndk/aarch64-linux-android26-clang.cmd"
-cargo build --locked --target aarch64-linux-android --lib
-New-Item -ItemType Directory -Path "$out/staging/lib/arm64-v8a" -Force
-Copy-Item "$target/aarch64-linux-android/debug/libphone_friction_control.so" "$out/staging/lib/arm64-v8a/libphone_friction_control.so"
-& "$ndk/llvm-strip.exe" --strip-unneeded "$out/staging/lib/arm64-v8a/libphone_friction_control.so"
-& "$tools/aapt2.exe" link -o "$out/unsigned.apk" --manifest android/AndroidManifest.xml -I "$env:ANDROID_HOME/platforms/android-36/android.jar" --version-code 1 --version-name 0.1.0 --debug-mode
-& "$env:JAVA_HOME/bin/jar.exe" --update --file "$out/unsigned.apk" --no-compress -C "$out/staging" lib/arm64-v8a/libphone_friction_control.so
-& "$tools/zipalign.exe" -P 16 -f 4 "$out/unsigned.apk" "$out/aligned.apk"
-& "$env:JAVA_HOME/bin/java.exe" -jar "$tools/lib/apksigner.jar" sign --ks "$env:USERPROFILE/.android/debug.keystore" --ks-key-alias androiddebugkey --ks-pass pass:android --key-pass pass:android --out "$out/phone-friction-control-arm64-debug.apk" "$out/aligned.apk"
-& "$env:JAVA_HOME/bin/java.exe" -jar "$tools/lib/apksigner.jar" verify --verbose "$out/phone-friction-control-arm64-debug.apk"
-& "$tools/zipalign.exe" -c -P 16 4 "$out/phone-friction-control-arm64-debug.apk"
-```
-
-各コマンドの終了コードが0であることを確認してから次へ進みます。APKはデバッグ可能な試用版です。正式配布の署名、広告配信、iOS版、実端末の検証は別途必要です。
-
-### 回帰検査
-
-```powershell
-cargo test --locked --features desktop-preview --lib
+cargo nextest run --locked --workspace --features desktop-preview --test-threads 10
+cargo test --locked --workspace --features desktop-preview --doc
+cargo clippy --locked --workspace --all-targets --features desktop-preview -- -D warnings
 cargo clippy --locked --target aarch64-linux-android --lib --no-deps -- -D warnings
 ```
 
-日付をまたぐ休憩、14日分の記録、権限解除時の記録保持、休憩終了後の再利用、保存内容の往復、途中の書き込み失敗と再保存を検査します。
+Rustターゲット、SDK Platform36、Build Tools36.1.0、NDK30.0.14904198、JDKとAndroidの標準デバッグ鍵を用意します。`ANDROID_HOME` と `JAVA_HOME` を設定します。このPCではCargoの共有ゲートと作業先固有の生成先を使います。
 
-## フォント
+```powershell
+$env:CARGO_TARGET_DIR = Join-Path (Get-Location) 'target'
+$env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = "$env:ANDROID_HOME/ndk/30.0.14904198/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android26-clang.cmd"
+cargo build --locked --target aarch64-linux-android --lib
+cargo run --locked -p android-bridge -- pack . target/aarch64-linux-android/debug/libphone_friction_control.so arm64-v8a <新しい出力フォルダー>
+```
 
-日本語表示にNoto Sans JPを使用します。ライセンスは `assets/OFL.txt` を参照してください。
+仮想端末用には `x86_64-linux-android` のライブラリとABI `x86_64` を使います。`android-bridge` はRustからJVMのサービス入口を生成し、d8でDEXに変換します。Java/Kotlinの製品ソースは追加していません。APKの署名と16KBのZIP配置を作成器が確認します。これはデバッグ可能な試用APKで、正式配布の鍵を使いません。
+
+## 一次資料
+
+- [UsageStatsManager](https://developer.android.com/reference/android/app/usage/UsageStatsManager)
+- [UsageEvents.Event](https://developer.android.com/reference/android/app/usage/UsageEvents.Event)
+- [MediaSessionManager](https://developer.android.com/reference/android/media/session/MediaSessionManager)
+- [AccessibilityService](https://developer.android.com/reference/android/accessibilityservice/AccessibilityService)
+- [Google PlayのAccessibilityService API利用条件](https://support.google.com/googleplay/android-developer/answer/10964491?hl=en)
+- [AppleのFamily Controls配布許可](https://developer.apple.com/documentation/familycontrols/requesting-the-family-controls-entitlement)
+
+日本語フォントはNoto Sans JPです。ライセンスは `assets/OFL.txt` を参照してください。

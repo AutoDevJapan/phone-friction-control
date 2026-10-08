@@ -8,6 +8,7 @@ pub struct StateStore {
 }
 
 impl StateStore {
+    #[cfg(any(target_os = "android", test))]
     pub fn new(path: PathBuf) -> Self {
         Self { path, ready: false }
     }
@@ -45,12 +46,17 @@ fn save<T: serde::Serialize>(path: &Path, state: &T) -> io::Result<()> {
     replace_with(path, |file| file.write_all(text.as_bytes()))
 }
 
+#[cfg(target_os = "android")]
+pub(crate) fn write_atomic<T: serde::Serialize>(path: &Path, state: &T) -> io::Result<()> {
+    save(path, state)
+}
+
 fn replace_with(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("Missing state directory"))?;
     fs::create_dir_all(parent)?;
-    // One app instance writes on its UI thread. An interrupted staging file is never loaded.
+    // Each path has one writer (UI or serialized guard worker). Never load staging files.
     let staging = path.with_extension("pending");
     let mut file = File::create(&staging)?;
     write(&mut file)?;

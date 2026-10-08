@@ -23,20 +23,26 @@ pub struct TrackedApp {
 }
 
 #[cfg(any(target_os = "android", test))]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UsageSnapshot {
     pub permission_granted: bool,
     pub day_key: String,
     pub day_label: String,
     pub now_ms: i64,
     pub usage_by_package_ms: HashMap<String, u64>,
+    pub foreground_package: Option<String>,
+    pub boot_count: i32,
+    pub measurement_available: bool,
 }
 
 #[cfg(target_os = "android")]
 pub enum PlatformEvent {
     InsetsLoaded(Result<Option<[i32; 4]>, String>),
     AppsLoaded(Result<Vec<TrackedApp>, String>),
-    UsageLoaded(Result<UsageSnapshot, String>),
+    UsageLoaded {
+        selected_packages: Vec<String>,
+        result: Result<UsageSnapshot, String>,
+    },
     ActionDone {
         label: String,
         result: Result<(), String>,
@@ -48,18 +54,23 @@ struct DailyRecord {
     day_key: String,
     label: String,
     used_ms: u64,
+    #[serde(default)]
+    playback_only: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-struct SavedState {
-    target_apps: Vec<TrackedApp>,
-    daily_limit_minutes: u32,
-    break_minutes: u32,
-    cooldown_until_ms: Option<i64>,
-    limit_triggered_day: Option<String>,
-    current_day_key: String,
+pub(crate) struct SavedState {
+    pub(crate) target_apps: Vec<TrackedApp>,
+    pub(crate) daily_limit_minutes: u32,
+    pub(crate) break_minutes: u32,
+    pub(crate) cooldown_until_ms: Option<i64>,
+    pub(crate) limit_triggered_day: Option<String>,
+    pub(crate) current_day_key: String,
     daily_records: Vec<DailyRecord>,
+    pub(crate) usage_disclosure_accepted: bool,
+    pub(crate) playback_only: bool,
+    pub(crate) service_disclosure_accepted: bool,
 }
 
 impl Default for SavedState {
@@ -72,6 +83,40 @@ impl Default for SavedState {
             limit_triggered_day: None,
             current_day_key: String::new(),
             daily_records: Vec::new(),
+            usage_disclosure_accepted: false,
+            playback_only: false,
+            service_disclosure_accepted: false,
+        }
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+impl SavedState {
+    fn accept_service_break(
+        &mut self,
+        deadline: Option<i64>,
+        triggered_day: Option<String>,
+        now: i64,
+    ) {
+        self.cooldown_until_ms = self
+            .cooldown_until_ms
+            .filter(|until| *until > now)
+            .max(deadline.filter(|until| *until > now));
+        if triggered_day.is_some() {
+            self.limit_triggered_day = triggered_day;
+        }
+    }
+    pub(crate) fn policy(&self) -> crate::enforcement::Policy {
+        crate::enforcement::Policy {
+            packages: self
+                .target_apps
+                .iter()
+                .map(|app| app.package.clone())
+                .collect(),
+            limit_minutes: self.daily_limit_minutes,
+            break_minutes: self.break_minutes,
+            playback_only: self.playback_only,
+            enabled: self.usage_disclosure_accepted && self.service_disclosure_accepted,
         }
     }
 }
@@ -89,11 +134,15 @@ enum Screen {
 pub struct ControlApp {
     saved: SavedState,
     last_persisted: Option<SavedState>,
+    last_persist_at: Instant,
+    #[cfg(target_os = "android")]
+    last_fallback_refresh: Instant,
     state_store: Option<crate::persistence::StateStore>,
     storage_error: Option<String>,
     last_state_reload: Instant,
     screen: Screen,
     permission_granted: bool,
+    measurement_available: bool,
     usage_by_package_ms: HashMap<String, u64>,
     today_label: String,
     available_apps: Vec<TrackedApp>,
@@ -149,12 +198,16 @@ impl ControlApp {
         let (events_tx, events_rx) = mpsc::channel();
         let mut app = Self {
             last_persisted: None,
+            last_persist_at: Instant::now(),
+            #[cfg(target_os = "android")]
+            last_fallback_refresh: Instant::now() - Duration::from_secs(120),
             state_store,
             storage_error,
             last_state_reload: Instant::now(),
             saved,
             screen: Screen::Home,
             permission_granted: false,
+            measurement_available: false,
             usage_by_package_ms: HashMap::new(),
             today_label: "今日".to_owned(),
             available_apps: Vec::new(),
@@ -192,6 +245,7 @@ impl ControlApp {
     #[cfg(not(target_os = "android"))]
     fn load_preview_data(&mut self) {
         self.permission_granted = true;
+        self.measurement_available = true;
         self.today_label = "日".to_owned();
         if self.saved.target_apps.is_empty() {
             self.saved.target_apps = vec![
@@ -227,6 +281,7 @@ impl ControlApp {
                 day_key: label.to_owned(),
                 label: label.to_owned(),
                 used_ms: minutes * 60_000,
+                playback_only: false,
             })
             .collect();
         }
@@ -252,8 +307,21 @@ impl ControlApp {
                         Err(error) => self.notice = Some(error),
                     }
                 }
-                Ok(PlatformEvent::UsageLoaded(result)) => {
+                Ok(PlatformEvent::UsageLoaded {
+                    selected_packages,
+                    result,
+                }) => {
                     self.usage_loading = false;
+                    let current: Vec<_> = self
+                        .saved
+                        .target_apps
+                        .iter()
+                        .map(|app| app.package.clone())
+                        .collect();
+                    if selected_packages != current {
+                        self.last_refresh = Instant::now() - Duration::from_secs(120);
+                        continue;
+                    }
                     match result {
                         Ok(snapshot) => self.apply_usage_snapshot(snapshot),
                         Err(error) => self.notice = Some(error),
@@ -287,7 +355,12 @@ impl ControlApp {
             self.screen = Screen::Break;
         }
 
-        if self.last_refresh.elapsed() >= Duration::from_secs(60) {
+        let refresh_seconds = if self.saved.service_disclosure_accepted {
+            1
+        } else {
+            60
+        };
+        if self.last_refresh.elapsed() >= Duration::from_secs(refresh_seconds) {
             self.refresh_usage(ctx.clone());
         }
     }
@@ -295,14 +368,17 @@ impl ControlApp {
     #[cfg(any(target_os = "android", test))]
     fn apply_usage_snapshot(&mut self, snapshot: UsageSnapshot) {
         self.permission_granted = snapshot.permission_granted;
-        self.usage_by_package_ms = snapshot.usage_by_package_ms;
+        self.measurement_available = snapshot.permission_granted && snapshot.measurement_available;
         self.today_label = snapshot.day_label.clone();
-        if !snapshot.permission_granted {
+        if !snapshot.permission_granted || !snapshot.measurement_available {
             // Losing access does not turn an already recorded day into zero usage.
             return;
         }
+        self.usage_by_package_ms = snapshot.usage_by_package_ms;
 
-        if !self.saved.current_day_key.is_empty() && self.saved.current_day_key != snapshot.day_key
+        if !self.saved.current_day_key.is_empty()
+            && self.saved.current_day_key != snapshot.day_key
+            && self.saved.limit_triggered_day.as_deref() != Some(snapshot.day_key.as_str())
         {
             // A break started before midnight still has to run for its full duration.
             self.saved.limit_triggered_day = None;
@@ -310,25 +386,31 @@ impl ControlApp {
         self.saved.current_day_key = snapshot.day_key.clone();
 
         let used_ms = self.today_usage_ms();
-        if let Some(record) = self
-            .saved
-            .daily_records
-            .iter_mut()
-            .find(|record| record.day_key == snapshot.day_key)
-        {
+        if let Some(record) = self.saved.daily_records.iter_mut().find(|record| {
+            record.day_key == snapshot.day_key && record.playback_only == self.saved.playback_only
+        }) {
             record.label = snapshot.day_label;
-            record.used_ms = used_ms;
+            // OS event history can be pruned/reset on reboot. A successful read
+            // must not erase the time already observed for this day.
+            record.used_ms = record.used_ms.max(used_ms);
         } else {
             self.saved.daily_records.push(DailyRecord {
                 day_key: snapshot.day_key.clone(),
                 label: snapshot.day_label,
                 used_ms,
+                playback_only: self.saved.playback_only,
             });
         }
-        if self.saved.daily_records.len() > 14 {
-            let excess = self.saved.daily_records.len() - 14;
-            self.saved.daily_records.drain(..excess);
+        let mut days = Vec::new();
+        for record in self.saved.daily_records.iter().rev() {
+            if !days.contains(&record.day_key) {
+                days.push(record.day_key.clone());
+            }
         }
+        days.truncate(14);
+        self.saved
+            .daily_records
+            .retain(|record| days.contains(&record.day_key));
 
         let limit_ms = u64::from(self.saved.daily_limit_minutes) * 60_000;
         if snapshot.permission_granted
@@ -358,7 +440,15 @@ impl ControlApp {
                     .copied()
                     .unwrap_or_default()
             })
-            .sum()
+            .fold(0_u64, u64::saturating_add)
+    }
+
+    fn display_usage(&self) -> String {
+        if !self.measurement_available {
+            "取得できません".into()
+        } else {
+            format_usage(self.today_usage_ms())
+        }
     }
 
     fn break_remaining_ms(&self) -> Option<i64> {
@@ -371,13 +461,43 @@ impl ControlApp {
         if self.last_persisted.as_ref() == Some(&self.saved) {
             return;
         }
+        if let Some(previous) = &self.last_persisted
+            && previous.target_apps == self.saved.target_apps
+            && previous.daily_limit_minutes == self.saved.daily_limit_minutes
+            && previous.break_minutes == self.saved.break_minutes
+            && previous.cooldown_until_ms == self.saved.cooldown_until_ms
+            && previous.limit_triggered_day == self.saved.limit_triggered_day
+            && previous.current_day_key == self.saved.current_day_key
+            && previous.usage_disclosure_accepted == self.saved.usage_disclosure_accepted
+            && previous.service_disclosure_accepted == self.saved.service_disclosure_accepted
+            && previous.playback_only == self.saved.playback_only
+            && self.last_persist_at.elapsed() < Duration::from_secs(10)
+        {
+            return;
+        }
         if let Some(store) = &self.state_store {
             if !store.is_ready() {
                 return;
             }
             match store.save(&self.saved) {
                 Ok(()) => {
+                    #[cfg(target_os = "android")]
+                    if let Some(dir) = self
+                        .android_app
+                        .as_ref()
+                        .and_then(|app| app.internal_data_path())
+                        && crate::persistence::write_atomic(
+                            &dir.join("guard-config.ron"),
+                            &self.saved,
+                        )
+                        .is_err()
+                    {
+                        self.storage_error =
+                            Some("使用中の制限設定を保存できません。保存を再試行します。".into());
+                        return;
+                    }
                     self.last_persisted = Some(self.saved.clone());
+                    self.last_persist_at = Instant::now();
                     self.storage_error = None;
                 }
                 Err(_) => {
@@ -391,6 +511,7 @@ impl ControlApp {
             eframe::set_value(storage, SAVE_KEY, &self.saved);
             storage.flush();
             self.last_persisted = Some(self.saved.clone());
+            self.last_persist_at = Instant::now();
         }
     }
 
@@ -420,6 +541,40 @@ impl ControlApp {
 
     fn refresh_usage(&mut self, ctx: egui::Context) {
         self.last_refresh = Instant::now();
+        if self.usage_loading || !self.saved.usage_disclosure_accepted {
+            return;
+        }
+        #[cfg(target_os = "android")]
+        if self.saved.service_disclosure_accepted {
+            if let Some(status) = crate::service::latest_status()
+                && status.policy == self.saved.policy()
+                && (0..=6_000).contains(&now_epoch_ms().saturating_sub(status.snapshot.now_ms))
+            {
+                self.saved.accept_service_break(
+                    status.cooldown_until_ms,
+                    status.triggered_day,
+                    now_epoch_ms(),
+                );
+                if status.storage_error {
+                    self.storage_error =
+                        Some("休憩は継続していますが、その状態を保存できません。".into());
+                }
+                if self.saved.playback_only && !status.media_available {
+                    self.notice = Some("再生状態を取得できません。Androidの通知へのアクセスを確認してください。再生時間を利用時間へ置き換えていません。".into());
+                }
+                self.apply_usage_snapshot(status.snapshot);
+                return;
+            }
+            self.notice = Some("使用中の中断はまだ動作を確認できません。Androidのユーザー補助で利用制限を有効にしてください。".into());
+            if self.saved.playback_only {
+                self.measurement_available = false;
+                return;
+            }
+            if self.last_fallback_refresh.elapsed() < Duration::from_secs(60) {
+                return;
+            }
+            self.last_fallback_refresh = Instant::now();
+        }
         #[cfg(target_os = "android")]
         if let Some(android_app) = &self.android_app {
             self.usage_loading = true;
@@ -441,6 +596,7 @@ impl ControlApp {
     }
 
     fn request_usage_settings(&mut self, ctx: egui::Context) {
+        self.saved.usage_disclosure_accepted = true;
         self.screen = Screen::Home;
         self.notice = None;
         #[cfg(target_os = "android")]
@@ -464,6 +620,25 @@ impl ControlApp {
         {
             let _ = ctx;
             self.notice = Some("Androidではホーム画面の選択を開きます。".to_owned());
+        }
+    }
+
+    fn request_guard_settings(&mut self, ctx: egui::Context, playback: bool) {
+        self.saved.usage_disclosure_accepted = true;
+        self.saved.service_disclosure_accepted = true;
+        #[cfg(target_os = "android")]
+        if let Some(android_app) = &self.android_app {
+            crate::platform::open_guard_settings(
+                android_app.clone(),
+                playback,
+                self.events_tx.clone(),
+                ctx,
+            );
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = (ctx, playback);
+            self.notice = Some("Androidでは説明を確認した後に、ユーザー補助または通知へのアクセスの設定を開きます。".into());
         }
     }
 
@@ -587,7 +762,14 @@ impl ControlApp {
                                 .copied()
                                 .unwrap_or_default();
                             if ui
-                                .button(format!("開く  ›  {}", format_usage(used)))
+                                .button(format!(
+                                    "開く  ›  {}",
+                                    if self.measurement_available {
+                                        format_usage(used)
+                                    } else {
+                                        "未取得".into()
+                                    }
+                                ))
                                 .clicked()
                             {
                                 self.open_target_app(target.clone(), ctx.clone());
@@ -613,16 +795,19 @@ impl ControlApp {
             });
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("今日の利用時間").color(MUTED));
+                ui.label(
+                    RichText::new(if self.saved.playback_only {
+                        "今日の再生時間"
+                    } else {
+                        "今日の利用時間"
+                    })
+                    .color(MUTED),
+                );
                 if self.usage_loading {
                     ui.spinner();
                 }
             });
-            ui.label(
-                RichText::new(format_usage(self.today_usage_ms()))
-                    .size(31.0)
-                    .strong(),
-            );
+            ui.label(RichText::new(self.display_usage()).size(31.0).strong());
             let limit_ms = u64::from(self.saved.daily_limit_minutes) * 60_000;
             let fraction = if limit_ms == 0 {
                 0.0
@@ -698,9 +883,17 @@ impl ControlApp {
             .fill(Color32::from_rgb(252, 235, 222))
             .inner_margin(egui::Margin::same(15))
             .show(ui, |ui| {
-                ui.label(format!("{}の利用時間", self.today_label));
+                ui.label(format!(
+                    "{}の{}",
+                    self.today_label,
+                    if self.saved.playback_only {
+                        "再生時間"
+                    } else {
+                        "利用時間"
+                    }
+                ));
                 ui.label(
-                    RichText::new(format_usage(self.today_usage_ms()))
+                    RichText::new(self.display_usage())
                         .size(30.0)
                         .strong()
                         .color(ORANGE),
@@ -715,6 +908,7 @@ impl ControlApp {
                 .saved
                 .daily_records
                 .iter()
+                .filter(|record| record.playback_only == self.saved.playback_only)
                 .rev()
                 .take(7)
                 .cloned()
@@ -818,9 +1012,26 @@ impl ControlApp {
             ui.label(
                 "ホームボタンからこのアプリに戻ると、利用時間を確認して休憩画面を表示します。",
             );
-            ui.label("通知や外部リンクから対象アプリを直接開く操作は、この試作では制御しません。");
+            ui.label("ホーム画面の設定だけでは、通知や外部リンクからの起動は制御しません。使用中の中断には、下のユーザー補助の許可が必要です。");
             if ui.button("Androidのホーム画面を選ぶ").clicked() {
                 self.request_home_settings(ctx.clone());
+            }
+        });
+
+        ui.add_space(10.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(RichText::new("使用中の中断と再生時間").strong());
+            ui.label("ユーザー補助を許可すると、選んだアプリの上限を確認して休憩画面へ切り替えます。画面の文字・画像・操作内容は読みません。許可はAndroid設定で解除できます。");
+            if ui.button("説明を確認してユーザー補助を開く").clicked() {
+                self.request_guard_settings(ctx.clone(), false);
+            }
+            if ui.checkbox(&mut self.saved.playback_only, "再生中と通知された時間だけを数える").changed() {
+                self.measurement_available = false;
+                self.last_refresh = Instant::now() - Duration::from_secs(120);
+            }
+            ui.label("再生時間には通知へのアクセスも必要です。通知本文は読みません。対象が前面にあり再生中の場合だけ数え、停止・読み込み待ち・画面消灯を除きます。動画と音声の区別や、画面を見ていたことは判定できません。再生状態を通知しないアプリには対応しません。");
+            if ui.button("説明を確認して通知へのアクセスを開く").clicked() {
+                self.request_guard_settings(ctx.clone(), true);
             }
         });
 
@@ -1195,11 +1406,13 @@ mod tests {
                 ..SavedState::default()
             },
             last_persisted: None,
+            last_persist_at: Instant::now(),
             state_store: None,
             storage_error: None,
             last_state_reload: Instant::now(),
             screen: Screen::Home,
             permission_granted: false,
+            measurement_available: false,
             usage_by_package_ms: HashMap::new(),
             today_label: String::new(),
             available_apps: Vec::new(),
@@ -1218,7 +1431,53 @@ mod tests {
             day_label: format!("10月{day}日"),
             now_ms: 1_000_000,
             usage_by_package_ms: HashMap::from([("test.video".into(), minutes * 60_000)]),
+            foreground_package: None,
+            boot_count: 1,
+            measurement_available: true,
         }
+    }
+
+    #[test]
+    fn stale_service_status_cannot_clear_a_new_break() {
+        let mut state = SavedState {
+            cooldown_until_ms: Some(2000),
+            ..SavedState::default()
+        };
+        state.accept_service_break(None, None, 1000);
+        assert_eq!(state.cooldown_until_ms, Some(2000));
+        state.accept_service_break(None, None, 2000);
+        assert_eq!(state.cooldown_until_ms, None);
+    }
+
+    #[test]
+    fn service_completed_break_at_midnight_is_not_restarted_by_ui() {
+        let mut app = app();
+        app.saved.current_day_key = "2026-10-01".into();
+        app.saved.limit_triggered_day = Some("2026-10-02".into());
+        app.apply_usage_snapshot(snapshot(2, 130));
+        assert_eq!(app.saved.cooldown_until_ms, None);
+    }
+
+    #[test]
+    fn background_policy_requires_both_disclosures() {
+        let mut state = SavedState::default();
+        assert!(!state.policy().enabled);
+        state.usage_disclosure_accepted = true;
+        assert!(!state.policy().enabled);
+        state.service_disclosure_accepted = true;
+        assert!(state.policy().enabled);
+    }
+
+    #[test]
+    fn foreground_and_playback_records_for_the_same_day_stay_separate() {
+        let mut app = app();
+        app.apply_usage_snapshot(snapshot(1, 44));
+        app.saved.playback_only = true;
+        app.apply_usage_snapshot(snapshot(1, 2));
+        assert_eq!(app.saved.daily_records.len(), 2);
+        assert_eq!(app.saved.daily_records[0].used_ms, 44 * 60_000);
+        assert_eq!(app.saved.daily_records[1].used_ms, 2 * 60_000);
+        assert!(app.saved.daily_records[1].playback_only);
     }
 
     #[test]
@@ -1262,6 +1521,33 @@ mod tests {
         app.apply_usage_snapshot(denied);
         assert!(!app.permission_granted);
         assert_eq!(app.saved, saved);
+        assert_eq!(app.display_usage(), "取得できません");
+        assert_eq!(app.today_usage_ms(), 44 * 60_000);
+    }
+
+    #[test]
+    fn unavailable_playback_does_not_create_a_zero_record_or_clear_observed_time() {
+        let mut app = app();
+        app.apply_usage_snapshot(snapshot(1, 44));
+        let saved = app.saved.clone();
+        let mut unavailable = snapshot(2, 0);
+        unavailable.measurement_available = false;
+        app.apply_usage_snapshot(unavailable);
+        assert_eq!(app.saved, saved);
+        assert_eq!(app.display_usage(), "取得できません");
+        assert_eq!(app.today_usage_ms(), 44 * 60_000);
+    }
+
+    #[test]
+    fn an_os_history_reset_cannot_erase_a_recorded_day() {
+        let mut app = app();
+        app.apply_usage_snapshot(snapshot(1, 44));
+        app.apply_usage_snapshot(snapshot(1, 0));
+        assert_eq!(app.saved.daily_records[0].used_ms, 44 * 60_000);
+        app.apply_usage_snapshot(snapshot(1, 47));
+        assert_eq!(app.saved.daily_records[0].used_ms, 47 * 60_000);
+        app.apply_usage_snapshot(snapshot(2, 1));
+        assert_eq!(app.saved.daily_records[1].used_ms, 60_000);
     }
 
     #[test]

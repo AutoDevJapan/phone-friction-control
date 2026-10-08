@@ -1,8 +1,14 @@
 mod app;
+#[cfg(any(target_os = "android", test))]
+mod enforcement;
 mod persistence;
+#[cfg(any(target_os = "android", test))]
+mod usage;
 
 #[cfg(target_os = "android")]
 mod platform;
+#[cfg(target_os = "android")]
+mod service;
 
 pub use app::ControlApp;
 
