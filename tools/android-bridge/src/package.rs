@@ -44,6 +44,16 @@ pub(crate) fn assemble(args: &[std::ffi::OsString]) -> io::Result<()> {
     if !["arm64-v8a", "x86_64"].contains(&abi) {
         return Err(io::Error::other("unsupported ABI"));
     }
+    // 広告入りのライブラリは広告用マニフェストでしか動かないため、通常のpackでは受け付けない。
+    let ads_symbol = b"Java_com_autodevjapan_phonefrictioncontrol_AdLoadListener_onAdLoaded";
+    if fs::read(&library)?
+        .windows(ads_symbol.len())
+        .any(|window| window == ads_symbol)
+    {
+        return Err(io::Error::other(
+            "library was built with ads-test; use pack-ads for it",
+        ));
+    }
     let output = Path::new(&args[3]);
     // Never overwrite a previous artifact or someone else's working files.
     fs::create_dir(output)?;
