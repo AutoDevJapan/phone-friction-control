@@ -2,7 +2,10 @@
 //!
 //! T は保持する参照の型。Android では GlobalRef、テストでは () を使う。
 // PCのテスト版では、Android側からだけ使う項目が未使用になる。
-#![cfg_attr(not(all(target_os = "android", feature = "ads-test")), allow(dead_code))]
+#![cfg_attr(
+    not(all(target_os = "android", feature = "ads-test")),
+    allow(dead_code)
+)]
 
 pub(super) const LEFT: &str = "ホーム画面を離れたため広告を閉じました。";
 pub(super) const PRIVACY_LEFT: &str =
