@@ -94,7 +94,10 @@ pub fn request_usage(
     let callback_app = app.clone();
     app.run_on_java_main_thread(Box::new(move || {
         let result = query_selected_usage(&callback_app, &selected_packages);
-        let _ = events.send(PlatformEvent::UsageLoaded(result));
+        let _ = events.send(PlatformEvent::UsageLoaded {
+            selected_packages,
+            result,
+        });
         repaint.request_repaint();
     }));
 }
@@ -114,6 +117,29 @@ pub fn open_home_settings(app: AndroidApp, events: Sender<PlatformEvent>, repain
         app,
         "android.settings.HOME_SETTINGS",
         "ホーム画面の選択",
+        events,
+        repaint,
+    );
+}
+
+pub fn open_guard_settings(
+    app: AndroidApp,
+    playback: bool,
+    events: Sender<PlatformEvent>,
+    repaint: Context,
+) {
+    open_settings(
+        app,
+        if playback {
+            "android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"
+        } else {
+            "android.settings.ACCESSIBILITY_SETTINGS"
+        },
+        if playback {
+            "通知へのアクセス"
+        } else {
+            "ユーザー補助"
+        },
         events,
         repaint,
     );
@@ -289,116 +315,198 @@ fn query_selected_usage(
     selected_packages: &[String],
 ) -> Result<UsageSnapshot, String> {
     with_activity(app, |env, activity| {
-        let now_ms = env
-            .call_static_method("java/lang/System", "currentTimeMillis", "()J", &[])?
-            .j()?;
-        let calendar = env
-            .call_static_method(
-                "java/util/Calendar",
-                "getInstance",
-                "()Ljava/util/Calendar;",
-                &[],
-            )?
-            .l()?;
-        for field in [11, 12, 13, 14] {
-            env.call_method(
-                &calendar,
-                "set",
-                "(II)V",
-                &[JValue::Int(field), JValue::Int(0)],
-            )?;
-        }
-        let start_ms = env
-            .call_method(&calendar, "getTimeInMillis", "()J", &[])?
-            .j()?;
-        let year = env
-            .call_method(&calendar, "get", "(I)I", &[JValue::Int(1)])?
-            .i()?;
-        let month = env
-            .call_method(&calendar, "get", "(I)I", &[JValue::Int(2)])?
-            .i()?
-            + 1;
-        let day = env
-            .call_method(&calendar, "get", "(I)I", &[JValue::Int(5)])?
-            .i()?;
-        let day_key = format!("{year:04}-{month:02}-{day:02}");
-        let day_label = format!("{month}月{day}日");
-
-        let app_ops = get_system_service(env, activity, "appops")?;
-        let package_name = env
-            .call_method(activity, "getPackageName", "()Ljava/lang/String;", &[])?
-            .l()?;
-        let operation = env.new_string("android:get_usage_stats")?;
-        let operation_object = JObject::from(operation);
-        let uid = env
-            .call_static_method("android/os/Process", "myUid", "()I", &[])?
-            .i()?;
-        let access_mode = env
-            .call_method(
-                &app_ops,
-                "checkOpNoThrow",
-                "(Ljava/lang/String;ILjava/lang/String;)I",
-                &[
-                    JValue::Object(&operation_object),
-                    JValue::Int(uid),
-                    JValue::Object(&package_name),
-                ],
-            )?
-            .i()?;
-        let mut usage_by_package_ms = HashMap::new();
-        if access_mode == 0 && !selected_packages.is_empty() {
-            let usage_manager = get_system_service(env, activity, "usagestats")?;
-            let usage_stats = env
-                .call_method(
-                    &usage_manager,
-                    "queryUsageStats",
-                    "(IJJ)Ljava/util/List;",
-                    &[JValue::Int(0), JValue::Long(start_ms), JValue::Long(now_ms)],
-                )?
-                .l()?;
-            if !usage_stats.is_null() {
-                let selected: HashSet<&str> =
-                    selected_packages.iter().map(String::as_str).collect();
-                let size = env.call_method(&usage_stats, "size", "()I", &[])?.i()?;
-                for index in 0..size {
-                    let (package, used_ms) =
-                        env.with_local_frame(12, |env| -> jni::errors::Result<(String, u64)> {
-                            let stats = env
-                                .call_method(
-                                    &usage_stats,
-                                    "get",
-                                    "(I)Ljava/lang/Object;",
-                                    &[JValue::Int(index)],
-                                )?
-                                .l()?;
-                            let package = env
-                                .call_method(&stats, "getPackageName", "()Ljava/lang/String;", &[])?
-                                .l()?;
-                            let package = read_java_string(env, package)?;
-                            let used_ms = env
-                                .call_method(&stats, "getTotalTimeInForeground", "()J", &[])?
-                                .j()?
-                                .max(0) as u64;
-                            Ok((package, used_ms))
-                        })?;
-                    if selected.contains(package.as_str()) {
-                        usage_by_package_ms.insert(package, used_ms);
-                    }
-                }
-            }
-        }
-
-        Ok(UsageSnapshot {
-            permission_granted: access_mode == 0,
-            day_key,
-            day_label,
-            now_ms,
-            usage_by_package_ms,
-        })
+        query_selected_usage_env(env, activity, selected_packages, false, None)
     })
 }
 
-fn get_system_service<'local>(
+pub(crate) fn query_selected_usage_env(
+    env: &mut jni::JNIEnv<'_>,
+    activity: &JObject<'_>,
+    selected_packages: &[String],
+    current_boot_only: bool,
+    tracker: Option<&mut crate::usage::UsageTracker>,
+) -> jni::errors::Result<UsageSnapshot> {
+    let now_ms = env
+        .call_static_method("java/lang/System", "currentTimeMillis", "()J", &[])?
+        .j()?;
+    let calendar = env
+        .call_static_method(
+            "java/util/Calendar",
+            "getInstance",
+            "()Ljava/util/Calendar;",
+            &[],
+        )?
+        .l()?;
+    for field in [11, 12, 13, 14] {
+        env.call_method(
+            &calendar,
+            "set",
+            "(II)V",
+            &[JValue::Int(field), JValue::Int(0)],
+        )?;
+    }
+    let start_ms = env
+        .call_method(&calendar, "getTimeInMillis", "()J", &[])?
+        .j()?;
+    let year = env
+        .call_method(&calendar, "get", "(I)I", &[JValue::Int(1)])?
+        .i()?;
+    let month = env
+        .call_method(&calendar, "get", "(I)I", &[JValue::Int(2)])?
+        .i()?
+        + 1;
+    let day = env
+        .call_method(&calendar, "get", "(I)I", &[JValue::Int(5)])?
+        .i()?;
+    let day_key = format!("{year:04}-{month:02}-{day:02}");
+    let day_label = format!("{month}月{day}日");
+    let resolver = env
+        .call_method(
+            activity,
+            "getContentResolver",
+            "()Landroid/content/ContentResolver;",
+            &[],
+        )?
+        .l()?;
+    let boot_key = JObject::from(env.new_string("boot_count")?);
+    let boot_count = env
+        .call_static_method(
+            "android/provider/Settings$Global",
+            "getInt",
+            "(Landroid/content/ContentResolver;Ljava/lang/String;I)I",
+            &[
+                JValue::Object(&resolver),
+                JValue::Object(&boot_key),
+                JValue::Int(-1),
+            ],
+        )?
+        .i()?;
+    let uptime = env
+        .call_static_method("android/os/SystemClock", "elapsedRealtime", "()J", &[])?
+        .j()?;
+    let boot_start = now_ms.saturating_sub(uptime);
+    let observation_start = if current_boot_only {
+        start_ms.max(boot_start)
+    } else {
+        start_ms
+    };
+
+    let app_ops = get_system_service(env, activity, "appops")?;
+    let package_name = env
+        .call_method(activity, "getPackageName", "()Ljava/lang/String;", &[])?
+        .l()?;
+    let operation = env.new_string("android:get_usage_stats")?;
+    let operation_object = JObject::from(operation);
+    let uid = env
+        .call_static_method("android/os/Process", "myUid", "()I", &[])?
+        .i()?;
+    let access_mode = env
+        .call_method(
+            &app_ops,
+            "checkOpNoThrow",
+            "(Ljava/lang/String;ILjava/lang/String;)I",
+            &[
+                JValue::Object(&operation_object),
+                JValue::Int(uid),
+                JValue::Object(&package_name),
+            ],
+        )?
+        .i()?;
+    let mut usage_by_package_ms = HashMap::new();
+    let mut foreground_package = None;
+    if access_mode == 0 && !selected_packages.is_empty() {
+        let mut working = tracker.as_deref().cloned().unwrap_or_default();
+        let earliest = if current_boot_only {
+            observation_start.saturating_sub(86_400_000).max(boot_start)
+        } else {
+            observation_start.saturating_sub(86_400_000)
+        };
+        let query_begin = working.prepare(
+            &day_key,
+            boot_count,
+            selected_packages,
+            observation_start,
+            now_ms,
+            earliest,
+        );
+        let usage_manager = get_system_service(env, activity, "usagestats")?;
+        let events = env
+            .call_method(
+                &usage_manager,
+                "queryEvents",
+                "(JJ)Landroid/app/usage/UsageEvents;",
+                &[JValue::Long(query_begin), JValue::Long(now_ms)],
+            )?
+            .l()?;
+        // A null result on a locked Android user is not a measured zero.
+        if events.is_null() {
+            return Err(jni::errors::Error::NullPtr("UsageEvents unavailable"));
+        }
+        let event = env.new_object("android/app/usage/UsageEvents$Event", "()V", &[])?;
+        while env.call_method(&events, "hasNextEvent", "()Z", &[])?.z()? {
+            if !env
+                .call_method(
+                    &events,
+                    "getNextEvent",
+                    "(Landroid/app/usage/UsageEvents$Event;)Z",
+                    &[JValue::Object(&event)],
+                )?
+                .z()?
+            {
+                break;
+            }
+            let kind = env.call_method(&event, "getEventType", "()I", &[])?.i()?;
+            let kind = match kind {
+                1 => crate::usage::EventKind::Resumed,
+                2 | 23 => crate::usage::EventKind::Paused,
+                16 | 17 => crate::usage::EventKind::ScreenOff,
+                26 | 27 => crate::usage::EventKind::Shutdown,
+                _ => continue,
+            };
+            let at_ms = env.call_method(&event, "getTimeStamp", "()J", &[])?.j()?;
+            if at_ms >= now_ms {
+                continue;
+            }
+            env.with_local_frame(8, |env| -> jni::errors::Result<()> {
+                let package = env
+                    .call_method(&event, "getPackageName", "()Ljava/lang/String;", &[])?
+                    .l()?;
+                let class = env
+                    .call_method(&event, "getClassName", "()Ljava/lang/String;", &[])?
+                    .l()?;
+                let package = if package.is_null() {
+                    String::new()
+                } else {
+                    read_java_string(env, package)?
+                };
+                let class = if class.is_null() {
+                    String::new()
+                } else {
+                    read_java_string(env, class)?
+                };
+                working.event(at_ms, &package, &class, kind);
+                Ok(())
+            })?;
+        }
+        (usage_by_package_ms, foreground_package) = working.result(now_ms);
+        if let Some(tracker) = tracker {
+            *tracker = working;
+        }
+    }
+
+    Ok(UsageSnapshot {
+        permission_granted: access_mode == 0,
+        day_key,
+        day_label,
+        now_ms,
+        usage_by_package_ms,
+        foreground_package,
+        boot_count,
+        measurement_available: access_mode == 0,
+    })
+}
+
+pub(crate) fn get_system_service<'local>(
     env: &mut jni::JNIEnv<'local>,
     activity: &JObject<'_>,
     name: &str,
@@ -414,7 +522,10 @@ fn get_system_service<'local>(
     .l()
 }
 
-fn read_java_string(env: &mut jni::JNIEnv<'_>, value: JObject<'_>) -> jni::errors::Result<String> {
+pub(crate) fn read_java_string(
+    env: &mut jni::JNIEnv<'_>,
+    value: JObject<'_>,
+) -> jni::errors::Result<String> {
     let value = JString::from(value);
     Ok(env.get_string(&value)?.into())
 }

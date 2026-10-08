@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="control_service_description">選んだアプリが利用上限を超えた時と休憩中に、休憩画面へ切り替えます。画面の文字・画像・操作内容は読みません。アプリ名とその日の合計時間を端末内だけに保存します。許可はこの設定でいつでも解除できます。</string>
+</resources>
