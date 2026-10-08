@@ -18,6 +18,10 @@ static LIVE_STATUS: std::sync::Mutex<Option<GuardStatus>> = std::sync::Mutex::ne
 static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static WAKE_FLAG: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 static WAKE: std::sync::Condvar = std::sync::Condvar::new();
+#[cfg(feature = "ads-test")]
+pub(crate) fn generation_is_current(generation: u64) -> bool {
+    GENERATION.load(Ordering::SeqCst) == generation
+}
 pub(crate) fn service_running() -> bool {
     RUNNING.load(Ordering::SeqCst)
 }
@@ -446,10 +450,22 @@ fn pause_selected(
 }
 
 fn interrupt(env: &mut JNIEnv, context: &JObject) -> jni::errors::Result<bool> {
+    #[cfg(feature = "ads-test")]
+    if crate::ads::defer_interrupt(env, context, GENERATION.load(Ordering::SeqCst))? {
+        return Ok(true);
+    }
+    interrupt_direct(env, context)
+}
+
+pub(crate) fn interrupt_direct(env: &mut JNIEnv, context: &JObject) -> jni::errors::Result<bool> {
     // Global HOME is asynchronous: starting the break immediately afterwards
     // races with HOME and can leave the launcher on top. Switch directly instead.
     let intent = env.new_object("android/content/Intent", "()V", &[])?;
-    let class = JObject::from(env.new_string("android.app.NativeActivity")?);
+    #[cfg(feature = "ads-test")]
+    let activity_class = "com.autodevjapan.phonefrictioncontrol.ControlAdsActivity";
+    #[cfg(not(feature = "ads-test"))]
+    let activity_class = "android.app.NativeActivity";
+    let class = JObject::from(env.new_string(activity_class)?);
     env.call_method(
         &intent,
         "setClassName",

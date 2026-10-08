@@ -7,6 +7,8 @@
 //! ControlService のコールバックは親の Rust ライブラリが JNI で公開する native 関数へ渡す。
 
 use std::{env, fs, path::Path, process::ExitCode};
+mod ads_callbacks;
+mod ads_package;
 mod package;
 
 const PACKAGE: &str = "com/autodevjapan/phonefrictioncontrol";
@@ -224,6 +226,28 @@ fn write_classes(out_dir: &Path) -> std::io::Result<()> {
 
 fn main() -> ExitCode {
     let args: Vec<_> = env::args_os().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "pack-ads") {
+        return match ads_package::assemble(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("android-bridge: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if args.first().is_some_and(|arg| arg == "ads-classes") {
+        return match args
+            .get(1)
+            .ok_or_else(|| std::io::Error::other("ads-classes <output-directory>"))
+            .and_then(|out| ads_callbacks::write_classes(Path::new(out)))
+        {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("android-bridge: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if args.first().is_some_and(|arg| arg == "pack") {
         return match package::assemble(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
