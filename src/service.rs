@@ -1,6 +1,6 @@
 //! Android accessibility lifecycle and background guard. Business logic is Rust.
 use crate::app::{SavedState, UsageSnapshot};
-use crate::enforcement::{GuardState, Policy};
+use crate::enforcement::{GuardState, MediaObservation, Policy};
 use crate::platform::{get_system_service, query_selected_usage_env, read_java_string};
 use jni::{
     JNIEnv,
@@ -15,8 +15,12 @@ const PACKAGE: &str = "com.autodevjapan.phonefrictioncontrol";
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static WORKER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static LIVE_STATUS: std::sync::Mutex<Option<GuardStatus>> = std::sync::Mutex::new(None);
-static TRACKED_PACKAGES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-static EVENT_FOREGROUND: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
+static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WAKE_FLAG: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+static WAKE: std::sync::Condvar = std::sync::Condvar::new();
+pub(crate) fn service_running() -> bool {
+    RUNNING.load(Ordering::SeqCst)
+}
 pub(crate) fn latest_status() -> Option<GuardStatus> {
     LIVE_STATUS
         .lock()
@@ -43,7 +47,6 @@ pub extern "system" fn Java_com_autodevjapan_phonefrictioncontrol_ControlService
     let result = (|| -> jni::errors::Result<()> {
         let vm = env.get_java_vm()?;
         let service = env.new_global_ref(service)?;
-        *EVENT_FOREGROUND.lock().unwrap_or_else(|p| p.into_inner()) = None;
         let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
         std::thread::spawn(move || run_guard(vm, service, generation));
         Ok(())
@@ -55,33 +58,14 @@ pub extern "system" fn Java_com_autodevjapan_phonefrictioncontrol_ControlService
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_autodevjapan_phonefrictioncontrol_ControlService_onAccessibilityEvent(
-    mut env: JNIEnv,
+    _env: JNIEnv,
     _service: JObject,
-    event: JObject,
+    _event: JObject,
 ) {
-    // Only the OS package identity; never inspect text, view trees or notification bodies.
-    let result = (|| -> jni::errors::Result<()> {
-        let name = env
-            .call_method(&event, "getPackageName", "()Ljava/lang/CharSequence;", &[])?
-            .l()?;
-        if name.is_null() {
-            return Ok(());
-        }
-        let string = env
-            .call_method(&name, "toString", "()Ljava/lang/String;", &[])?
-            .l()?;
-        let package = read_java_string(&mut env, string)?;
-        let selected = TRACKED_PACKAGES
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains(&package);
-        *EVENT_FOREGROUND.lock().unwrap_or_else(|p| p.into_inner()) =
-            Some(selected.then_some(package));
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = env.exception_clear();
-    }
+    // Window events include IME/volume panels, so they only wake the worker.
+    // Foreground identity comes exclusively from the replayable UsageEvents.
+    *WAKE_FLAG.lock().unwrap_or_else(|p| p.into_inner()) = true;
+    WAKE.notify_one();
 }
 
 #[unsafe(no_mangle)]
@@ -121,6 +105,8 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
         return;
     };
     let mut config_store = crate::persistence::StateStore::new(dir.join("guard-config.ron"));
+    let mut last_config: Option<SavedState> = None;
+    RUNNING.store(true, Ordering::SeqCst);
     let mut guard_store = crate::persistence::StateStore::new(dir.join("guard-state.ron"));
     let mut state: Option<GuardState> = None;
     let mut last_saved: Option<GuardState> = None;
@@ -130,30 +116,60 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
     let mut last_playing: Option<String> = None;
     let mut last_sample = Instant::now();
     let mut last_interruption = Instant::now() - Duration::from_secs(10);
+    let mut last_pause = Instant::now() - Duration::from_secs(10);
     while GENERATION.load(Ordering::SeqCst) == generation {
-        if state.is_none() && last_load.elapsed() >= Duration::from_secs(5) {
+        if !guard_store.is_ready() && last_load.elapsed() >= Duration::from_secs(5) {
             last_load = Instant::now();
-            if let Ok(restored) = guard_store.load::<GuardState>() {
-                state = Some(restored.unwrap_or_default());
-                last_saved = state.clone();
-            }
-        }
-        if let Some(state) = &mut state
-            && let Ok(Some(config)) = config_store.load::<SavedState>()
-        {
-            let policy = config.policy();
-            {
-                let mut tracked = TRACKED_PACKAGES.lock().unwrap_or_else(|p| p.into_inner());
-                if *tracked != policy.packages {
-                    *tracked = policy.packages.clone();
-                    *EVENT_FOREGROUND.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            match guard_store.load::<GuardState>() {
+                Ok(restored) => {
+                    let mut restored = restored.unwrap_or_default();
+                    last_saved = Some(restored.clone());
+                    if let Some(memory) = state.take() {
+                        restored.merge_unpersisted(memory);
+                    }
+                    state = Some(restored);
+                }
+                Err(_) => {
+                    // Count new observations in memory without overwriting unreadable history.
+                    state.get_or_insert_with(GuardState::default);
                 }
             }
+        }
+        if let Ok(config) = config_store.load::<SavedState>() {
+            last_config = config;
+        }
+        if let Some(state) = &mut state
+            && let Some(config) = &last_config
+        {
+            let policy = config.policy();
             if policy.enabled {
                 let result =
                     env.with_local_frame(64, |env| -> jni::errors::Result<Option<GuardStatus>> {
                         let power = get_system_service(env, service.as_obj(), "power")?;
                         let keyguard = get_system_service(env, service.as_obj(), "keyguard")?;
+                        let now = env
+                            .call_static_method(
+                                "java/lang/System",
+                                "currentTimeMillis",
+                                "()J",
+                                &[],
+                            )?
+                            .j()?;
+                        state.import_break(
+                            config.cooldown_until_ms,
+                            &config.limit_triggered_day,
+                            now,
+                        );
+                        // A break also stops selected background/PiP sessions. This runs before
+                        // the display check; playback measurement still requires a visible screen.
+                        if state.cooldown_until_ms.is_some_and(|until| until > now)
+                            && last_pause.elapsed() >= Duration::from_secs(2)
+                            && GENERATION.load(Ordering::SeqCst) == generation
+                        {
+                            let _ = pause_selected(env, service.as_obj(), &policy.packages);
+                            let _ = env.exception_clear();
+                            last_pause = Instant::now();
+                        }
                         if !env.call_method(&power, "isInteractive", "()Z", &[])?.z()?
                             || env
                                 .call_method(&keyguard, "isKeyguardLocked", "()Z", &[])?
@@ -170,13 +186,6 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                             true,
                             Some(&mut tracker),
                         )?;
-                        if let Some(foreground) = EVENT_FOREGROUND
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .clone()
-                        {
-                            snapshot.foreground_package = foreground;
-                        }
                         let elapsed = last_sample.elapsed().as_millis() as u64;
                         last_sample = Instant::now();
                         if state
@@ -195,16 +204,18 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                                 &snapshot.usage_by_package_ms,
                             );
                             state.retain_selected(&policy);
-                            let media = playing_package(
+                            let media = observe_media(
                                 env,
                                 service.as_obj(),
                                 &snapshot.foreground_package,
+                                &policy.packages,
                             );
-                            media_available = media.is_ok();
-                            if !media_available {
+                            if media.is_err() {
                                 let _ = env.exception_clear();
                             }
-                            let playing = media.unwrap_or(None);
+                            let media = media.unwrap_or_default();
+                            media_available = media.available(&policy.packages);
+                            let playing = media.playing;
                             state.observe_playback(
                                 changed_day,
                                 playing,
@@ -217,8 +228,9 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                                 snapshot.now_ms,
                             );
                             state.enforce(&policy, snapshot.now_ms);
-                            snapshot.measurement_available =
-                                !policy.playback_only || media_available;
+                            snapshot.measurement_available = guard_store.is_ready()
+                                && config_store.is_ready()
+                                && (!policy.playback_only || media_available);
                             snapshot.usage_by_package_ms = if policy.playback_only {
                                 state.playback_ms.clone()
                             } else {
@@ -234,7 +246,7 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                                 || old.triggered_day != state.triggered_day
                                 || old.day != state.day
                         });
-                        let mut storage_error = false;
+                        let mut storage_error = !guard_store.is_ready() || !config_store.is_ready();
                         let mut wrote = false;
                         if last_saved.as_ref() != Some(state)
                             && (critical || last_save.elapsed() >= Duration::from_secs(10))
@@ -251,6 +263,14 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                             }
                         }
                         let mut interruption_succeeded = false;
+                        if state.cooldown_until_ms.is_some()
+                            && last_pause.elapsed() >= Duration::from_secs(2)
+                            && GENERATION.load(Ordering::SeqCst) == generation
+                        {
+                            let _ = pause_selected(env, service.as_obj(), &policy.packages);
+                            let _ = env.exception_clear();
+                            last_pause = Instant::now();
+                        }
                         // Keep the in-memory break working even when a persistence attempt fails.
                         if should_interrupt
                             && last_interruption.elapsed() >= Duration::from_secs(2)
@@ -296,14 +316,18 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
             last_playing = None;
             last_sample = Instant::now();
         }
-        std::thread::sleep(Duration::from_secs(1));
+        let flag = WAKE_FLAG.lock().unwrap_or_else(|p| p.into_inner());
+        let (mut flag, _) = WAKE
+            .wait_timeout_while(flag, Duration::from_secs(1), |flag| !*flag)
+            .unwrap_or_else(|p| p.into_inner());
+        *flag = false;
     }
+    RUNNING.store(false, Ordering::SeqCst);
 }
-fn playing_package(
-    env: &mut JNIEnv,
+fn active_sessions<'local>(
+    env: &mut JNIEnv<'local>,
     context: &JObject,
-    foreground: &Option<String>,
-) -> jni::errors::Result<Option<String>> {
+) -> jni::errors::Result<JObject<'local>> {
     let manager = get_system_service(env, context, "media_session")?;
     let name = JObject::from(env.new_string(format!("{PACKAGE}.MediaListener"))?);
     let component = env.new_object(
@@ -311,17 +335,26 @@ fn playing_package(
         "(Landroid/content/Context;Ljava/lang/String;)V",
         &[JValue::Object(context), JValue::Object(&name)],
     )?;
-    let sessions = env
-        .call_method(
-            &manager,
-            "getActiveSessions",
-            "(Landroid/content/ComponentName;)Ljava/util/List;",
-            &[JValue::Object(&component)],
-        )?
-        .l()?;
+    env.call_method(
+        &manager,
+        "getActiveSessions",
+        "(Landroid/content/ComponentName;)Ljava/util/List;",
+        &[JValue::Object(&component)],
+    )?
+    .l()
+}
+
+fn observe_media(
+    env: &mut JNIEnv,
+    context: &JObject,
+    foreground: &Option<String>,
+    selected: &[String],
+) -> jni::errors::Result<MediaObservation> {
+    let sessions = active_sessions(env, context)?;
+    let mut observation = MediaObservation::default();
     let size = env.call_method(&sessions, "size", "()I", &[])?.i()?;
     for index in 0..size {
-        let playing = env.with_local_frame(12, |env| -> jni::errors::Result<Option<String>> {
+        let result = env.with_local_frame(12, |env| -> jni::errors::Result<()> {
             let controller = env
                 .call_method(
                     &sessions,
@@ -334,8 +367,8 @@ fn playing_package(
                 .call_method(&controller, "getPackageName", "()Ljava/lang/String;", &[])?
                 .l()?;
             let package = read_java_string(env, package)?;
-            if foreground.as_deref() != Some(package.as_str()) {
-                return Ok(None);
+            if !selected.contains(&package) {
+                return Ok(());
             }
             let state = env
                 .call_method(
@@ -346,16 +379,70 @@ fn playing_package(
                 )?
                 .l()?;
             if state.is_null() {
-                return Ok(None);
+                return Ok(());
             }
-            let playing = env.call_method(&state, "getState", "()I", &[])?.i()? == 3;
-            Ok(playing.then_some(package))
-        })?;
-        if playing.is_some() {
-            return Ok(playing);
+            let state = env.call_method(&state, "getState", "()I", &[])?.i()?;
+            observation.observe(&package, state, foreground.as_deref());
+            Ok(())
+        });
+        if result.is_err() {
+            let _ = env.exception_clear();
         }
     }
-    Ok(None)
+    Ok(observation)
+}
+
+fn pause_selected(
+    env: &mut JNIEnv,
+    context: &JObject,
+    selected: &[String],
+) -> jni::errors::Result<()> {
+    let sessions = active_sessions(env, context)?;
+    let size = env.call_method(&sessions, "size", "()I", &[])?.i()?;
+    for index in 0..size {
+        let result = env.with_local_frame(12, |env| -> jni::errors::Result<()> {
+            let controller = env
+                .call_method(
+                    &sessions,
+                    "get",
+                    "(I)Ljava/lang/Object;",
+                    &[JValue::Int(index)],
+                )?
+                .l()?;
+            let package = env
+                .call_method(&controller, "getPackageName", "()Ljava/lang/String;", &[])?
+                .l()?;
+            let package = read_java_string(env, package)?;
+            if !selected.contains(&package) {
+                return Ok(());
+            }
+            let state = env
+                .call_method(
+                    &controller,
+                    "getPlaybackState",
+                    "()Landroid/media/session/PlaybackState;",
+                    &[],
+                )?
+                .l()?;
+            if state.is_null() || env.call_method(&state, "getState", "()I", &[])?.i()? != 3 {
+                return Ok(());
+            }
+            let controls = env
+                .call_method(
+                    &controller,
+                    "getTransportControls",
+                    "()Landroid/media/session/MediaController$TransportControls;",
+                    &[],
+                )?
+                .l()?;
+            env.call_method(&controls, "pause", "()V", &[])?;
+            Ok(())
+        });
+        if result.is_err() {
+            let _ = env.exception_clear();
+        }
+    }
+    Ok(())
 }
 
 fn interrupt(env: &mut JNIEnv, context: &JObject) -> jni::errors::Result<bool> {

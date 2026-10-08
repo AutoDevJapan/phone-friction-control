@@ -52,6 +52,7 @@ jobs:
           export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
           export AR_x86_64_linux_android="$NDK_BIN/llvm-ar"
           cargo clippy --locked --target aarch64-linux-android --lib --no-deps -- -D warnings
+          cargo clippy --locked --target x86_64-linux-android --lib --no-deps -- -D warnings
           cargo build --locked --target aarch64-linux-android --lib
           cargo build --locked --target x86_64-linux-android --lib
       - name: Verify VM bridges and resource compilation

@@ -198,6 +198,23 @@ mod tests {
     }
 
     #[test]
+    fn provisional_pause_closes_focus_without_committing_estimated_tail_time() {
+        let selected = packages();
+        let mut cache = UsageTracker::default();
+        cache.prepare("day1", 1, &selected, 0, 20_000, 0);
+        cache.event(1000, "video", "Player", EventKind::Resumed);
+        cache.result(20_000);
+        cache.prepare("day1", 1, &selected, 0, 22_000, 0);
+        cache.event(15_000, "video", "Player", EventKind::Paused);
+        let (total, foreground) = cache.result(22_000);
+        assert_eq!(total["video"], 11_000);
+        assert_eq!(foreground, None);
+        cache.prepare("day1", 1, &selected, 0, 30_000, 0);
+        cache.event(15_000, "video", "Player", EventKind::Paused);
+        assert_eq!(cache.result(30_000).0["video"], 14_000);
+    }
+
+    #[test]
     fn clips_midnight_and_the_query_end() {
         let selected = packages();
         let mut usage = ForegroundUsage::new(&selected, 100, 200);

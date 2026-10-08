@@ -150,6 +150,7 @@ pub struct ControlApp {
     usage_loading: bool,
     app_filter: String,
     notice: Option<String>,
+    guard_notice: Option<String>,
     last_refresh: Instant,
     #[cfg(target_os = "android")]
     events_tx: Sender<PlatformEvent>,
@@ -215,6 +216,7 @@ impl ControlApp {
             usage_loading: false,
             app_filter: String::new(),
             notice: None,
+            guard_notice: None,
             last_refresh: Instant::now() - Duration::from_secs(120),
             #[cfg(target_os = "android")]
             events_tx,
@@ -550,22 +552,29 @@ impl ControlApp {
                 && status.policy == self.saved.policy()
                 && (0..=6_000).contains(&now_epoch_ms().saturating_sub(status.snapshot.now_ms))
             {
+                self.guard_notice = None;
                 self.saved.accept_service_break(
                     status.cooldown_until_ms,
                     status.triggered_day,
                     now_epoch_ms(),
                 );
                 if status.storage_error {
-                    self.storage_error =
-                        Some("休憩は継続していますが、その状態を保存できません。".into());
+                    self.guard_notice = Some("状態を読み書きできません。前の記録を保持し、確認できた利用分の制限は続けています。".into());
                 }
-                if self.saved.playback_only && !status.media_available {
-                    self.notice = Some("再生状態を取得できません。Androidの通知へのアクセスを確認してください。再生時間を利用時間へ置き換えていません。".into());
+                if self.saved.playback_only && !status.media_available && !status.storage_error {
+                    self.guard_notice = Some("選んだアプリの再生状態を取得できません。通知へのアクセスの許可と、対象アプリが再生状態を通知するかを確認してください。前の記録を保持しています。".into());
                 }
                 self.apply_usage_snapshot(status.snapshot);
                 return;
             }
-            self.notice = Some("使用中の中断はまだ動作を確認できません。Androidのユーザー補助で利用制限を有効にしてください。".into());
+            if crate::service::service_running() {
+                self.guard_notice = Some(
+                    "時間の計測を更新しています。取得が終わるまで前の記録を保持します。".into(),
+                );
+                self.measurement_available = false;
+                return;
+            }
+            self.guard_notice = Some("使用中の中断はまだ動作を確認できません。Androidのユーザー補助で利用制限を有効にしてください。".into());
             if self.saved.playback_only {
                 self.measurement_available = false;
                 return;
@@ -624,7 +633,10 @@ impl ControlApp {
     }
 
     fn request_guard_settings(&mut self, ctx: egui::Context, playback: bool) {
-        self.saved.usage_disclosure_accepted = true;
+        if !self.saved.usage_disclosure_accepted {
+            self.screen = Screen::Disclosure;
+            return;
+        }
         self.saved.service_disclosure_accepted = true;
         #[cfg(target_os = "android")]
         if let Some(android_app) = &self.android_app {
@@ -1029,7 +1041,7 @@ impl ControlApp {
                 self.measurement_available = false;
                 self.last_refresh = Instant::now() - Duration::from_secs(120);
             }
-            ui.label("再生時間には通知へのアクセスも必要です。通知本文は読みません。対象が前面にあり再生中の場合だけ数え、停止・読み込み待ち・画面消灯を除きます。動画と音声の区別や、画面を見ていたことは判定できません。再生状態を通知しないアプリには対応しません。");
+            ui.label("再生時間には通知へのアクセスも必要です。通知本文は読みません。対象が前面にあり再生中の場合だけ数え、停止・読み込み待ち・画面消灯を除きます。休憩中は、選んだアプリの再生へ一時停止を要求します。対象が要求に応じない場合は止められません。動画と音声の区別や、画面を見ていたことは判定できません。再生状態を通知しないアプリには対応しません。");
             if ui.button("説明を確認して通知へのアクセスを開く").clicked() {
                 self.request_guard_settings(ctx.clone(), true);
             }
@@ -1187,6 +1199,10 @@ impl ControlApp {
             ui.colored_label(ORANGE, error);
         }
         if let Some(notice) = &self.notice {
+            ui.add_space(8.0);
+            ui.colored_label(ORANGE, notice);
+        }
+        if let Some(notice) = &self.guard_notice {
             ui.add_space(8.0);
             ui.colored_label(ORANGE, notice);
         }
@@ -1420,6 +1436,7 @@ mod tests {
             usage_loading: false,
             app_filter: String::new(),
             notice: None,
+            guard_notice: None,
             last_refresh: Instant::now(),
         }
     }
@@ -1456,6 +1473,17 @@ mod tests {
         app.saved.limit_triggered_day = Some("2026-10-02".into());
         app.apply_usage_snapshot(snapshot(2, 130));
         assert_eq!(app.saved.cooldown_until_ms, None);
+    }
+
+    #[test]
+    fn guard_settings_cannot_skip_the_usage_disclosure() {
+        for playback in [false, true] {
+            let mut app = app();
+            app.request_guard_settings(egui::Context::default(), playback);
+            assert_eq!(app.screen, Screen::Disclosure);
+            assert!(!app.saved.usage_disclosure_accepted);
+            assert!(!app.saved.service_disclosure_accepted);
+        }
     }
 
     #[test]
