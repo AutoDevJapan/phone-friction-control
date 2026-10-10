@@ -61,6 +61,16 @@ cargo run --locked -p android-bridge -- pack . target/aarch64-linux-android/debu
 
 仮想端末用には `x86_64-linux-android` のライブラリとABI `x86_64` を使います。`android-bridge` はRustからJVMのサービス入口を生成し、d8でDEXに変換します。Java/Kotlinの製品ソースは追加していません。APKの署名と16KBのZIP配置を作成器が確認します。これはデバッグ可能な試用APKで、正式配布の鍵を使いません。
 
+配布署名の経路は `android-bridge pack-release` です。Rustライブラリは `cargo build --locked --release --target aarch64-linux-android --lib` で作成します。
+
+```text
+android-bridge pack-release <プロジェクト> <ライブラリ.so> <ABI> <新しい出力フォルダー> <署名鍵のKeyStore> <鍵の別名> <versionCode> <versionName> <証明書のSHA-256>
+```
+
+鍵のパスワードは `PHONE_CONTROL_KS_PASS` と `PHONE_CONTROL_KEY_PASS` の環境変数から署名ツールへ渡します。コマンド引数やログへ値を書きません。指定するSHA-256は、保管している正しい署名証明書から先に確認した64桁の16進数です。生成されたAPKから後付けで採った値を基準にしません。証明書が一致しない場合とAndroidのデバッグ証明書では、完成品を出力しません。APKの署名と16KB配置の確認後にだけ `phone-control-<ABI>-release.apk` を出力します。更新には同じ署名鍵と増加したversionCodeを使います。
+
+この経路の検証は使い捨ての試験鍵で行っています。製品用の鍵を作成したこと、実端末へ配布したこと、広告付きの配布版を作成したことを意味しません。`pack-release` は通常の広告なしライブラリ専用です。`ads-test` のライブラリは既存の `pack-ads` だけが扱います。
+
 ## 一次資料
 
 試験広告版は `cargo build --locked --target <Androidターゲット> --lib --features ads-test` の後、`android-bridge pack-ads <プロジェクト> <ライブラリ.so> <ABI> <新しい出力フォルダー> <Gradle実行ファイル>` で作ります。Gradle 8.14.3、AGP 8.13.2を使用し、AARの依存・DEX・リソースを統合します。作成器はSOのコピーだけをstripし、署名と16KB配置を確認します。Googleの試験IDを組み込むデバッグ版のため、製品配布には使いません。
@@ -72,5 +82,7 @@ cargo run --locked -p android-bridge -- pack . target/aarch64-linux-android/debu
 - [AccessibilityService](https://developer.android.com/reference/android/accessibilityservice/AccessibilityService)
 - [Google PlayのAccessibilityService API利用条件](https://support.google.com/googleplay/android-developer/answer/10964491?hl=en)
 - [AppleのFamily Controls配布許可](https://developer.apple.com/documentation/familycontrols/requesting-the-family-controls-entitlement)
+- [Android APKの署名と環境変数によるパスワード指定](https://developer.android.com/tools/apksigner)
+- [Androidアプリの署名と更新時の鍵の管理](https://developer.android.com/studio/publish/app-signing)
 
 日本語フォントはNoto Sans JPです。ライセンスは `assets/OFL.txt` を参照してください。

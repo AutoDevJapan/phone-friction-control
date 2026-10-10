@@ -248,8 +248,11 @@ fn main() -> ExitCode {
             }
         };
     }
-    if args.first().is_some_and(|arg| arg == "pack") {
-        return match package::assemble(&args[1..]) {
+    if args
+        .first()
+        .is_some_and(|arg| arg == "pack" || arg == "pack-release")
+    {
+        return match package::assemble(&args[1..], args[0] == "pack-release") {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("android-bridge: {error}");
