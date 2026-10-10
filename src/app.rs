@@ -132,11 +132,20 @@ enum Screen {
 }
 
 pub struct ControlApp {
-    #[cfg(all(target_os = "android", feature = "ads-test"))]
+    #[cfg(all(
+        target_os = "android",
+        any(feature = "ads-test", feature = "ads-production")
+    ))]
     ads_ui: Option<crate::ads::AdsUi>,
-    #[cfg(all(target_os = "android", feature = "ads-test"))]
+    #[cfg(all(
+        target_os = "android",
+        any(feature = "ads-test", feature = "ads-production")
+    ))]
     ad_bounds: Option<[i32; 4]>,
-    #[cfg(all(target_os = "android", feature = "ads-test"))]
+    #[cfg(all(
+        target_os = "android",
+        any(feature = "ads-test", feature = "ads-production")
+    ))]
     ad_pending: bool,
     saved: SavedState,
     last_persisted: Option<SavedState>,
@@ -204,11 +213,20 @@ impl ControlApp {
         #[cfg(target_os = "android")]
         let (events_tx, events_rx) = mpsc::channel();
         let mut app = Self {
-            #[cfg(all(target_os = "android", feature = "ads-test"))]
+            #[cfg(all(
+                target_os = "android",
+                any(feature = "ads-test", feature = "ads-production")
+            ))]
             ads_ui: android_app.as_ref().cloned().map(crate::ads::AdsUi::new),
-            #[cfg(all(target_os = "android", feature = "ads-test"))]
+            #[cfg(all(
+                target_os = "android",
+                any(feature = "ads-test", feature = "ads-production")
+            ))]
             ad_bounds: None,
-            #[cfg(all(target_os = "android", feature = "ads-test"))]
+            #[cfg(all(
+                target_os = "android",
+                any(feature = "ads-test", feature = "ads-production")
+            ))]
             ad_pending: false,
             last_persisted: None,
             last_persist_at: Instant::now(),
@@ -880,14 +898,14 @@ impl ControlApp {
             .fill(Color32::from_rgb(225, 220, 211))
             .inner_margin(egui::Margin::same(12))
             .show(ui, |ui| {
-                #[cfg(all(target_os = "android", feature = "ads-test"))]
+                #[cfg(all(target_os = "android", any(feature = "ads-test", feature = "ads-production")))]
                 if let Some(ads) = &self.ads_ui {
-                    ui.label(RichText::new("広告（試験用）").strong());
+                    ui.label(RichText::new(if cfg!(feature = "ads-production") { "広告" } else { "広告（試験用）" }).strong());
                     ui.label("表示を選ぶとGoogleへ端末情報などを通信します。選んだアプリ名と利用時間は渡しません。");
                     ui.horizontal(|ui| {
                         if ads.is_requested() {
                             if ui.button("広告を閉じる").clicked() { ads.close(); }
-                        } else if ui.button("任意の試験広告を表示").clicked() { self.ad_pending = true; }
+                        } else if ui.button(if cfg!(feature = "ads-production") { "任意の広告を表示" } else { "任意の試験広告を表示" }).clicked() { self.ad_pending = true; }
                         if ui.button("広告の同意設定").clicked() { ads.privacy(); }
                     });
                     ui.label(ads.status());
@@ -906,7 +924,7 @@ impl ControlApp {
                     }
                     ui.label(RichText::new("広告を閉じても休憩や制限は変わりません。").size(12.0).color(MUTED));
                 }
-                #[cfg(not(all(target_os = "android", feature = "ads-test")))]
+                #[cfg(not(all(target_os = "android", any(feature = "ads-test", feature = "ads-production"))))]
                 {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
@@ -1094,7 +1112,9 @@ impl ControlApp {
             ui.label("広告はこのアプリ内だけに表示する想定です。休憩画面には出さず、広告を断っても制限機能は変わりません。");
             #[cfg(all(target_os = "android", feature = "ads-test"))]
             ui.label("この試験版はGoogleの試験広告に接続します。ホームで表示を選んだときだけ同意を確認し、広告を読み込みます。");
-            #[cfg(not(all(target_os = "android", feature = "ads-test")))]
+            #[cfg(all(target_os = "android", feature = "ads-production"))]
+            ui.label("ホームで表示を選んだときだけ同意を確認し、広告を読み込みます。");
+            #[cfg(not(all(target_os = "android", any(feature = "ads-test", feature = "ads-production"))))]
             ui.label("この版は広告枠だけで、広告配信には接続しません。");
         });
 
@@ -1374,7 +1394,10 @@ impl eframe::App for ControlApp {
     }
 
     fn ui(&mut self, root_ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        #[cfg(all(target_os = "android", feature = "ads-test"))]
+        #[cfg(all(
+            target_os = "android",
+            any(feature = "ads-test", feature = "ads-production")
+        ))]
         {
             self.ad_bounds = None;
         }
@@ -1440,7 +1463,10 @@ impl eframe::App for ControlApp {
             },
         );
 
-        #[cfg(all(target_os = "android", feature = "ads-test"))]
+        #[cfg(all(
+            target_os = "android",
+            any(feature = "ads-test", feature = "ads-production")
+        ))]
         if let Some(ads) = &self.ads_ui {
             if self.screen != Screen::Home || self.break_remaining_ms().is_some() {
                 self.ad_pending = false;

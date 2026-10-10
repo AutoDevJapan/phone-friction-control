@@ -1,5 +1,8 @@
 name: Rust and Android
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
 permissions:
   contents: read
 env:
@@ -68,6 +71,31 @@ jobs:
           mkdir -p "$HOME/.android"
           keytool -genkeypair -keystore "$HOME/.android/debug.keystore" -alias androiddebugkey -storepass android -keypass android -dname 'CN=Android Debug,O=Android,C=US' -keyalg RSA -keysize 2048 -validity 30
           cargo run --locked -p android-bridge -- pack . target/x86_64-linux-android/debug/libphone_friction_control.so x86_64 apk-out
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+      - name: Compile and distinguish advertising native variants
+        shell: bash
+        run: |
+          mkdir ci-native
+          cp target/x86_64-linux-android/debug/libphone_friction_control.so ci-native/plain.so
+          NDK_BIN="$ANDROID_HOME/ndk/30.0.14904198/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_BIN/aarch64-linux-android26-clang"
+          export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$NDK_BIN/x86_64-linux-android26-clang"
+          export CC_aarch64_linux_android="$NDK_BIN/aarch64-linux-android26-clang"
+          export CC_x86_64_linux_android="$NDK_BIN/x86_64-linux-android26-clang"
+          export AR_aarch64_linux_android="$NDK_BIN/llvm-ar" AR_x86_64_linux_android="$NDK_BIN/llvm-ar"
+          for FEATURE in ads-test ads-production; do
+            cargo clippy --locked --target aarch64-linux-android --lib --features "$FEATURE" --no-deps -- -D warnings
+            cargo clippy --locked --target x86_64-linux-android --lib --features "$FEATURE" --no-deps -- -D warnings
+            cargo build --locked --target x86_64-linux-android --lib --features "$FEATURE"
+            cp target/x86_64-linux-android/debug/libphone_friction_control.so "ci-native/$FEATURE.so"
+          done
+          if cargo check --locked --target x86_64-linux-android --lib --features ads-test,ads-production > mixed-features.log 2>&1; then exit 1; fi
+          grep 'ads-test and ads-production are mutually exclusive' mixed-features.log
+          target/debug/android-bridge pack-ads . ci-native/ads-test.so x86_64 ads-test-apk gradle
+          if target/debug/android-bridge pack-ads . ci-native/ads-production.so x86_64 production-as-test gradle; then exit 1; fi
+          test ! -e production-as-test
       - name: Verify release packaging with an ephemeral signer
         shell: bash
         run: |
@@ -76,7 +104,7 @@ jobs:
           keytool -genkeypair -keystore fixture.p12 -alias fixture -storepass:env PHONE_CONTROL_KS_PASS -keypass:env PHONE_CONTROL_KEY_PASS -dname 'CN=AutoDevJapan Release Fixture' -keyalg RSA -keysize 3072 -validity 30
           keytool -exportcert -keystore fixture.p12 -alias fixture -storepass:env PHONE_CONTROL_KS_PASS -file fixture.der
           PIN=$(sha256sum fixture.der | cut -d ' ' -f1)
-          LIB=target/x86_64-linux-android/debug/libphone_friction_control.so
+          LIB=ci-native/plain.so
           target/debug/android-bridge pack-release . "$LIB" x86_64 release3 fixture.p12 fixture 3 0.3.0 "$PIN"
           target/debug/android-bridge pack-release . "$LIB" x86_64 release4 fixture.p12 fixture 4 0.3.1 "$PIN"
           "$ANDROID_HOME/build-tools/36.1.0/aapt2" dump badging release4/phone-control-x86_64-release.apk > release-badging.txt
@@ -84,6 +112,27 @@ jobs:
           grep "versionCode='4'" release-badging.txt
           if target/debug/android-bridge pack-release . "$LIB" x86_64 wrong-pin fixture.p12 fixture 5 0.3.2 "$(printf '0%.0s' {1..64})"; then exit 1; fi
           test ! -e wrong-pin/phone-control-x86_64-release.apk
+          # These IDs are syntax fixtures, not registered AdMob IDs. Never install/run this APK.
+          APP_ID=ca-app-pub-1234567890123456~1234567890
+          BANNER_ID=ca-app-pub-1234567890123456/9876543210
+          target/debug/android-bridge pack-ads-release . ci-native/ads-production.so x86_64 ads-release gradle fixture.p12 fixture 6 0.4.0-fixture "$PIN" "$APP_ID" "$BANNER_ID"
+          ADS_APK=ads-release/phone-control-x86_64-ads-release.apk
+          "$ANDROID_HOME/build-tools/36.1.0/aapt2" dump xmltree "$ADS_APK" --file AndroidManifest.xml > ads-manifest.txt
+          grep "$APP_ID" ads-manifest.txt
+          grep "$BANNER_ID" ads-manifest.txt
+          if grep -q 3940256099942544 ads-manifest.txt; then exit 1; fi
+          "$ANDROID_HOME/build-tools/36.1.0/aapt2" dump badging "$ADS_APK" > ads-badging.txt
+          grep "versionCode='6'" ads-badging.txt
+          if grep -q '^application-debuggable' ads-badging.txt; then exit 1; fi
+          if target/debug/android-bridge pack-ads-release . ci-native/ads-test.so x86_64 test-as-production gradle fixture.p12 fixture 6 0.4.0 "$PIN" "$APP_ID" "$BANNER_ID"; then exit 1; fi
+          test ! -e test-as-production
+          if target/debug/android-bridge pack-ads-release . ci-native/ads-production.so x86_64 sample-reject gradle fixture.p12 fixture 6 0.4.0 "$PIN" ca-app-pub-3940256099942544~3347511713 ca-app-pub-3940256099942544/9214589741; then exit 1; fi
+          test ! -e sample-reject
+          if target/debug/android-bridge pack-ads-release . ci-native/ads-production.so x86_64 ads-wrong-pin gradle fixture.p12 fixture 6 0.4.0 "$(printf '0%.0s' {1..64})" "$APP_ID" "$BANNER_ID"; then exit 1; fi
+          test ! -e ads-wrong-pin/phone-control-x86_64-ads-release.apk
+          BEFORE=$(sha256sum "$ADS_APK")
+          if target/debug/android-bridge pack-ads-release . ci-native/ads-production.so x86_64 ads-release gradle fixture.p12 fixture 7 0.4.1 "$PIN" "$APP_ID" "$BANNER_ID"; then exit 1; fi
+          test "$BEFORE" = "$(sha256sum "$ADS_APK")"
           export PHONE_CONTROL_KS_PASS=android PHONE_CONTROL_KEY_PASS=android
           keytool -exportcert -keystore "$HOME/.android/debug.keystore" -alias androiddebugkey -storepass:env PHONE_CONTROL_KS_PASS -file debug.der
           DEBUG_PIN=$(sha256sum debug.der | cut -d ' ' -f1)

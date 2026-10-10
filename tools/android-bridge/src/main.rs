@@ -7,8 +7,11 @@
 //! ControlService のコールバックは親の Rust ライブラリが JNI で公開する native 関数へ渡す。
 
 use std::{env, fs, path::Path, process::ExitCode};
+#[path = "../../../src/ad_config.rs"]
+mod ad_config;
 mod ads_callbacks;
 mod ads_package;
+mod native_features;
 mod package;
 
 const PACKAGE: &str = "com/autodevjapan/phonefrictioncontrol";
@@ -226,8 +229,11 @@ fn write_classes(out_dir: &Path) -> std::io::Result<()> {
 
 fn main() -> ExitCode {
     let args: Vec<_> = env::args_os().skip(1).collect();
-    if args.first().is_some_and(|arg| arg == "pack-ads") {
-        return match ads_package::assemble(&args[1..]) {
+    if args
+        .first()
+        .is_some_and(|arg| arg == "pack-ads" || arg == "pack-ads-release")
+    {
+        return match ads_package::assemble(&args[1..], args[0] == "pack-ads-release") {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("android-bridge: {error}");

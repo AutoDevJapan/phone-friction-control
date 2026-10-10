@@ -1,4 +1,29 @@
 mod app;
+#[cfg(all(feature = "ads-test", feature = "ads-production"))]
+compile_error!("ads-test and ads-production are mutually exclusive");
+
+#[cfg(any(
+    all(
+        target_os = "android",
+        any(feature = "ads-test", feature = "ads-production")
+    ),
+    test
+))]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+mod ad_config;
+
+// Dynamic exports survive stripping and let packagers distinguish the native feature.
+#[cfg(all(target_os = "android", feature = "ads-test"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn phone_control_ads_test() -> u32 {
+    1
+}
+
+#[cfg(all(target_os = "android", feature = "ads-production"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn phone_control_ads_production() -> u32 {
+    1
+}
 #[cfg(any(target_os = "android", test))]
 mod enforcement;
 mod persistence;
@@ -10,9 +35,18 @@ mod platform;
 #[cfg(target_os = "android")]
 mod service;
 
-#[cfg(all(target_os = "android", feature = "ads-test"))]
+#[cfg(all(
+    target_os = "android",
+    any(feature = "ads-test", feature = "ads-production")
+))]
 mod ads;
-#[cfg(any(all(target_os = "android", feature = "ads-test"), test))]
+#[cfg(any(
+    all(
+        target_os = "android",
+        any(feature = "ads-test", feature = "ads-production")
+    ),
+    test
+))]
 mod ads_state;
 
 pub use app::ControlApp;
