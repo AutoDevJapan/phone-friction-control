@@ -1,6 +1,15 @@
 name: Manual iOS SDK audit
 on:
   workflow_dispatch:
+    inputs:
+      authorization_probe:
+        description: Call the public individual authorization API once in the isolated Simulator
+        type: boolean
+        default: false
+      family_controls_entitlement:
+        description: Include Family Controls in this disposable Simulator app's ad-hoc signature; not proof of development or distribution approval
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -25,6 +34,8 @@ jobs:
           SDK=$(xcrun --sdk iphonesimulator --show-sdk-path)
           VERSION=$(xcrun --sdk iphonesimulator --show-sdk-version)
           printf 'Simulator SDK: %s\n' "$VERSION" >> "$OUT/versions.txt"
+          test "$VERSION" = 17.5
+          grep -F 'Swift version 5.10' "$OUT/versions.txt"
           TARGET="arm64-apple-ios${VERSION%%.*}.0-simulator"
           for MODULE in FamilyControls DeviceActivity ManagedSettings; do
             FRAMEWORK="$SDK/System/Library/Frameworks/$MODULE.framework"
@@ -33,16 +44,112 @@ jobs:
             xcrun swift-api-digester -dump-sdk -module "$MODULE" -sdk "$SDK" -target "$TARGET" -o "$RUNNER_TEMP/$MODULE.json"
             jq '[.. | objects | select(.name? | IN("AuthorizationCenter", "shared", "requestAuthorization", "FamilyActivityPicker", "FamilyActivitySelection", "DeviceActivityCenter", "startMonitoring", "DeviceActivityEvent", "DeviceActivityMonitor", "ManagedSettingsStore", "ShieldSettings", "applications")) | {kind, name, printedName, usr, mangledName}]' "$RUNNER_TEMP/$MODULE.json" > "$OUT/$MODULE-symbols.json"
             test "$(jq length "$OUT/$MODULE-symbols.json")" -gt 0
+            jq '[.. | objects | select(.kind? == "TypeDecl" and (.name? | IN("AuthorizationCenter", "FamilyActivityPicker", "FamilyActivitySelection", "DeviceActivityCenter", "DeviceActivityMonitor", "DeviceActivityEvent", "ManagedSettingsStore", "ShieldSettings"))) | {name, usr, declKind, genericSig, members: [.children[]? | select(.name? | IN("shared", "requestAuthorization", "authorizationStatus", "init", "startMonitoring", "intervalDidStart", "intervalDidEnd", "eventDidReachThreshold", "shield", "applications"))]}]' "$RUNNER_TEMP/$MODULE.json" > "$OUT/$MODULE-selected-declarations.json"
+            if [ "$MODULE" = FamilyControls ]; then
+              grep -oE '\$s14FamilyControls19AuthorizationCenterC[[:alnum:]_]+' "$FRAMEWORK/$MODULE.tbd" | sort -u > "$OUT/authorization-center-exports.txt"
+              test -s "$OUT/authorization-center-exports.txt"
+              xcrun swift-demangle --compact < "$OUT/authorization-center-exports.txt" > "$OUT/authorization-center-demangled.txt"
+            fi
           done
+          # Collect the SDK's own enum declaration, not inferred raw values.
+          FRAMEWORK="$SDK/System/Library/Frameworks/FamilyControls.framework"
+          if grep -R -n -A 12 -B 3 'FamilyControlsMember' "$FRAMEWORK/Headers" > "$OUT/family-controls-member-header.txt"; then
+            printf 'member_definition_source=Headers\n' > "$OUT/member-definition-scope.txt"
+          else
+            grep -R --include='*.swiftinterface' -n -A 12 -B 3 'FamilyControlsMember' "$FRAMEWORK/Modules" > "$OUT/family-controls-member-header.txt"
+            printf 'member_definition_source=Modules\n' > "$OUT/member-definition-scope.txt"
+          fi
+          test -s "$OUT/family-controls-member-header.txt"
           for TARGET in aarch64-apple-ios aarch64-apple-ios-sim; do
             mkdir "$OUT/$TARGET"
-            rustc tools/ios-abi-probe.rs --crate-name ios_abi_probe --crate-type lib --target "$TARGET" --emit llvm-ir,asm,obj --out-dir "$OUT/$TARGET"
+            rustc tools/ios-abi-probe.rs --crate-name ios_abi_probe --edition 2024 --crate-type lib --target "$TARGET" --emit llvm-ir,asm,obj --out-dir "$OUT/$TARGET"
             grep -q 'call swiftcc void @abi_probe_external' "$OUT/$TARGET/ios_abi_probe.ll"
             xcrun nm "$OUT/$TARGET/ios_abi_probe.o" > "$OUT/$TARGET/symbols.txt"
             grep 'U _abi_probe_external' "$OUT/$TARGET/symbols.txt"
           done
-          printf 'compiler_codegen=true\nsdk_declarations_collected=true\nframework_linked=false\nos_executed=false\nauthorization=false\nmonitoring=false\nshielding=false\n' > "$OUT/scope.txt"
+          printf 'compiler_codegen=true\nsdk_declarations_collected=true\ncodegen_framework_linked=false\ncodegen_os_executed=false\nauthorization=false\nmonitoring=false\nshielding=false\n' > "$OUT/scope.txt"
+      - name: Inspect the public SDK singleton from a Rust Simulator process
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/ios-sdk-audit"
+          SDK=$(xcrun --sdk iphonesimulator --show-sdk-path)
+          VERSION=$(xcrun --sdk iphonesimulator --show-sdk-version)
+          export SDKROOT="$SDK" IPHONEOS_DEPLOYMENT_TARGET="$VERSION"
+          export AUTH_SHARED_SYMBOL=$(jq -er '[.[] | select(.name == "AuthorizationCenter") | .members[] | select(.name == "shared" and .static == true) | .accessors[] | select(.accessorKind == "get" and .static == true) | .mangledName] | if length == 1 then .[0] else error("expected one public static getter") end' "$OUT/FamilyControls-selected-declarations.json")
+          grep -Fx "$AUTH_SHARED_SYMBOL" "$OUT/authorization-center-exports.txt"
+          export AUTH_METADATA_SYMBOL=$(jq -er '[.[] | select(.name == "AuthorizationCenter") | .usr | sub("^s:"; "\u0024s") + "Ma"] | if length == 1 then .[0] else error("expected one class metadata accessor") end' "$OUT/FamilyControls-selected-declarations.json")
+          grep -Fx "$AUTH_METADATA_SYMBOL" "$OUT/authorization-center-exports.txt"
+          AUTH_REQUEST_SYMBOL=$(jq -er '[.[] | select(.name == "AuthorizationCenter") | .members[] | select(.name == "requestAuthorization" and .printedName == "requestAuthorization(for:)" and .throwing == true) | .mangledName] | if length == 1 then .[0] else error("expected one public individual async request") end' "$OUT/FamilyControls-selected-declarations.json")
+          export AUTH_ASYNC_SYMBOL="${AUTH_REQUEST_SYMBOL}TjTu"
+          grep -Fx "$AUTH_ASYNC_SYMBOL" "$OUT/authorization-center-exports.txt"
+          REQUEST_ARGS=()
+          if [ '${{ inputs.authorization_probe }}' = true ]; then
+            grep -F '_swift_stdlib_bridgeErrorToNSError' "$SDK/usr/lib/swift/libswiftCore.tbd"
+            INTERFACE="$SDK/System/Library/Frameworks/FamilyControls.framework/Modules/FamilyControls.swiftmodule/arm64-apple-ios-simulator.swiftinterface"
+            awk '/^@objc public enum FamilyControlsMember : Swift.Int,/ { found=1 } found { print } found && /^}/ { exit }' "$INTERFACE" > "$OUT/member-raw-value-definition.txt"
+            grep -F '@objc public enum FamilyControlsMember : Swift.Int,' "$OUT/member-raw-value-definition.txt"
+            test "$(grep -c '^  case ' "$OUT/member-raw-value-definition.txt")" -eq 2
+            # Swift 5.10 ASTPrinter.cpp prints explicit @objc enum raw values.
+            # Require exactly these two implicit cases in this order. Swift.Int
+            # implicit raw values start at zero and increase by one (Swift book).
+            test "$(grep '^  case ' "$OUT/member-raw-value-definition.txt")" = "$(printf '  case child\n  case individual')"
+            export AUTH_INDIVIDUAL_VALUE=1
+            awk '/^public enum FamilyControlsError / { found=1 } found { print } found && /^}/ { exit }' "$INTERFACE" > "$OUT/family-controls-error-definition.txt"
+            REQUEST_ARGS=(--cfg auth_request)
+          fi
+          PROBE_APP="$OUT/authorization-center-probe.app"
+          mkdir "$PROBE_APP"
+          rustc tools/ios-abi-probe.rs --crate-name ios_runtime_probe --edition 2024 --cfg runtime_probe "${REQUEST_ARGS[@]}" --target aarch64-apple-ios-sim --emit "llvm-ir=$OUT/ios_runtime_probe.ll,asm=$OUT/ios_runtime_probe.s,link" -L "native=$SDK/usr/lib/swift" -C link-arg=-Wl,-rpath,/usr/lib/swift -o "$PROBE_APP/authorization-center-probe"
+          cat > "$PROBE_APP/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          <key>CFBundleIdentifier</key><string>com.autodevjapan.phonecontrol1614abiprobe</string>
+          <key>CFBundleName</key><string>phone-friction-control（未定）</string>
+          <key>CFBundleExecutable</key><string>authorization-center-probe</string>
+          <key>CFBundlePackageType</key><string>APPL</string>
+          <key>CFBundleVersion</key><string>1</string>
+          <key>CFBundleShortVersionString</key><string>0.0.1</string>
+          <key>MinimumOSVersion</key><string>17.0</string>
+          <key>CFBundleSupportedPlatforms</key><array><string>iPhoneSimulator</string></array>
+          <key>UIDeviceFamily</key><array><integer>1</integer></array>
+          </dict></plist>
+          PLIST
+          if [ '${{ inputs.family_controls_entitlement }}' = true ]; then
+            cat > "$OUT/probe-entitlements.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          <key>com.apple.developer.family-controls</key><true/>
+          </dict></plist>
+          PLIST
+            codesign --sign - --entitlements "$OUT/probe-entitlements.plist" "$PROBE_APP"
+          else
+            codesign --sign - "$PROBE_APP"
+          fi
+          codesign --display --entitlements :- "$PROBE_APP" > "$OUT/signed-entitlements.plist" 2> "$OUT/signature-diagnostics.txt"
+          RUNTIME=$(xcrun simctl list runtimes -j | jq -er --arg version "$VERSION" '[.runtimes[] | select(.isAvailable and .version == $version and (.identifier | contains("iOS"))) | .identifier] | if length == 1 then .[0] else error("SDK-matching Simulator runtime missing or ambiguous") end')
+          SIM_ID=$(xcrun simctl create phone-control1614-abi com.apple.CoreSimulator.SimDeviceType.iPhone-15 "$RUNTIME")
+          trap 'xcrun simctl shutdown "$SIM_ID" || true; xcrun simctl delete "$SIM_ID" || true' EXIT
+          xcrun simctl boot "$SIM_ID"
+          xcrun simctl bootstatus "$SIM_ID" -b
+          xcrun simctl install "$SIM_ID" "$PROBE_APP"
+          xcrun simctl launch --console "$SIM_ID" com.autodevjapan.phonecontrol1614abiprobe > "$OUT/singleton-runtime.txt" 2>&1
+          # The new Simulator has no account login, user selections, or personal
+          # apps. Limit diagnostics to this probe's connection/entitlement messages.
+          xcrun simctl spawn "$SIM_ID" log show --style compact --last 1m --predicate 'process == "authorization-center-probe" AND (eventMessage CONTAINS[c] "connection" OR eventMessage CONTAINS[c] "entitlement")' > "$OUT/probe-connection-log.txt" 2>&1
+          grep -F 'SDK singleton class: FamilyControls.AuthorizationCenter' "$OUT/singleton-runtime.txt"
+          grep -F 'Rust async task entry observed; authorization_requested=false' "$OUT/singleton-runtime.txt"
+          REQUESTED=false
+          if [ '${{ inputs.authorization_probe }}' = true ]; then
+            grep -F 'SDK async continuation caller frame validated' "$OUT/singleton-runtime.txt"
+            grep -F 'Public individual authorization continuation observed; error_present=' "$OUT/singleton-runtime.txt"
+            REQUESTED=true
+          fi
+          printf 'simulator_process_executed=true\npublic_singleton_called=true\npublic_async_descriptor_read=true\nrust_async_task_entry_observed=true\nruntime_teardown_verified=false\nauthorization_requested=%s\nauthorization_status_verified=false\nmonitoring=false\nshielding=false\n' "$REQUESTED" > "$OUT/singleton-runtime-scope.txt"
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: ios-sdk-audit
           path: ${{ runner.temp }}/ios-sdk-audit
