@@ -39,7 +39,7 @@ on:
         type: boolean
         default: false
       selection_inspection_mode:
-        description: Inspect verified selection layout, public entries, or initial value lifetime without requesting access
+        description: Inspect selection layout, entries, value lifetime, or finite mutable Binding without requesting access
         type: choice
         default: none
         options:
@@ -47,6 +47,7 @@ on:
           - layout
           - entries
           - values
+          - mutable
 permissions:
   contents: read
 jobs:
@@ -67,7 +68,7 @@ jobs:
           mkdir "$OUT"
           SELECTION_MODE='${{ inputs.selection_inspection_mode }}'
           case "$SELECTION_MODE" in
-            none|layout|entries|values) ;;
+            none|layout|entries|values|mutable) ;;
             *) echo 'Unknown selection inspection mode' >&2; exit 1 ;;
           esac
           if [ "$SELECTION_MODE" != none ]; then
@@ -241,8 +242,8 @@ jobs:
             export SELECTION_METADATA_SYMBOL SELECTION_INIT_SYMBOL BINDING_METADATA_SYMBOL BINDING_INIT_SYMBOL
             # The digester identifies initializing constructors (fc). The ABI's
             # allocating constructor entry (fC) is exported for these structs.
-            # Require that exact public entry. Only the separate value phase
-            # may invoke Selection.init(); Binding entries remain inspection-only.
+            # Require that exact public entry. The finite mutable phase alone
+            # invokes Binding; the value phase invokes Selection.init().
             # Candidate exports stay in scratch. Publish only the seven exact
             # entries needed here; never publish complete tbd/SDK dumps.
             grep -oE '\$s14FamilyControls0A17ActivitySelectionV[[:alnum:]_]+' "$SDK/System/Library/Frameworks/FamilyControls.framework/FamilyControls.tbd" | sort -u > "$RUNNER_TEMP/selection-candidate-exports.txt"
@@ -265,20 +266,26 @@ jobs:
             if [ '${{ inputs.selection_inspection_mode }}' = values ]; then
               SELECTION_ARGS+=(--cfg selection_value_probe)
             fi
-            if [ '${{ inputs.selection_inspection_mode }}' = entries ]; then
+            if [ '${{ inputs.selection_inspection_mode }}' = mutable ]; then
+              export SELECTION_CATEGORY_INIT_SYMBOL=$(jq -er '[.[] | select(.name == "FamilyActivitySelection") | .members[] | select(.kind == "Constructor" and .printedName == "init(includeEntireCategory:)" and .moduleName == "FamilyControls" and .throwing != true and (.children | map(.usr)) == ["s:14FamilyControls0A17ActivitySelectionV", "s:Sb"] and .mangledName == "\u0024s14FamilyControls0A17ActivitySelectionV21includeEntireCategoryACSb_tcfc") | .mangledName | sub("cfc$"; "cfC")] | if length == 1 then .[0] else error("expected one public category Bool initializer") end' "$OUT/FamilyControls-selected-declarations.json")
+              grep -Fx "$SELECTION_CATEGORY_INIT_SYMBOL" "$RUNNER_TEMP/selection-candidate-exports.txt" > "$OUT/selection-category-init-export.txt"
+              test "$(wc -l < "$OUT/selection-category-init-export.txt" | tr -d ' ')" = 1
+              SELECTION_ARGS+=(--cfg mutable_binding_probe)
+            fi
+            if [ '${{ inputs.selection_inspection_mode }}' = entries ] || [ '${{ inputs.selection_inspection_mode }}' = mutable ]; then
               BINDING_GET_SYMBOL=$(jq -er '[.[] | select(.usr == "s:7SwiftUI7BindingV") | .members[] | select(.kind == "Var" and .printedName == "wrappedValue") | .accessors[] | select(.accessorKind == "get" and .mangledName == "\u0024s7SwiftUI7BindingV12wrappedValuexvg") | .mangledName] | if length == 1 then .[0] else error("expected one public Binding getter") end' "$OUT/SwiftUI-selected-declarations.json")
               BINDING_SET_SYMBOL=$(jq -er '[.[] | select(.usr == "s:7SwiftUI7BindingV") | .members[] | select(.kind == "Var" and .printedName == "wrappedValue") | .accessors[] | select(.accessorKind == "set" and .mangledName == "\u0024s7SwiftUI7BindingV12wrappedValuexvs") | .mangledName] | if length == 1 then .[0] else error("expected one public Binding setter") end' "$OUT/SwiftUI-selected-declarations.json")
               export BINDING_GET_SYMBOL BINDING_SET_SYMBOL
               { grep -Fx "$BINDING_GET_SYMBOL" "$RUNNER_TEMP/binding-candidate-exports.txt"; grep -Fx "$BINDING_SET_SYMBOL" "$RUNNER_TEMP/binding-candidate-exports.txt"; } > "$OUT/binding-accessor-exports.txt"
               grep -n -A 12 -B 3 'dli_fname' "$SDK/usr/include/dlfcn.h" > "$OUT/dladdr-selected-declaration.txt"
-              SELECTION_ARGS+=(--cfg binding_entry_probe)
+              if [ '${{ inputs.selection_inspection_mode }}' = entries ]; then SELECTION_ARGS+=(--cfg binding_entry_probe); fi
             fi
           fi
           # Only SDK symbols and inspection options cross this step boundary.
           # Bash preserves export attributes and array elements without eval.
           BUILD_ENV="$RUNNER_TEMP/ios-probe-build-env.sh"
           : > "$BUILD_ENV"
-          for PROBE_VAR in SDKROOT IPHONEOS_DEPLOYMENT_TARGET AUTH_SHARED_SYMBOL AUTH_METADATA_SYMBOL AUTH_ASYNC_SYMBOL AUTH_INDIVIDUAL_VALUE AUTH_STATUS_METADATA_SYMBOL AUTH_STATUS_GET_SYMBOL AUTH_STATUS_RAW_GET_SYMBOL UI_SYSTEM_BUTTON_TYPE UI_TOUCH_UP_INSIDE_EVENT SELECTION_METADATA_SYMBOL SELECTION_INIT_SYMBOL BINDING_METADATA_SYMBOL BINDING_INIT_SYMBOL BINDING_GET_SYMBOL BINDING_SET_SYMBOL; do
+          for PROBE_VAR in SDKROOT IPHONEOS_DEPLOYMENT_TARGET AUTH_SHARED_SYMBOL AUTH_METADATA_SYMBOL AUTH_ASYNC_SYMBOL AUTH_INDIVIDUAL_VALUE AUTH_STATUS_METADATA_SYMBOL AUTH_STATUS_GET_SYMBOL AUTH_STATUS_RAW_GET_SYMBOL UI_SYSTEM_BUTTON_TYPE UI_TOUCH_UP_INSIDE_EVENT SELECTION_METADATA_SYMBOL SELECTION_INIT_SYMBOL BINDING_METADATA_SYMBOL BINDING_INIT_SYMBOL BINDING_GET_SYMBOL BINDING_SET_SYMBOL SELECTION_CATEGORY_INIT_SYMBOL; do
             if declare -p "$PROBE_VAR" >/dev/null 2>&1; then declare -p "$PROBE_VAR" >> "$BUILD_ENV"; fi
           done
           declare -p REQUEST_ARGS SELECTION_ARGS >> "$BUILD_ENV"
@@ -427,6 +434,13 @@ jobs:
               # successful value counts from the requested input.
               grep '^Selection value result: ' "$OUT/singleton-runtime.txt" | sed 's/^Selection value result: //' > "$OUT/selection-value-results.txt" || true
             fi
+            if [ '${{ inputs.selection_inspection_mode }}' = mutable ]; then
+              # Extract actual partial comparisons/counters BEFORE exit checks.
+              grep '^Mutable binding result: ' "$OUT/singleton-runtime.txt" | sed 's/^Mutable binding result: //' > "$OUT/mutable-binding-results.txt" || true
+              grep '^Mutable binding entry guards: ' "$OUT/singleton-runtime.txt" > "$OUT/mutable-binding-entry-guards.txt" || true
+              printf 'launch_status=%s\n' "$LAUNCH_STATUS" > "$OUT/mutable-binding-launch.txt"
+              cat "$OUT/mutable-binding-launch.txt" "$OUT/mutable-binding-results.txt" >> "$GITHUB_STEP_SUMMARY"
+            fi
             test "$LAUNCH_STATUS" = 0
             grep -F 'Selection box: buffer_aligned=true; project_matches=true; uninitialized_deallocated=true' "$OUT/selection-layout.txt"
             grep -F 'Selection layout inspection complete; phase=layout; selection_values_constructed=0; selection_values_read=0; initializer_calls=0; closure_calls=0; value_witness_calls=0; authorization_requests=0;' "$OUT/selection-layout.txt"
@@ -462,11 +476,34 @@ jobs:
               done
               test "$(wc -l < "$RESULTS" | tr -d ' ')" = 31
             fi
+            if [ '${{ inputs.selection_inspection_mode }}' = mutable ]; then
+              RESULTS="$OUT/mutable-binding-results.txt"
+              for EXPECTED in phase=mutable_value mutable_binding_verified=true category_values_differ=true initial_get_equals_false=true changed_get_equals_true=true changed_get_differs_false=true restored_get_equals_false=true null_contexts=true binding_full_vwt=true main_thread_required=true; do
+                test "$(grep -Fxc "$EXPECTED" "$RESULTS")" = 1
+              done
+              for FIELD in picker_verified tokens_verified grant_verified monitoring_verified shielding_verified selection_contents_output selection_addresses_output; do
+                test "$(grep -Fxc "$FIELD=false" "$RESULTS")" = 1
+              done
+              for FIELD in authorization_requests private_api_calls private_api_reads; do
+                test "$(grep -Fxc "$FIELD=0" "$RESULTS")" = 1
+              done
+              # Getter calls during construction are allowed: check relations,
+              # not a hardcoded closure/getter count inferred from the mode.
+              awk -F= '
+                /^[a-z_]+=[0-9]+$/ { if (seen[$1]++) exit 1; n[$1]=$2 }
+                END {
+                  split("allocations deallocations category_initializer_calls binding_initializer_calls binding_getter_calls binding_setter_calls getter_closure_calls setter_closure_calls initialize_with_copy_calls assign_with_copy_calls destroy_calls binding_initialize_with_copy_calls binding_destroy_calls setter_inputs_transferred returned_destination_checks byte_comparisons callbacks_active", fields, " ");
+                  for (i in fields) if (!(fields[i] in n)) exit 1;
+                  if (!(n["allocations"]==n["deallocations"] && n["allocations"]==10 && n["category_initializer_calls"]==2 && n["binding_initializer_calls"]==1 && n["binding_getter_calls"]==3 && n["binding_setter_calls"]==2 && n["getter_closure_calls"]>=3 && n["setter_closure_calls"]==2 && n["initialize_with_copy_calls"]==3+n["getter_closure_calls"] && n["assign_with_copy_calls"]==n["setter_closure_calls"] && n["binding_initialize_with_copy_calls"]==1 && n["binding_destroy_calls"]==2 && n["setter_inputs_transferred"]==2 && n["destroy_calls"]==6 && n["returned_destination_checks"]==n["initialize_with_copy_calls"]+n["assign_with_copy_calls"]+n["binding_initialize_with_copy_calls"] && n["byte_comparisons"]==5 && n["callbacks_active"]==0)) exit 1;
+                }' "$RESULTS"
+              test "$(wc -l < "$RESULTS" | tr -d ' ')" = 37
+              grep -Fx 'Mutable binding entry guards: category_first28=true; binding_register_prefixes=true; setter_outer_destroy=true; reconstructed_addresses_used=false' "$OUT/mutable-binding-entry-guards.txt"
+            fi
             grep -F 'SDK singleton class: FamilyControls.AuthorizationCenter' "$OUT/singleton-runtime.txt"
             grep -F 'Rust UIKit active callback observed' "$OUT/singleton-runtime.txt"
             if grep -Fq 'Public individual authorization request starting;' "$OUT/singleton-runtime.txt"; then exit 1; fi
             printf 'authorization_requested=false\n' >> "$OUT/selection-layout-scope.txt"
-            # Layout/box and optional default-value lifecycle only. Separate consent
+            # Layout/box, optional value lifecycle or finite mutation. Separate consent
             # fixture checks the authorization continuation after a UI choice.
             exit 0
           fi
@@ -618,5 +655,18 @@ jobs:
           path: |
             ${{ runner.temp }}/ios-sdk-audit/binding-accessor-exports.txt
             ${{ runner.temp }}/ios-sdk-audit/dladdr-selected-declaration.txt
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.selection_inspection_mode == 'mutable'
+        with:
+          name: ios-mutable-binding-audit
+          path: |
+            ${{ runner.temp }}/ios-sdk-audit/mutable-binding-results.txt
+            ${{ runner.temp }}/ios-sdk-audit/mutable-binding-entry-guards.txt
+            ${{ runner.temp }}/ios-sdk-audit/mutable-binding-launch.txt
+            ${{ runner.temp }}/ios-sdk-audit/selection-category-init-export.txt
+            ${{ runner.temp }}/ios-sdk-audit/binding-accessor-exports.txt
+            ${{ runner.temp }}/ios-sdk-audit/singleton-runtime.txt
           retention-days: 1
           if-no-files-found: error

@@ -126,7 +126,7 @@ Swiftの保持用boxを確保し、未初期化の値領域が要求されたア
 
 ソース `7591545` の[実行38077219284](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38077219284)では、独立した値の寿命を調べる検査も全工程成功しました。Rustで別々の領域を3つ確保し、公開のSelection.init()を1回、コピーを2回、代入を1回、破棄を3回呼びました。元の値を破棄した後も複製した値を別の領域へコピーでき、3つの領域をそれぞれ解放しました。値の内容は出力しません。
 
-これは初期状態のSelection値の寿命を確認した前提工程です。可変Bindingの生成・getter/setter・クロージャはまだ呼んでおらず、アプリ選択・許可要求・監視・遮蔽も行っていません。初期状態の値を可変Bindingの代用品にはしていません。
+これは初期状態のSelection値の寿命を確認した前提工程です。この段階では可変Bindingの生成・getter/setter・クロージャを呼んでおらず、アプリ選択・許可要求・監視・遮蔽も行っていませんでした。初期状態の値を可変Bindingの代用品にはしていません。
 
 [検査PR9](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/pull/9)で、確認済みの選択値の検査を最新の許可操作・状態getterコードへ統合しました。選択モードは許可要求を呼ばず、許可操作・状態取得とは別に実行します。初期化・値の操作を行うモジュールは成功済み `7591545` とバイト一致しています。
 
@@ -134,7 +134,21 @@ Swiftの保持用boxを確保し、未初期化の値領域が要求されたア
 
 PR9のmain取り込み時の競合は、実測済み `d10a1cf` の2ファイルと同じ内容を保って解消しました。製品リポジトリへ同期する検査2ファイルもSHA256でバイト一致を確認しています。製品クレートやAndroidの動作は変更していません。
 
-カテゴリを指定する公開初期化子の[実行38082809973](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38082809973)も成功しました。公開宣言とexportを照合し、入口の最大128バイトをページ内で採取した結果です。最初の戻り命令までの28バイトを復号し、Boolの入力と間接戻り先の受渡しを確認しました。この検査では、その初期化子やBindingを呼んでいません。可変Bindingの実装・実行は次の条件として残ります。
+カテゴリを指定する公開初期化子の[実行38082809973](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38082809973)も成功しました。公開宣言とexportを照合し、入口の最大128バイトをページ内で採取した結果です。最初の戻り命令までの28バイトを復号し、Boolの入力と間接戻り先の受渡しを確認しました。この入口検査では、その初期化子やBindingを呼んでいません。
+
+## 実Bindingの生成と値の更新（2026-10-11追加）
+
+[検査PR10](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/pull/10)で、Rustが保持する可変なSelection値を公開のBindingへつなぎました。公開初期化子でfalse・trueの異なる値をそれぞれ作り、getterが現在値をコピーし、setterが借りた入力を保存値へ代入します。値のフィールドを手で変更したり、定数のBindingを可変な選択の代用品にしたりしていません。
+
+コンストラクターへ渡すSelectionの型情報と、公開getter・setterが使うBinding自身の型情報は異なります。追加の命令照合でこの区別を確認し、アクセサーがBindingのgeneric引数からSelectionを取り出すことを検査してから呼びます。旧ソースの[実行38084347523](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38084347523)は、誤った型情報を渡す前に取り消しました。ビルド・実行の工程はどちらも省略され、誤った型情報での実呼出しはありません。
+
+修正ソース `4412036` の[実行38084816899](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38084816899)は全工程成功しました。実Bindingの初期化1回、全体のコピー1回、公開getter3回、公開setter2回を確認しました。getterクロージャは4回、setterクロージャは2回呼ばれ、初期化中のgetter呼出しも実際の回数に含めています。
+
+初期値falseとの一致、変更後のtrueとの一致・falseとの不一致、復元後のfalseとの一致を、値内容を出力しない5回の比較で確認しました。Bindingの元の値を破棄した後も、複製したBindingで読取り・書込みを続けました。確保・解放は10領域ずつ、残ったcallbackは0です。
+
+setterには専用コピーの所有権をSDKへ一度だけ渡し、Rustのクロージャは借りた入力を破棄しません。Bindingは自身の値操作表で全体をコピー・破棄し、保存値はすべてのBindingを破棄した後に解放します。記録した値操作回数は検査コードが直接呼んだ回数であり、SDK内部の破棄をすべて数えた意味ではありません。
+
+修正後の別モデルレビューは指摘0件、最終CodeQLも成功し、検査PR10をマージしました。同期した検査2ファイルは、公開main `1abcbe3` と同じ実測済みソースです。この結果は可変な値の受渡しの前提を確認したもので、FamilyActivityPickerの画面表示・実際のアプリ選択・選択token・Device Activity・Managed Settings・拡張・製品UI・正式配布の成功ではありません。
 
 ## アカウントと配布
 
