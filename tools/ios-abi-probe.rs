@@ -449,7 +449,12 @@ pub extern "C" fn main(_: i32, _: *mut *mut std::ffi::c_char) -> i32 {
 compile_error!("Xcode static library host requires the UIKit authorization mode");
 
 #[cfg(all(
-    any(selection_layout_probe, binding_entry_probe, selection_value_probe),
+    any(
+        selection_layout_probe,
+        binding_entry_probe,
+        selection_value_probe,
+        mutable_binding_probe
+    ),
     any(
         ui_test_host,
         ui_test_bundle,
@@ -471,6 +476,10 @@ compile_error!("selection layout inspection requires the Xcode UIKit authorizati
 compile_error!("binding entry inspection requires the selection layout mode");
 #[cfg(all(selection_value_probe, not(selection_layout_probe)))]
 compile_error!("selection value lifecycle requires the selection layout mode");
+#[cfg(all(mutable_binding_probe, not(selection_layout_probe)))]
+compile_error!("mutable binding inspection requires the selection layout mode");
+#[cfg(all(mutable_binding_probe, any(binding_entry_probe, selection_value_probe)))]
+compile_error!("mutable binding inspection is a separate finite value experiment");
 
 // Layout and entry-byte evidence only; no Selection or Binding value is built.
 #[cfg(selection_layout_probe)]
@@ -1124,6 +1133,900 @@ mod selection_value {
             );
         }
         proof.verified.set(true);
+    }
+}
+
+// Finite, request-free mutable value experiment. Evidence: Selection VWT
+// run38077219284, category entry run38082809973, and null-context boundary
+// research050528 (Swift 5.10 SILFunctionType/CallingConvention/HeapObject).
+#[cfg(all(mutable_binding_probe, selection_layout_probe))]
+mod mutable_binding {
+    use super::MetadataResponse;
+    use super::selection_layout::{ValueWitnessTable, read, resolve};
+    use std::alloc::{Layout, alloc_zeroed, dealloc};
+    use std::cell::RefCell;
+    use std::ffi::{c_char, c_void};
+    use std::ptr::NonNull;
+    use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    // Every C/Swift boundary saves x20 and LR and has a 16-byte C stack/CFI.
+    // Category: C(dst, Bool, entry) -> Swift x8=dst, x0=Bool, no self/metatype.
+    // Binding init: C(dst, get, set, metadata, entry) -> x8, x0/NULL,
+    // x2/NULL, x4=Value metadata (not an explicit metatype argument).
+    // Public get/set: x20 is Binding self; x0(get)/x1(set) is Binding
+    // metadata, from which the SDK projects Value at +16.
+    // Closure x20 is NULL context.
+    // Closure metadata registers are deliberately unused: the stable state
+    // supplies the already validated metadata, so no extra-argument assumption.
+    core::arch::global_asm!(
+        ".text",
+        ".p2align 2",
+        ".globl _rust_mutable_category_init",
+        "_rust_mutable_category_init:",
+        ".cfi_startproc",
+        "stp x20, x30, [sp, #-16]!",
+        ".cfi_def_cfa_offset 16",
+        ".cfi_offset 20, -16",
+        ".cfi_offset 30, -8",
+        "mov x8, x0",
+        "mov x0, x1",
+        "blr x2",
+        "ldp x20, x30, [sp], #16",
+        ".cfi_restore 20",
+        ".cfi_restore 30",
+        ".cfi_def_cfa_offset 0",
+        "ret",
+        ".cfi_endproc",
+        ".p2align 2",
+        ".globl _rust_mutable_binding_init",
+        "_rust_mutable_binding_init:",
+        ".cfi_startproc",
+        "stp x20, x30, [sp, #-16]!",
+        ".cfi_def_cfa_offset 16",
+        ".cfi_offset 20, -16",
+        ".cfi_offset 30, -8",
+        "mov x8, x0",
+        "mov x0, x1",
+        "mov x1, xzr",
+        "mov x9, x4",
+        "mov x4, x3",
+        "mov x3, xzr",
+        "blr x9",
+        "ldp x20, x30, [sp], #16",
+        ".cfi_restore 20",
+        ".cfi_restore 30",
+        ".cfi_def_cfa_offset 0",
+        "ret",
+        ".cfi_endproc",
+        ".p2align 2",
+        ".globl _rust_mutable_binding_get",
+        "_rust_mutable_binding_get:",
+        ".cfi_startproc",
+        "stp x20, x30, [sp, #-16]!",
+        ".cfi_def_cfa_offset 16",
+        ".cfi_offset 20, -16",
+        ".cfi_offset 30, -8",
+        "mov x20, x0",
+        "mov x8, x1",
+        "mov x0, x2",
+        "blr x3",
+        "ldp x20, x30, [sp], #16",
+        ".cfi_restore 20",
+        ".cfi_restore 30",
+        ".cfi_def_cfa_offset 0",
+        "ret",
+        ".cfi_endproc",
+        ".p2align 2",
+        ".globl _rust_mutable_binding_set",
+        "_rust_mutable_binding_set:",
+        ".cfi_startproc",
+        "stp x20, x30, [sp, #-16]!",
+        ".cfi_def_cfa_offset 16",
+        ".cfi_offset 20, -16",
+        ".cfi_offset 30, -8",
+        "mov x20, x0",
+        "mov x0, x1",
+        "mov x1, x2",
+        "blr x3",
+        "ldp x20, x30, [sp], #16",
+        ".cfi_restore 20",
+        ".cfi_restore 30",
+        ".cfi_def_cfa_offset 0",
+        "ret",
+        ".cfi_endproc",
+        ".p2align 2",
+        ".globl _rust_mutable_get_closure",
+        "_rust_mutable_get_closure:",
+        ".cfi_startproc",
+        "stp x20, x30, [sp, #-16]!",
+        ".cfi_def_cfa_offset 16",
+        ".cfi_offset 20, -16",
+        ".cfi_offset 30, -8",
+        "mov x0, x8",
+        "mov x1, x20",
+        "bl _rust_mutable_get_helper",
+        "ldp x20, x30, [sp], #16",
+        ".cfi_restore 20",
+        ".cfi_restore 30",
+        ".cfi_def_cfa_offset 0",
+        "ret",
+        ".cfi_endproc",
+        ".p2align 2",
+        ".globl _rust_mutable_set_closure",
+        "_rust_mutable_set_closure:",
+        ".cfi_startproc",
+        "stp x20, x30, [sp, #-16]!",
+        ".cfi_def_cfa_offset 16",
+        ".cfi_offset 20, -16",
+        ".cfi_offset 30, -8",
+        "mov x1, x20",
+        "bl _rust_mutable_set_helper",
+        "ldp x20, x30, [sp], #16",
+        ".cfi_restore 20",
+        ".cfi_restore 30",
+        ".cfi_def_cfa_offset 0",
+        "ret",
+        ".cfi_endproc",
+    );
+    unsafe extern "C" {
+        fn rust_mutable_category_init(dst: *mut c_void, flag: usize, entry: *const c_void);
+        fn rust_mutable_binding_init(
+            dst: *mut c_void,
+            get: *const c_void,
+            set: *const c_void,
+            metadata: *const c_void,
+            entry: *const c_void,
+        );
+        fn rust_mutable_binding_get(
+            value: *mut c_void,
+            dst: *mut c_void,
+            metadata: *const c_void,
+            entry: *const c_void,
+        );
+        fn rust_mutable_binding_set(
+            value: *mut c_void,
+            source: *mut c_void,
+            metadata: *const c_void,
+            entry: *const c_void,
+        );
+        fn rust_mutable_get_closure();
+        fn rust_mutable_set_closure();
+        fn getpagesize() -> i32;
+        fn pthread_main_np() -> i32;
+        fn dladdr(address: *const c_void, information: *mut DlInfo) -> i32;
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct DlInfo {
+        filename: *const c_char,
+        base: *const c_void,
+        symbol: *const c_char,
+        symbol_address: *const c_void,
+    }
+    type Destroy = unsafe extern "Swift" fn(*mut c_void, *const c_void);
+    type Copy = unsafe extern "Swift" fn(*mut c_void, *mut c_void, *const c_void) -> *mut c_void;
+    struct Witnesses {
+        metadata: *const c_void,
+        destroy: Destroy,
+        initialize: Copy,
+        assign: Copy,
+        layout: Layout,
+        size: usize,
+    }
+    impl Witnesses {
+        fn load(metadata: *const c_void, expected: usize, page: usize) -> Self {
+            assert!(
+                unsafe { read(metadata.cast::<usize>(), page) } == 0x200,
+                "mutable value metadata must be a struct"
+            );
+            let table = unsafe {
+                read(
+                    metadata.cast::<*const ValueWitnessTable>().wrapping_sub(1),
+                    page,
+                )
+            };
+            assert!(!table.is_null(), "mutable value witnesses missing");
+            let size = unsafe { read(&raw const (*table).size, page) };
+            let stride = unsafe { read(&raw const (*table).stride, page) };
+            let flags = unsafe { read(&raw const (*table).flags, page) };
+            let alignment = (flags as usize & 0xff) + 1;
+            assert!(
+                flags & 0x0040_0000 == 0 && (size, stride, alignment) == (expected, expected, 8),
+                "mutable value layout changed"
+            );
+            let entry = |slot| {
+                let p = unsafe {
+                    read(
+                        (&raw const (*table).functions)
+                            .cast::<*const c_void>()
+                            .add(slot),
+                        page,
+                    )
+                };
+                assert!(
+                    !p.is_null() && p.addr() % 4 == 0,
+                    "invalid mutable value witness"
+                );
+                p
+            };
+            Self {
+                metadata,
+                size,
+                layout: Layout::from_size_align(stride, alignment).unwrap(),
+                destroy: unsafe { std::mem::transmute::<*const c_void, Destroy>(entry(1)) },
+                initialize: unsafe { std::mem::transmute::<*const c_void, Copy>(entry(2)) },
+                assign: unsafe { std::mem::transmute::<*const c_void, Copy>(entry(3)) },
+            }
+        }
+    }
+    #[derive(Clone, Copy)]
+    enum Count {
+        Alloc,
+        Dealloc,
+        Category,
+        BindingInit,
+        PublicGet,
+        PublicSet,
+        ClosureGet,
+        ClosureSet,
+        InitCopy,
+        AssignCopy,
+        Destroy,
+        BindingCopy,
+        BindingDestroy,
+        Taken,
+        Returned,
+        Comparisons,
+        Active,
+    }
+    const COUNT_NAMES: [&str; 17] = [
+        "allocations",
+        "deallocations",
+        "category_initializer_calls",
+        "binding_initializer_calls",
+        "binding_getter_calls",
+        "binding_setter_calls",
+        "getter_closure_calls",
+        "setter_closure_calls",
+        "initialize_with_copy_calls",
+        "assign_with_copy_calls",
+        "destroy_calls",
+        "binding_initialize_with_copy_calls",
+        "binding_destroy_calls",
+        "setter_inputs_transferred",
+        "returned_destination_checks",
+        "byte_comparisons",
+        "callbacks_active",
+    ];
+    struct Proof {
+        counts: [AtomicUsize; 17],
+        verified: AtomicBool,
+        comparisons: [AtomicBool; 5],
+        started: Instant,
+    }
+    impl Proof {
+        fn new() -> Self {
+            Self {
+                counts: std::array::from_fn(|_| AtomicUsize::new(0)),
+                verified: AtomicBool::new(false),
+                comparisons: std::array::from_fn(|_| AtomicBool::new(false)),
+                started: Instant::now(),
+            }
+        }
+        fn inc(&self, c: Count) {
+            self.counts[c as usize].fetch_add(1, Ordering::SeqCst);
+        }
+        fn n(&self, c: Count) -> usize {
+            self.counts[c as usize].load(Ordering::SeqCst)
+        }
+        fn check(&self) {
+            assert!(
+                unsafe { pthread_main_np() } == 1,
+                "mutable binding requires the main thread"
+            );
+            assert!(
+                self.started.elapsed() < Duration::from_secs(30),
+                "mutable binding deadline exceeded"
+            );
+        }
+        fn emit(&self) {
+            println!("Mutable binding result: phase=mutable_value");
+            println!(
+                "Mutable binding result: mutable_binding_verified={}",
+                self.verified.load(Ordering::SeqCst)
+            );
+            for (i, name) in COUNT_NAMES.iter().enumerate() {
+                println!(
+                    "Mutable binding result: {name}={}",
+                    self.counts[i].load(Ordering::SeqCst)
+                );
+            }
+            for (i, name) in [
+                "category_values_differ",
+                "initial_get_equals_false",
+                "changed_get_equals_true",
+                "changed_get_differs_false",
+                "restored_get_equals_false",
+            ]
+            .iter()
+            .enumerate()
+            {
+                println!(
+                    "Mutable binding result: {name}={}",
+                    self.comparisons[i].load(Ordering::SeqCst)
+                );
+            }
+            for name in ["null_contexts", "binding_full_vwt", "main_thread_required"] {
+                println!("Mutable binding result: {name}=true");
+            }
+            for name in [
+                "picker_verified",
+                "tokens_verified",
+                "grant_verified",
+                "monitoring_verified",
+                "shielding_verified",
+                "selection_contents_output",
+                "selection_addresses_output",
+            ] {
+                println!("Mutable binding result: {name}=false");
+            }
+            for name in [
+                "authorization_requests",
+                "private_api_calls",
+                "private_api_reads",
+            ] {
+                println!("Mutable binding result: {name}=0");
+            }
+        }
+    }
+    impl Drop for Proof {
+        fn drop(&mut self) {
+            self.emit();
+        }
+    }
+    // A separate watchdog terminates even if a foreign synchronous call stalls.
+    // It reads atomic counters only, never the state or Selection memory.
+    struct Deadline {
+        done: Arc<(Mutex<bool>, Condvar)>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Deadline {
+        fn start(proof: Arc<Proof>) -> Self {
+            let done = Arc::new((Mutex::new(false), Condvar::new()));
+            let signal = done.clone();
+            let thread = std::thread::spawn(move || {
+                let (lock, wake) = &*signal;
+                let finished = wake
+                    .wait_timeout_while(
+                        lock.lock().unwrap(),
+                        Duration::from_secs(30).saturating_sub(proof.started.elapsed()),
+                        |done| !*done,
+                    )
+                    .unwrap();
+                if !*finished.0 {
+                    proof.verified.store(false, Ordering::SeqCst);
+                    proof.emit();
+                    eprintln!("Mutable binding foreign-call deadline exceeded");
+                    std::process::exit(1);
+                }
+            });
+            Self {
+                done,
+                thread: Some(thread),
+            }
+        }
+    }
+    impl Drop for Deadline {
+        fn drop(&mut self) {
+            *self.done.0.lock().unwrap() = true;
+            self.done.1.notify_all();
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("mutable deadline thread failed");
+            }
+        }
+    }
+    struct Value<'a> {
+        pointer: NonNull<u8>,
+        initialized: bool,
+        taken: bool,
+        witnesses: &'a Witnesses,
+        proof: &'a Proof,
+        binding: bool,
+    }
+    impl<'a> Value<'a> {
+        fn allocate(witnesses: &'a Witnesses, proof: &'a Proof, binding: bool) -> Self {
+            let pointer = NonNull::new(unsafe { alloc_zeroed(witnesses.layout) })
+                .expect("mutable allocation failed");
+            proof.inc(Count::Alloc);
+            Self {
+                pointer,
+                initialized: false,
+                taken: false,
+                witnesses,
+                proof,
+                binding,
+            }
+        }
+        fn ptr(&self) -> *mut c_void {
+            self.pointer.as_ptr().cast()
+        }
+        fn category(&mut self, flag: bool, entry: *const c_void) {
+            self.proof.check();
+            assert!(!self.initialized && !self.taken && !self.binding);
+            self.proof.inc(Count::Category);
+            unsafe { rust_mutable_category_init(self.ptr(), usize::from(flag), entry) };
+            self.initialized = true;
+        }
+        fn copy(&mut self, source: &Self) {
+            self.proof.check();
+            assert!(!self.initialized && !self.taken && source.initialized);
+            assert!(
+                self.witnesses.metadata == source.witnesses.metadata && self.ptr() != source.ptr()
+            );
+            self.proof.inc(if self.binding {
+                Count::BindingCopy
+            } else {
+                Count::InitCopy
+            });
+            let result = unsafe {
+                (self.witnesses.initialize)(self.ptr(), source.ptr(), self.witnesses.metadata)
+            };
+            self.initialized = true;
+            assert!(
+                result == self.ptr(),
+                "mutable copy returned another destination"
+            );
+            self.proof.inc(Count::Returned);
+        }
+        fn compare(&self, other: &Self, slot: usize, equal: bool) {
+            self.proof.check();
+            assert!(self.initialized && other.initialized && !self.binding && !other.binding);
+            assert!(
+                self.witnesses.metadata == other.witnesses.metadata && self.ptr() != other.ptr()
+            );
+            let a =
+                unsafe { std::slice::from_raw_parts(self.pointer.as_ptr(), self.witnesses.size) };
+            let b =
+                unsafe { std::slice::from_raw_parts(other.pointer.as_ptr(), other.witnesses.size) };
+            self.proof.inc(Count::Comparisons);
+            assert!((a == b) == equal, "opaque mutable comparison failed");
+            self.proof.comparisons[slot].store(true, Ordering::SeqCst);
+        }
+        fn get(&self, output: &mut Self, metadata: *const c_void, entry: *const c_void) {
+            self.proof.check();
+            assert!(self.binding && self.initialized && !output.initialized && !output.taken);
+            assert!(output.witnesses.metadata == metadata && !output.binding);
+            let before = self.proof.n(Count::ClosureGet);
+            self.proof.inc(Count::PublicGet);
+            // The generic accessor receives Binding<Value> metadata, then
+            // projects its Value argument at +16. The initializer instead
+            // receives the direct Value metadata argument.
+            unsafe {
+                rust_mutable_binding_get(self.ptr(), output.ptr(), self.witnesses.metadata, entry)
+            };
+            output.initialized = true; // only after the public getter returns
+            assert!(
+                self.proof.n(Count::ClosureGet) > before,
+                "public getter did not invoke the mutable closure"
+            );
+        }
+        fn set(&self, input: &mut Self, metadata: *const c_void, entry: *const c_void) {
+            self.proof.check();
+            assert!(self.binding && self.initialized && input.initialized && !input.taken);
+            assert!(input.witnesses.metadata == metadata && !input.binding);
+            // The public setter owns this dedicated copy. Its closure borrows it;
+            // the outer SDK setter destroys it. Retain just the allocation until
+            // the call returns; Rust must never destroy this consumed value.
+            input.initialized = false;
+            input.taken = true;
+            self.proof.inc(Count::Taken);
+            self.proof.inc(Count::PublicSet);
+            unsafe {
+                rust_mutable_binding_set(self.ptr(), input.ptr(), self.witnesses.metadata, entry)
+            };
+        }
+    }
+    impl Drop for Value<'_> {
+        fn drop(&mut self) {
+            if self.initialized {
+                self.initialized = false;
+                self.proof.inc(if self.binding {
+                    Count::BindingDestroy
+                } else {
+                    Count::Destroy
+                });
+                unsafe { (self.witnesses.destroy)(self.ptr(), self.witnesses.metadata) };
+            }
+            unsafe { dealloc(self.pointer.as_ptr(), self.witnesses.layout) };
+            self.proof.inc(Count::Dealloc);
+        }
+    }
+    struct State<'a> {
+        value: RefCell<Value<'a>>,
+        proof: &'a Proof,
+    }
+    static STATE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    // Failure diagnostics may run on a rejected foreign callback thread. Keep
+    // only atomic counters here, independently of the main-thread state lifetime.
+    static DIAGNOSTICS: Mutex<Option<Arc<Proof>>> = Mutex::new(None);
+    struct Installed<'a> {
+        state: Box<State<'a>>,
+    }
+    impl<'a> Installed<'a> {
+        fn install(value: Value<'a>, proof: &'a Arc<Proof>) -> Self {
+            assert!(value.initialized && !value.binding);
+            proof.check();
+            let mut state = Box::new(State {
+                value: RefCell::new(value),
+                proof,
+            });
+            let pointer = (&raw mut *state).cast::<c_void>();
+            assert!(
+                STATE
+                    .compare_exchange(
+                        std::ptr::null_mut(),
+                        pointer,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst
+                    )
+                    .is_ok(),
+                "mutable state already installed"
+            );
+            let owner = Self { state };
+            let mut diagnostics = DIAGNOSTICS.lock().unwrap();
+            assert!(
+                diagnostics.is_none(),
+                "mutable diagnostics already installed"
+            );
+            *diagnostics = Some(proof.clone());
+            owner
+        }
+    }
+    impl Drop for Installed<'_> {
+        fn drop(&mut self) {
+            // Declared before all Binding owners: their full VWT destroy completes
+            // before this guard. NULL contexts cannot escape into an owned capture.
+            assert!(
+                self.state.proof.n(Count::Active) == 0,
+                "mutable callbacks still active"
+            );
+            let p = (&raw mut *self.state).cast::<c_void>();
+            assert!(
+                STATE
+                    .compare_exchange(p, std::ptr::null_mut(), Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok(),
+                "mutable state ownership changed"
+            );
+            DIAGNOSTICS.lock().unwrap().take();
+            // Box drops initialized state through Selection VWT after unregistering.
+        }
+    }
+    struct Callback<'a>(&'a Proof);
+    impl Drop for Callback<'_> {
+        fn drop(&mut self) {
+            self.0.counts[Count::Active as usize].fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    fn callback(pointer: *mut c_void, context: *mut c_void, getter: bool) {
+        // C helpers cannot unwind through Swift. Failed validation emits actual
+        // partial counters and exits; no attempt to destroy an unknown foreign
+        // partial result. Successful calls participate in ordinary RAII cleanup.
+        let diagnostics = DIAGNOSTICS.lock().unwrap().clone();
+        if let Some(proof) = &diagnostics {
+            proof.inc(if getter {
+                Count::ClosureGet
+            } else {
+                Count::ClosureSet
+            });
+        }
+        let outcome = std::panic::catch_unwind(|| {
+            assert!(
+                unsafe { pthread_main_np() } == 1,
+                "foreign mutable callback thread"
+            );
+            let p = STATE.load(Ordering::SeqCst);
+            assert!(!p.is_null(), "mutable callback without initialized state");
+            let state = unsafe { &*p.cast::<State<'_>>() };
+            state.proof.check();
+            assert!(context.is_null(), "mutable callback context is not NULL");
+            assert!(
+                state.proof.n(Count::Active) == 0,
+                "mutable callback reentry"
+            );
+            state.proof.inc(Count::Active);
+            let _active = Callback(state.proof);
+            let value = state.value.borrow();
+            assert!(
+                value.initialized
+                    && !pointer.is_null()
+                    && pointer.addr() % value.witnesses.layout.align() == 0,
+                "invalid mutable callback value"
+            );
+            let distance = pointer.addr().abs_diff(value.ptr().addr());
+            assert!(
+                distance >= value.witnesses.layout.size(),
+                "mutable callback overlaps stable state"
+            );
+            let result = if getter {
+                state.proof.inc(Count::InitCopy);
+                unsafe {
+                    (value.witnesses.initialize)(pointer, value.ptr(), value.witnesses.metadata)
+                }
+            } else {
+                state.proof.inc(Count::AssignCopy);
+                unsafe { (value.witnesses.assign)(value.ptr(), pointer, value.witnesses.metadata) }
+            };
+            assert!(
+                result == if getter { pointer } else { value.ptr() },
+                "mutable closure witness destination changed"
+            );
+            state.proof.inc(Count::Returned);
+        });
+        if outcome.is_err() {
+            if let Some(proof) = diagnostics {
+                proof.verified.store(false, Ordering::SeqCst);
+                proof.emit();
+            }
+            eprintln!("Mutable binding callback validation failed");
+            std::process::exit(1);
+        }
+    }
+    #[unsafe(no_mangle)]
+    unsafe extern "C" fn rust_mutable_get_helper(dst: *mut c_void, context: *mut c_void) {
+        callback(dst, context, true);
+    }
+    #[unsafe(no_mangle)]
+    unsafe extern "C" fn rust_mutable_set_helper(source: *mut c_void, context: *mut c_void) {
+        callback(source, context, false);
+    }
+
+    fn word(entry: *const c_void, offset: usize, page: usize) -> u32 {
+        unsafe { read(entry.cast::<u8>().wrapping_add(offset).cast::<u32>(), page) }
+    }
+    fn branch(entry: *const c_void, offset: usize, call: bool, page: usize) -> *const c_void {
+        let instruction = word(entry, offset, page);
+        assert!(
+            instruction & 0xfc00_0000 == if call { 0x9400_0000 } else { 0x1400_0000 },
+            "SDK branch shape changed"
+        );
+        let relative = ((instruction << 6) as i32 >> 6) as isize * 4;
+        let displacement = (offset as isize).checked_add(relative).unwrap();
+        let address = entry
+            .addr()
+            .checked_add_signed(displacement)
+            .expect("SDK branch address overflow");
+        let target = entry
+            .cast::<u8>()
+            .wrapping_offset(displacement)
+            .cast::<c_void>();
+        assert!(address == target.addr() && address % 4 == 0);
+        let mut a = DlInfo::default();
+        let mut b = DlInfo::default();
+        assert!(
+            unsafe { dladdr(entry, &mut a) } != 0
+                && unsafe { dladdr(target, &mut b) } != 0
+                && !a.base.is_null()
+                && a.base == b.base,
+            "SDK branch changed image"
+        );
+        target
+    }
+    fn verify_entries(
+        category: *const c_void,
+        init: *const c_void,
+        get: *const c_void,
+        set: *const c_void,
+        page: usize,
+    ) {
+        // Only the 28 actual SDK bytes up to the first RET are interpreted.
+        // ADRP relocation bits are variable; reconstructed addresses are never
+        // treated as actual SDK addresses or followed for category constants.
+        for (offset, expected) in [
+            (0, 0x3900_0100),
+            (12, 0xa900_a509),
+            (16, 0xa901_a509),
+            (20, 0xa902_a509),
+            (24, 0xd65f_03c0),
+        ] {
+            assert!(
+                word(category, offset, page) == expected,
+                "category initializer prefix changed"
+            );
+        }
+        assert!(
+            word(category, 4, page) & 0x9f00_001f == 0x9000_0009
+                && word(category, 8, page) & 0xffc0_03ff == 0xf940_0129,
+            "category constant load shape changed"
+        );
+        for (offset, expected) in [
+            (0, 0xa9ba_6ffc),
+            (4, 0xaa1e_03e5),
+            (12, 0xaa05_03fe),
+            (16, 0xa905_7bfd),
+            (20, 0x9101_43fd),
+            (24, 0xd100_c3ff),
+            (28, 0xaa04_03fa),
+            (32, 0xaa03_03f3),
+            (36, 0xaa02_03f4),
+        ] {
+            assert!(
+                word(init, offset, page) == expected,
+                "Binding constructor prefix changed"
+            );
+        }
+        let _save = branch(init, 8, true, page);
+        let helper = branch(init, 40, true, page);
+        for (offset, expected) in [(0, 0xaa01_03f5), (4, 0xaa00_03fb), (8, 0xf818_83a8)] {
+            assert!(
+                word(helper, offset, page) == expected,
+                "Binding constructor helper changed"
+            );
+        }
+        let getter = branch(get, 0, false, page);
+        for (offset, expected) in [
+            (0, 0xa9bd_57f6),
+            (4, 0xa901_4ff4),
+            (8, 0xa902_7bfd),
+            (12, 0x9100_83fd),
+            (16, 0xaa14_03f5),
+            (20, 0xaa00_03f6),
+            (24, 0xaa08_03f3),
+            (104, 0xb980_22c8),
+            (112, 0xf940_0ac2),
+        ] {
+            assert!(
+                word(getter, offset, page) == expected,
+                "Binding getter prefix changed"
+            );
+        }
+        for (offset, expected) in [
+            (0, 0xa9bd_57f6),
+            (4, 0xa901_4ff4),
+            (8, 0xa902_7bfd),
+            (12, 0x9100_83fd),
+            (16, 0xaa01_03f3),
+            (20, 0xaa00_03f5),
+            (24, 0xa940_2281),
+            (28, 0xf940_0109),
+            (32, 0xf940_4129),
+            (36, 0xaa08_03f4),
+            (40, 0xd63f_0120),
+            (44, 0xf940_0a61),
+            (48, 0xf85f_8028),
+            (52, 0xf940_0502),
+            (56, 0xaa15_03e0),
+            (60, 0xa942_7bfd),
+            (64, 0xa941_4ff4),
+            (68, 0xa8c3_57f6),
+            (72, 0xd61f_0040),
+        ] {
+            assert!(
+                word(set, offset, page) == expected,
+                "Binding setter ownership prefix changed"
+            );
+        }
+        println!(
+            "Mutable binding entry guards: category_first28=true; binding_register_prefixes=true; setter_outer_destroy=true; reconstructed_addresses_used=false"
+        );
+    }
+    pub(super) fn inspect(metadata: *const c_void) {
+        let proof = Arc::new(Proof::new());
+        let _deadline = Deadline::start(proof.clone());
+        proof.check();
+        let page = unsafe { getpagesize() };
+        assert!(page > 0);
+        let page = page as usize;
+        let selection = Witnesses::load(metadata, 56, page);
+        let accessor: unsafe extern "Swift" fn(usize, *const c_void) -> MetadataResponse =
+            unsafe { std::mem::transmute(resolve(env!("BINDING_METADATA_SYMBOL"))) };
+        let response = unsafe { accessor(0, metadata) };
+        assert!(
+            response.state == 0 && !response.value.is_null(),
+            "Binding metadata incomplete"
+        );
+        let binding_type = Witnesses::load(response.value, 72, page);
+        // Swift5.10 StructMetadata has kind + descriptor before its generic
+        // arguments. Actual get body uses [x0+16], and set uses [x1+16],
+        // to project Value metadata. Validate that specialization before calls.
+        assert!(
+            unsafe { read(response.value.cast::<*const c_void>().wrapping_add(2), page) }
+                == metadata,
+            "Binding generic Value metadata differs"
+        );
+        let category = resolve(env!("SELECTION_CATEGORY_INIT_SYMBOL"));
+        let init = resolve(env!("BINDING_INIT_SYMBOL"));
+        let get = resolve(env!("BINDING_GET_SYMBOL"));
+        let set = resolve(env!("BINDING_SET_SYMBOL"));
+        verify_entries(category, init, get, set, page);
+        let mut initial = Value::allocate(&selection, &proof, false);
+        initial.category(false, category);
+        let mut changed = Value::allocate(&selection, &proof, false);
+        changed.category(true, category);
+        initial.compare(&changed, 0, false);
+        let mut stable = Value::allocate(&selection, &proof, false);
+        stable.copy(&initial);
+        // Stable boxed Rust state is installed BEFORE the actual constructor,
+        // which may synchronously invoke the getter. No Swift heap context.
+        let state = Installed::install(stable, &proof);
+        let mut binding = Value::allocate(&binding_type, &proof, true);
+        proof.inc(Count::BindingInit);
+        unsafe {
+            rust_mutable_binding_init(
+                binding.ptr(),
+                rust_mutable_get_closure as *const c_void,
+                rust_mutable_set_closure as *const c_void,
+                metadata,
+                init,
+            )
+        };
+        binding.initialized = true;
+        // Copy/destroy the ENTIRE initialized Binding using its own VWT, then
+        // continue with the copy after destroying the original allocation.
+        let mut binding_copy = Value::allocate(&binding_type, &proof, true);
+        binding_copy.copy(&binding);
+        drop(binding);
+        let mut first = Value::allocate(&selection, &proof, false);
+        binding_copy.get(&mut first, metadata, get);
+        first.compare(&initial, 1, true);
+        let mut input = Value::allocate(&selection, &proof, false);
+        input.copy(&changed);
+        let before = proof.n(Count::ClosureSet);
+        binding_copy.set(&mut input, metadata, set);
+        assert!(
+            proof.n(Count::ClosureSet) == before + 1,
+            "public setter did not call the mutable closure once"
+        );
+        drop(input); // consumed allocation only, no Rust destroy
+        let mut after = Value::allocate(&selection, &proof, false);
+        binding_copy.get(&mut after, metadata, get);
+        after.compare(&changed, 2, true);
+        after.compare(&initial, 3, false);
+        let mut restore = Value::allocate(&selection, &proof, false);
+        restore.copy(&initial);
+        let before = proof.n(Count::ClosureSet);
+        binding_copy.set(&mut restore, metadata, set);
+        assert!(
+            proof.n(Count::ClosureSet) == before + 1,
+            "restore did not call the mutable closure once"
+        );
+        drop(restore);
+        let mut last = Value::allocate(&selection, &proof, false);
+        binding_copy.get(&mut last, metadata, get);
+        last.compare(&initial, 4, true);
+        drop(first);
+        drop(after);
+        drop(last);
+        drop(binding_copy); // no remaining owned Binding or callable closure
+        assert!(proof.n(Count::Active) == 0);
+        drop(state);
+        drop(changed);
+        drop(initial);
+        proof.check();
+        assert!(
+            proof.n(Count::Alloc) == proof.n(Count::Dealloc)
+                && proof.n(Count::Category) == 2
+                && proof.n(Count::BindingInit) == 1
+                && proof.n(Count::BindingCopy) == 1
+                && proof.n(Count::BindingDestroy) == 2
+                && proof.n(Count::PublicGet) == 3
+                && proof.n(Count::PublicSet) == 2
+                && proof.n(Count::ClosureGet) >= 3
+                && proof.n(Count::ClosureSet) == 2
+                && proof.n(Count::AssignCopy) == proof.n(Count::ClosureSet)
+                && proof.n(Count::InitCopy) == 3 + proof.n(Count::ClosureGet)
+                && proof.n(Count::Returned)
+                    == proof.n(Count::InitCopy)
+                        + proof.n(Count::AssignCopy)
+                        + proof.n(Count::BindingCopy)
+                && proof.n(Count::Taken) == 2
+                && proof.n(Count::Destroy) == 6
+                && proof.n(Count::Comparisons) == 5
+                && proof.n(Count::Active) == 0,
+            "mutable lifecycle counts inconsistent"
+        );
+        proof.verified.store(true, Ordering::SeqCst);
     }
 }
 
@@ -2129,7 +3032,9 @@ mod native_host {
                 let metadata = super::selection_layout::inspect();
                 #[cfg(selection_value_probe)]
                 super::selection_value::inspect(metadata);
-                #[cfg(not(selection_value_probe))]
+                #[cfg(mutable_binding_probe)]
+                super::mutable_binding::inspect(metadata);
+                #[cfg(not(any(selection_value_probe, mutable_binding_probe)))]
                 let _ = metadata;
             })
             .is_ok();
