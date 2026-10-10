@@ -1,6 +1,6 @@
 # iOSの未達条件（2026-10-11確認）
 
-iOS製品の許可画面・アプリ選択・計測・遮蔽は未実装です。検査用のRustコードから公開の個人向け許可APIを呼び、エラーの戻りを受け取るところまで確認しました。許可の承認や、Androidの計測結果をiOSの制御成功として扱いません。
+iOS製品の許可画面・アプリ選択・計測・遮蔽は未実装です。Rustの検査ホストでは、Simulatorの個人向け許可操作と、公開getterによる許可済み状態の取得まで確認しました。検査ホストでの成功と、製品の画面・選択・制御の完成は区別します。
 
 ## 計測の意味
 
@@ -86,13 +86,29 @@ SDKの公開宣言から、個人向けの許可要求が `requestAuthorization(
 
 ソース `0afb76e` の[実行38078299191](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38078299191)では、公開の入力APIをSDKヘッダーと照合し、1回の合成入力でOSの「Approved to Access Screen Time」画面まで進みました。最後のDoneを押していなかったため、全体は完了待ちで失敗しました。Done操作を追加した最終ソース `65f67e2` の[実行38079380084](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38079380084)は全工程成功し、1件のXCTestが29.209秒で成功しました。公開APIからの戻りと `error_present=false` を確認しています。
 
-最終統合レビューはMust 0件、CodeQLも成功し、[検査PR7](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/pull/7)をマージしました。公開mainの `e211950` のCodeQLも成功しています。製品リポジトリへ同期した2ファイルは、この公開mainと同じソースです。状態getter・可変Binding・製品統合の追加検査は別の作業ブランチにあります。今回の無エラーの戻りを、状態getterの取得や製品UI・監視・遮蔽の完成とは判定しません。
+最終統合レビューはMust 0件、CodeQLも成功し、[検査PR7](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/pull/7)をマージしました。公開mainの `e211950` のCodeQLも成功しています。製品リポジトリへ当初同期した2ファイルは、この公開mainと同じソースでした。この段階の無エラーの戻りを、状態getterの取得や製品UI・監視・遮蔽の完成とは判定しません。後続の状態getterと選択値の検査は、以下の別の実測として記録します。
 
 ## 許可状態を読むための型情報（2026-10-11追加）
 
 ソース `64ced79` の[実行38077790004](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38077790004)は全工程成功しました。SDKの公開宣言とexportを照合したうえで、AuthorizationStatusの完全なenumメタデータを取得しました。サイズ・stride・alignmentはいずれも1です。公開のauthorizationStatus getter入口は、ページ内の最大128バイトだけ採取しました。
 
 この検査は許可要求をしない独立プロセスで行いました。getter・値の操作表・enum値の構築は呼んでいません。型情報と入口の取得を、許可状態の取得や承認の確認とは扱いません。最初の起動要求はGitHubがHTTP 500を返しましたが、実行一覧に同じソースの受付があることを確認し、再送していません。
+
+## 実getterによる許可状態の取得（2026-10-11追加）
+
+ソース `e731b48` の[実行38080955889](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38080955889)は全工程成功しました。要求をしない新規Simulatorの独立プロセスで、公開の状態getter、rawValue getter、実行系のenum case名取得をそれぞれ1回呼び、raw値0と `notDetermined` の一致を確認しました。型情報だけの検査とは別の結果です。
+
+[検査PR8](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/pull/8)で、状態取得を最新のXcode検査ホストへ統合しました。公開許可APIの戻りを受け取ってからメインスレッドで状態を読み、SDKの結果と状態を同じファイルへ保存します。実getterの呼出し・raw値・反射したcase名の照合を終えてから、XCTestに完了を知らせます。
+
+ソース `9fcc8dd` の[許可側の実行38082434285](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38082434285)は全工程成功しました。OSの許可操作後にAPIがエラーなしで戻り、実getterがraw値2と `approved` を返しました。状態・raw値・case名の取得は各1回で、メインスレッドで読んだことも確認しました。
+
+同じソースの[拒否側の実行38081982214](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38081982214)は、XCTestの1件が16.256秒で成功した後、状態の期待値照合で失敗しました。OSの「Don't Allow」操作後にAPIはエラーを返し、実getterはraw値0と `notDetermined` を返しています。`denied` を前提にした検査条件が実測と違いました。
+
+[Appleの個人向け許可APIの説明](https://developer.apple.com/documentation/familycontrols/authorizationcenter/requestauthorization(for:))は、承認または取消後に状態を設定するか、エラーを投げるとしています。拒否後に必ず `denied` へ変わるとは仮定せず、APIのエラーと「状態が許可済みではないこと」を照合するよう修正しました。Rust側はraw値とcase名の対応を厳密に検証し、許可側には引き続きエラーなし・raw値2・`approved` を要求します。
+
+修正ソース `f82e110` の[拒否側の実行38082622453](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38082622453)は全工程成功し、エラーとraw値0・`notDetermined` を再確認しました。`denied` の取得成功とは扱いません。拒否条件の修正はRustや許可側の操作・照合を変更しておらず、許可側の成功検査を重複実行していません。
+
+統合と期待値修正の別モデルレビューは指摘0件、最終CodeQLも成功し、検査PR8をマージしました。公開main `b3bb985` のCodeQLも成功しています。ここまでの成果は検査ホストでの許可と状態取得であり、製品への統合・可変なアプリ選択・監視・遮蔽・他社動画の再生時間取得・正式配布の成功ではありません。
 
 ## 選択値とBindingの型情報（2026-10-11追加）
 
@@ -111,6 +127,14 @@ Swiftの保持用boxを確保し、未初期化の値領域が要求されたア
 ソース `7591545` の[実行38077219284](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38077219284)では、独立した値の寿命を調べる検査も全工程成功しました。Rustで別々の領域を3つ確保し、公開のSelection.init()を1回、コピーを2回、代入を1回、破棄を3回呼びました。元の値を破棄した後も複製した値を別の領域へコピーでき、3つの領域をそれぞれ解放しました。値の内容は出力しません。
 
 これは初期状態のSelection値の寿命を確認した前提工程です。可変Bindingの生成・getter/setter・クロージャはまだ呼んでおらず、アプリ選択・許可要求・監視・遮蔽も行っていません。初期状態の値を可変Bindingの代用品にはしていません。
+
+[検査PR9](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/pull/9)で、確認済みの選択値の検査を最新の許可操作・状態getterコードへ統合しました。選択モードは許可要求を呼ばず、許可操作・状態取得とは別に実行します。初期化・値の操作を行うモジュールは成功済み `7591545` とバイト一致しています。
+
+最初の起動要求は、ワークフローの1工程がGitHubの21,000文字上限を超えたため、HTTP422で受理されませんでした。準備とビルドを別工程に分け、公開SDK識別子と検査オプションだけを引き継ぐよう修正しました。追加レビューは指摘0件、ソース `d10a1cf` の[実行38083393269](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38083393269)は全工程成功しました。3領域の確保・解放、初期化1・コピー2・代入1・破棄3、元値を破棄した後のコピーを、統合後にも確認しました。
+
+PR9のmain取り込み時の競合は、実測済み `d10a1cf` の2ファイルと同じ内容を保って解消しました。製品リポジトリへ同期する検査2ファイルもSHA256でバイト一致を確認しています。製品クレートやAndroidの動作は変更していません。
+
+カテゴリを指定する公開初期化子の[実行38082809973](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38082809973)も成功しました。公開宣言とexportを照合し、入口の最大128バイトをページ内で採取した結果です。最初の戻り命令までの28バイトを復号し、Boolの入力と間接戻り先の受渡しを確認しました。この検査では、その初期化子やBindingを呼んでいません。可変Bindingの実装・実行は次の条件として残ります。
 
 ## アカウントと配布
 
