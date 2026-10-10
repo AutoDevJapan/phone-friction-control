@@ -1,4 +1,4 @@
-//! 検証用のバナー広告。`ads-test` 機能のときだけ組み込む。
+//! 任意のバナー広告。試験版と製品版で同じ同意・休憩制御を使う。
 //!
 //! 同意SDKと広告SDKは、利用者がボタンを押すまで呼ばない。取り消し・ホーム離脱・休憩の後に
 //! 届いたコールバックは、呼び出し元オブジェクトと世代番号で捨てる。SDKはロックの外で呼ぶ。
@@ -9,13 +9,68 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use android_activity::AndroidApp;
 use jni::JNIEnv;
-use jni::objects::{GlobalRef, JClass, JObject, JValue};
+use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
 
 use crate::ads_state::{BREAK, CLOSED, Event, FAILED, LEFT, Manager, Op, Stage, Step, TOO_SMALL};
 
-// Google公式のサンプルID。テスト広告だけが返る。
-const APP_ID: &str = "ca-app-pub-3940256099942544~3347511713";
-const BANNER_UNIT: &str = "ca-app-pub-3940256099942544/9214589741";
+struct AdIds {
+    app: String,
+    banner: String,
+}
+
+// GET_META_DATA is required: Context.getApplicationInfo() alone need not include the bundle.
+// Read the APK's sole configuration before calling either SDK; never use build-time env IDs.
+fn ad_ids(env: &mut JNIEnv, activity: &JObject) -> jni::errors::Result<AdIds> {
+    let package = env
+        .call_method(activity, "getPackageName", "()Ljava/lang/String;", &[])?
+        .l()?;
+    let pm = env
+        .call_method(
+            activity,
+            "getPackageManager",
+            "()Landroid/content/pm/PackageManager;",
+            &[],
+        )?
+        .l()?;
+    let info = env
+        .call_method(
+            &pm,
+            "getApplicationInfo",
+            "(Ljava/lang/String;I)Landroid/content/pm/ApplicationInfo;",
+            &[JValue::Object(&package), JValue::Int(128)],
+        )?
+        .l()?;
+    let metadata = env
+        .get_field(&info, "metaData", "Landroid/os/Bundle;")?
+        .l()?;
+    if metadata.is_null() {
+        return Err(jni::errors::Error::NullPtr("ad metadata missing"));
+    }
+    let mut read = |key: &str| -> jni::errors::Result<String> {
+        let key = JObject::from(env.new_string(key)?);
+        let value = env
+            .call_method(
+                &metadata,
+                "getString",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+                &[JValue::Object(&key)],
+            )?
+            .l()?;
+        if value.is_null() {
+            return Err(jni::errors::Error::NullPtr("ad ID missing"));
+        }
+        let value = JString::from(value);
+        let text = env.get_string(&value)?.into();
+        Ok(text)
+    };
+    let ids = AdIds {
+        app: read(crate::ad_config::APP_KEY)?,
+        banner: read(crate::ad_config::BANNER_KEY)?,
+    };
+    crate::ad_config::validate(&ids.app, &ids.banner, cfg!(feature = "ads-production"))
+        .map_err(jni::errors::Error::NullPtr)?;
+    Ok(ids)
+}
 const GONE: i32 = 8;
 const TOP_LEFT: i32 = 0x33;
 
@@ -78,9 +133,27 @@ impl AdsUi {
         match m.stage {
             Stage::Idle => m.notice,
             Stage::Update | Stage::Form | Stage::Check => "広告の同意状況を確認しています。",
-            Stage::Init | Stage::Ready => "テスト広告を準備しています。",
-            Stage::Loading => "テスト広告を読み込んでいます。",
-            Stage::Shown => "テスト広告を表示しています。閉じるといつでも消せます。",
+            Stage::Init | Stage::Ready => {
+                if cfg!(feature = "ads-production") {
+                    "広告を準備しています。"
+                } else {
+                    "テスト広告を準備しています。"
+                }
+            }
+            Stage::Loading => {
+                if cfg!(feature = "ads-production") {
+                    "広告を読み込んでいます。"
+                } else {
+                    "テスト広告を読み込んでいます。"
+                }
+            }
+            Stage::Shown => {
+                if cfg!(feature = "ads-production") {
+                    "広告を表示しています。閉じるといつでも消せます。"
+                } else {
+                    "テスト広告を表示しています。閉じるといつでも消せます。"
+                }
+            }
             Stage::PrivacyUpdate | Stage::PrivacyForm => "プライバシー設定を開いています。",
         }
         .to_owned()
@@ -305,6 +378,7 @@ fn register(epoch: u64, refs: &[&GlobalRef]) -> bool {
 }
 
 fn update(env: &mut JNIEnv, activity: &JObject, epoch: u64) -> jni::errors::Result<()> {
+    let ids = ad_ids(env, activity)?;
     let ump = class(
         env,
         activity,
@@ -325,7 +399,7 @@ fn update(env: &mut JNIEnv, activity: &JObject, epoch: u64) -> jni::errors::Resu
         "com.google.android.ump.ConsentRequestParameters$Builder",
     )?;
     let builder = env.new_object(&builder_class, "()V", &[])?;
-    let app_id = JObject::from(env.new_string(APP_ID)?);
+    let app_id = JObject::from(env.new_string(&ids.app)?);
     env.call_method(
         &builder,
         "setAdMobAppId",
@@ -401,6 +475,7 @@ fn check(env: &mut JNIEnv, epoch: u64) -> jni::errors::Result<()> {
 }
 
 fn initialize(env: &mut JNIEnv, activity: &JObject) -> jni::errors::Result<()> {
+    let ids = ad_ids(env, activity)?;
     let context = env
         .call_method(
             activity,
@@ -446,7 +521,7 @@ fn initialize(env: &mut JNIEnv, activity: &JObject) -> jni::errors::Result<()> {
         activity,
         "com.google.android.libraries.ads.mobile.sdk.initialization.InitializationConfig$Builder",
     )?;
-    let app_id = JObject::from(env.new_string(APP_ID)?);
+    let app_id = JObject::from(env.new_string(&ids.app)?);
     let init_builder = env.new_object(
         &init_builder_class,
         "(Ljava/lang/String;)V",
@@ -520,6 +595,7 @@ fn load(
     epoch: u64,
     bounds: [i32; 4],
 ) -> jni::errors::Result<()> {
+    let ids = ad_ids(env, activity)?;
     let [x, y, width, height] = bounds;
     let resources = env
         .call_method(
@@ -576,7 +652,7 @@ fn load(
         activity,
         "com.google.android.libraries.ads.mobile.sdk.banner.BannerAdRequest$Builder",
     )?;
-    let unit = JObject::from(env.new_string(BANNER_UNIT)?);
+    let unit = JObject::from(env.new_string(&ids.banner)?);
     let builder = env.new_object(
         &builder_class,
         "(Ljava/lang/String;Lcom/google/android/libraries/ads/mobile/sdk/banner/AdSize;)V",

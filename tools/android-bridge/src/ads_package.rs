@@ -1,4 +1,4 @@
-//! 試験用広告入りの debug APK を Gradle で組み立てる (`pack-ads`)。
+//! 広告入りの試験APKと署名付き製品APKをGradleで組み立てる。
 //!
 //! 生成するのは使い捨ての Gradle 設定だけで、処理はすべて Rust 側にある。依存 AAR の
 //! 取り込み・リソース・マニフェストの統合は Gradle (AGP) に任せる。通常の `pack` は変えない。
@@ -17,10 +17,8 @@ const USAGE: &str = "pack-ads <project-root> <native-library.so> <abi> <new-outp
 const PROJECT_NAME: &str = "phone-control-ads";
 const NDK: &str = "ndk/30.0.14904198/toolchains/llvm/prebuilt";
 const BUILD_TOOLS: &str = "build-tools/36.1.0";
-/// `ads-test` 機能で組んだライブラリだけが持つ JNI 関数。
-const ADS_SYMBOL: &str = "Java_com_autodevjapan_phonefrictioncontrol_AdLoadListener_onAdLoaded";
-/// Google 公式のサンプル用アプリ ID (試験広告専用、秘密情報ではない)。
-const SAMPLE_APP_ID: &str = "ca-app-pub-3940256099942544~3347511713";
+const RELEASE_USAGE: &str = "pack-ads-release <root> <library.so> <abi> <new-output> <gradle> <keystore> <alias> <version-code> <version-name> <certificate-sha256> <app-id> <banner-unit>; PHONE_CONTROL_KS_PASS / PHONE_CONTROL_KEY_PASS required";
+use super::ad_config::{APP_KEY, BANNER_KEY, SAMPLE_APP, SAMPLE_BANNER};
 
 const SETTINGS: &str = "pluginManagement {
     repositories { google(); mavenCentral(); gradlePluginPortal() }
@@ -90,7 +88,11 @@ fn replace_once(text: &mut String, needle: &str, with: &str) -> io::Result<()> {
 }
 
 /// 元のマニフェスト文字列から広告試験用の版を作る。XML の統合は行わず、決まった位置に足すだけ。
-fn ads_manifest(source: &str) -> io::Result<String> {
+fn ads_manifest(source: &str, app: &str, banner: &str, production: bool) -> io::Result<String> {
+    super::ad_config::validate(app, banner, production).map_err(other)?;
+    if source.contains(APP_KEY) || source.contains(BANNER_KEY) {
+        return Err(other("ad metadata already exists in source manifest"));
+    }
     let mut m = source.to_owned();
     replace_once(
         &mut m,
@@ -133,7 +135,8 @@ fn ads_manifest(source: &str) -> io::Result<String> {
         + 1;
     m.insert_str(
         end,
-        &format!("\n        <meta-data android:name=\"com.google.android.gms.ads.APPLICATION_ID\" android:value=\"{SAMPLE_APP_ID}\" />"),
+        // IDs have a strict ASCII grammar, so XML metacharacters cannot be inserted.
+        &format!("\n        <meta-data android:name=\"{APP_KEY}\" android:value=\"{app}\" />\n        <meta-data android:name=\"{BANNER_KEY}\" android:value=\"{banner}\" />"),
     );
     Ok(m)
 }
@@ -146,7 +149,7 @@ fn properties_value(path: &Path) -> io::Result<String> {
     let mut out = String::new();
     for c in text.chars() {
         match c {
-            '\\' | ':' | '=' | '#' | '!' => {
+            '\\' | ':' | '=' | '#' | '!' | ' ' => {
                 out.push('\\');
                 out.push(c);
             }
@@ -186,7 +189,13 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn build_gradle(abi: &str) -> String {
+fn groovy_literal(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+fn build_gradle(abi: &str, signing: Option<&super::package::Release>) -> String {
+    let code = signing.map_or("3", |s| &s.version_code);
+    let name = groovy_literal(signing.map_or("0.3.0-test-ads", |s| &s.version_name));
     format!(
         "plugins {{ id 'com.android.application' version '8.13.2' }}
 
@@ -198,11 +207,14 @@ android {{
         applicationId 'com.autodevjapan.phonefrictioncontrol'
         minSdk 26
         targetSdk 36
-        versionCode 3
-        versionName '0.3.0-test-ads'
+        versionCode {code}
+        versionName '{name}'
         ndk {{ abiFilters '{abi}' }}
     }}
-    buildTypes {{ debug {{ minifyEnabled false }} }}
+    buildTypes {{
+        debug {{ minifyEnabled false }}
+        release {{ minifyEnabled false; debuggable false }}
+    }}
     packaging {{ jniLibs {{ useLegacyPackaging false }} }}
 }}
 
@@ -215,9 +227,29 @@ dependencies {{
     )
 }
 
-pub(super) fn assemble(args: &[OsString]) -> io::Result<()> {
-    let [root, native, abi, output, gradle] = args else {
-        return Err(other(USAGE));
+pub(super) fn assemble(args: &[OsString], production: bool) -> io::Result<()> {
+    if args.len() != if production { 12 } else { 5 } {
+        return Err(other(if production { RELEASE_USAGE } else { USAGE }));
+    }
+    let [root, native, abi, output, gradle] = &args[..5] else {
+        unreachable!()
+    };
+    let (app, banner) = if production {
+        let app = args[10].to_str().ok_or_else(|| other("invalid app ID"))?;
+        let banner = args[11]
+            .to_str()
+            .ok_or_else(|| other("invalid banner ID"))?;
+        super::ad_config::validate(app, banner, true).map_err(other)?;
+        (app, banner)
+    } else {
+        (SAMPLE_APP, SAMPLE_BANNER)
+    };
+    let signing = if production {
+        let signing = super::package::Release::parse(&args[5..10])?;
+        super::package::require_signing_passwords()?;
+        Some(signing)
+    } else {
+        None
     };
     let root = Path::new(root).canonicalize()?;
     let native = Path::new(native).canonicalize()?;
@@ -228,12 +260,25 @@ pub(super) fn assemble(args: &[OsString]) -> io::Result<()> {
         .to_str()
         .filter(|abi| ["arm64-v8a", "x86_64"].contains(abi))
         .ok_or_else(|| other("unsupported ABI"))?;
+    let library_bytes = fs::read(&native)?;
+    super::native_features::validate(
+        &library_bytes,
+        abi,
+        if production {
+            super::native_features::Flavor::Production
+        } else {
+            super::native_features::Flavor::Test
+        },
+    )?;
     let sdk = env_path("ANDROID_HOME")?;
     let java_home = env_path("JAVA_HOME")?;
     let jdk = java_home.join("bin");
-    let manifest = ads_manifest(&fs::read_to_string(
-        root.join("android/AndroidManifest.xml"),
-    )?)?;
+    let manifest = ads_manifest(
+        &fs::read_to_string(root.join("android/AndroidManifest.xml"))?,
+        app,
+        banner,
+        production,
+    )?;
 
     // 以前の成果物や他人の作業を上書きしない。canonicalize の \\?\ 形式は Gradle に渡さない。
     fs::create_dir(output)?;
@@ -245,7 +290,7 @@ pub(super) fn assemble(args: &[OsString]) -> io::Result<()> {
     let lib_dir = main.join("jniLibs").join(abi);
     fs::create_dir_all(&lib_dir)?;
     let library = lib_dir.join("libphone_friction_control.so");
-    fs::copy(&native, &library)?;
+    fs::write(&library, library_bytes)?;
 
     let ndk_bin = sdk
         .join(NDK)
@@ -255,18 +300,6 @@ pub(super) fn assemble(args: &[OsString]) -> io::Result<()> {
             "linux-x86_64"
         })
         .join("bin");
-    let mut nm = command(&exe(&ndk_bin, "llvm-nm"));
-    nm.args(["-D", "--defined-only"]).arg(&library);
-    let listing = nm.output()?;
-    let exported = String::from_utf8_lossy(&listing.stdout)
-        .lines()
-        .any(|line| line.split_whitespace().last() == Some(ADS_SYMBOL));
-    if !listing.status.success() || !exported {
-        return Err(other(format!(
-            "{ADS_SYMBOL} not exported; build the library with the ads-test feature"
-        )));
-    }
-
     // Strip the copy only; preserve the Cargo artifact for debugging/reuse.
     let mut strip = command(&exe(&ndk_bin, "llvm-strip"));
     strip.arg("--strip-unneeded").arg(&library);
@@ -285,7 +318,10 @@ pub(super) fn assemble(args: &[OsString]) -> io::Result<()> {
 
     fs::write(project.join("settings.gradle"), SETTINGS)?;
     fs::write(project.join("gradle.properties"), PROPERTIES)?;
-    fs::write(project.join("build.gradle"), build_gradle(abi))?;
+    fs::write(
+        project.join("build.gradle"),
+        build_gradle(abi, signing.as_ref()),
+    )?;
     fs::write(
         project.join("local.properties"),
         format!("sdk.dir={}\n", properties_value(&sdk)?),
@@ -302,23 +338,38 @@ pub(super) fn assemble(args: &[OsString]) -> io::Result<()> {
     if let Some(cache) = env::var_os("PHONE_CONTROL_GRADLE_CACHE") {
         build.arg("-g").arg(cache);
     }
-    build.arg("-p").arg(&project).arg("assembleDebug");
+    build.arg("-p").arg(&project).arg(if production {
+        "assembleRelease"
+    } else {
+        "assembleDebug"
+    });
     run(build)?;
 
-    let built = project.join(format!("build/outputs/apk/debug/{PROJECT_NAME}-debug.apk"));
-    let apk = output.join(format!("phone-control-{abi}-test-ads.apk"));
-    fs::copy(&built, &apk)?;
     let tools = sdk.join(BUILD_TOOLS);
+    if let Some(signing) = &signing {
+        let built = project.join(format!(
+            "build/outputs/apk/release/{PROJECT_NAME}-release-unsigned.apk"
+        ));
+        let apk = output.join(format!("phone-control-{abi}-ads-release.apk"));
+        super::package::publish_release(&built, &output, &tools, &jdk, signing, &apk)?;
+        println!("{}", apk.display());
+        return Ok(());
+    }
+    let built = project.join(format!("build/outputs/apk/debug/{PROJECT_NAME}-debug.apk"));
+    let candidate = output.join("test-ads-candidate.apk");
+    fs::copy(&built, &candidate)?;
     let mut align = command(&exe(&tools, "zipalign"));
-    align.args(["-c", "-P", "16", "-v", "4"]).arg(&apk);
+    align.args(["-c", "-P", "16", "-v", "4"]).arg(&candidate);
     run(align)?;
     let mut verify = command(&exe(&jdk, "java"));
     verify
         .arg("-jar")
         .arg(tools.join("lib/apksigner.jar"))
         .args(["verify", "--verbose"])
-        .arg(&apk);
+        .arg(&candidate);
     run(verify)?;
+    let apk = output.join(format!("phone-control-{abi}-test-ads.apk"));
+    fs::rename(candidate, &apk)?;
     println!("{}", apk.display());
     Ok(())
 }
@@ -333,13 +384,14 @@ mod tests {
     fn ads_permissions_and_app_id_only_in_the_ads_manifest() {
         assert!(!DEFAULT_MANIFEST.contains("INTERNET"));
         assert!(!DEFAULT_MANIFEST.contains("APPLICATION_ID"));
-        let m = ads_manifest(DEFAULT_MANIFEST).unwrap();
+        let m = ads_manifest(DEFAULT_MANIFEST, SAMPLE_APP, SAMPLE_BANNER, false).unwrap();
         for want in [
             "android.permission.INTERNET",
             "android.permission.ACCESS_NETWORK_STATE",
             "permission.AD_ID\" tools:node=\"remove\"",
             "READ_BASIC_PHONE_STATE\" tools:node=\"remove\"",
-            SAMPLE_APP_ID,
+            SAMPLE_APP,
+            SAMPLE_BANNER,
         ] {
             assert!(m.contains(want), "{want}");
         }
@@ -347,15 +399,15 @@ mod tests {
         // 権限は application の前、アプリ ID は application の中に置く。
         let app = m.find("<application").unwrap();
         assert!(m.find("permission.INTERNET").unwrap() < app);
-        assert!(m.find(SAMPLE_APP_ID).unwrap() > app);
-        assert!(m.find(SAMPLE_APP_ID).unwrap() < m.find("</application>").unwrap());
+        assert!(m.find(SAMPLE_APP).unwrap() > app);
+        assert!(m.find(SAMPLE_APP).unwrap() < m.find("</application>").unwrap());
     }
 
     #[test]
     fn unexpected_manifest_is_rejected() {
-        assert!(ads_manifest("<manifest></manifest>").is_err());
+        assert!(ads_manifest("<manifest></manifest>", SAMPLE_APP, SAMPLE_BANNER, false).is_err());
         let twice = DEFAULT_MANIFEST.replace("</manifest>", "<application /></manifest>");
-        assert!(ads_manifest(&twice).is_err());
+        assert!(ads_manifest(&twice, SAMPLE_APP, SAMPLE_BANNER, false).is_err());
     }
 
     #[test]
@@ -365,6 +417,84 @@ mod tests {
             r"C\:\\Android\\Sdk\=1\#\u00e4"
         );
         assert!(properties_value(Path::new("a\nb")).is_err());
+        assert_eq!(
+            properties_value(Path::new(" C:\\a b")).unwrap(),
+            r"\ C\:\\a\ b"
+        );
+    }
+
+    #[test]
+    fn production_manifest_has_one_authoritative_pair_and_no_sample_ids() {
+        let app = "ca-app-pub-1234567890123456~1234567890";
+        let banner = "ca-app-pub-1234567890123456/9876543210";
+        let manifest = ads_manifest(DEFAULT_MANIFEST, app, banner, true).unwrap();
+        for (key, value) in [(APP_KEY, app), (BANNER_KEY, banner)] {
+            assert_eq!(manifest.matches(key).count(), 1);
+            assert!(manifest.contains(&format!("android:name=\"{key}\" android:value=\"{value}\"")));
+            let at = manifest.find(value).unwrap();
+            assert!(
+                at > manifest.find("<application").unwrap()
+                    && at < manifest.find("</application>").unwrap()
+            );
+        }
+        assert!(!manifest.contains("3940256099942544"));
+        assert!(ads_manifest(&manifest, app, banner, true).is_err());
+        assert!(ads_manifest(DEFAULT_MANIFEST, "\" /><activity", banner, true).is_err());
+    }
+
+    #[test]
+    fn groovy_literals_cannot_break_out_of_single_quotes() {
+        assert_eq!(groovy_literal("release'\\${value}"), r"release\'\\${value}");
+        assert_eq!(groovy_literal("1.0-$version"), "1.0-$version");
+        let script = build_gradle("x86_64", None);
+        assert!(script.contains("release { minifyEnabled false; debuggable false }"));
+        assert!(!script.contains("signingConfig"));
+    }
+
+    #[test]
+    fn rejected_ids_and_native_input_do_not_create_an_output_directory() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        // No files or folders are created by this test: every input fails before create_dir.
+        let output = env::temp_dir().join(format!(
+            "ads-rejected-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let common = [
+            root.as_os_str().to_owned(),
+            root.join("src/ads.rs").into_os_string(),
+            "x86_64".into(),
+            output.as_os_str().to_owned(),
+            "unused-gradle".into(),
+        ];
+        assert!(assemble(&common, false).is_err());
+        assert!(!output.exists());
+        let mut args = common.to_vec();
+        args.extend(
+            [
+                "unused-keystore",
+                "alias",
+                "4",
+                "0.4.0",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                SAMPLE_APP,
+                SAMPLE_BANNER,
+            ]
+            .map(OsString::from),
+        );
+        assert!(assemble(&args, true)
+            .unwrap_err()
+            .to_string()
+            .contains("sample publisher"));
+        args[10] = "ca-app-pub-1234567890123456~1234567890".into();
+        assert!(assemble(&args, true)
+            .unwrap_err()
+            .to_string()
+            .contains("same publisher"));
+        assert!(!output.exists());
     }
 
     #[cfg(unix)]

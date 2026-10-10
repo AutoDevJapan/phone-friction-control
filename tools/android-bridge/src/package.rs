@@ -5,11 +5,11 @@ use std::{
     process::{Command, Stdio},
 };
 
-struct Release {
+pub(super) struct Release {
     keystore: PathBuf,
     alias: std::ffi::OsString,
-    version_code: String,
-    version_name: String,
+    pub(super) version_code: String,
+    pub(super) version_name: String,
     certificate_sha256: String,
 }
 
@@ -23,25 +23,30 @@ fn digest(value: &str) -> io::Result<String> {
 }
 
 impl Release {
-    fn parse(args: &[std::ffi::OsString]) -> io::Result<Self> {
-        let code = args[6]
+    pub(super) fn parse(args: &[std::ffi::OsString]) -> io::Result<Self> {
+        let [keystore, alias, code, name, certificate] = args else {
+            return Err(io::Error::other(
+                "expected keystore, alias, version code, version name and certificate SHA-256",
+            ));
+        };
+        let code = code
             .to_str()
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|v| *v > 0 && *v <= 2_100_000_000)
             .ok_or_else(|| io::Error::other("invalid Android version code"))?;
-        let name = args[7]
+        let name = name
             .to_str()
             .filter(|v| !v.is_empty() && !v.chars().any(char::is_control))
             .ok_or_else(|| io::Error::other("invalid version name"))?;
-        if args[5].is_empty() {
+        if alias.is_empty() {
             return Err(io::Error::other("key alias is empty"));
         }
         Ok(Self {
-            keystore: Path::new(&args[4]).canonicalize()?,
-            alias: args[5].clone(),
+            keystore: Path::new(keystore).canonicalize()?,
+            alias: alias.clone(),
             version_code: code.to_string(),
             version_name: name.to_owned(),
-            certificate_sha256: digest(args[8].to_str().unwrap_or(""))?,
+            certificate_sha256: digest(certificate.to_str().unwrap_or(""))?,
         })
     }
 }
@@ -100,12 +105,8 @@ pub(crate) fn assemble(args: &[std::ffi::OsString], release: bool) -> io::Result
         return Err(io::Error::other("pack <root> <library.so> <abi> <new-output>; pack-release additionally requires <keystore> <alias> <version-code> <version-name> <certificate-sha256> and PHONE_CONTROL_KS_PASS / PHONE_CONTROL_KEY_PASS"));
     }
     let signing = if release {
-        let signing = Release::parse(args)?;
-        for name in ["PHONE_CONTROL_KS_PASS", "PHONE_CONTROL_KEY_PASS"] {
-            if env::var_os(name).is_none_or(|v| v.is_empty()) {
-                return Err(io::Error::other(format!("{name} missing")));
-            }
-        }
+        let signing = Release::parse(&args[4..])?;
+        require_signing_passwords()?;
         Some(signing)
     } else {
         None
@@ -119,16 +120,8 @@ pub(crate) fn assemble(args: &[std::ffi::OsString], release: bool) -> io::Result
         return Err(io::Error::other("unsupported ABI"));
     }
     // 広告入りのライブラリは広告用マニフェストでしか動かないため、通常のpackでは受け付けない。
-    let ads_symbol = b"Java_com_autodevjapan_phonefrictioncontrol_AdLoadListener_onAdLoaded";
     let library_bytes = fs::read(&library)?;
-    if library_bytes
-        .windows(ads_symbol.len())
-        .any(|window| window == ads_symbol)
-    {
-        return Err(io::Error::other(
-            "library was built with ads-test; use pack-ads for it",
-        ));
-    }
+    super::native_features::validate(&library_bytes, abi, super::native_features::Flavor::Plain)?;
     let output = Path::new(&args[3]);
     // Never overwrite a previous artifact or someone else's working files.
     fs::create_dir(output)?;
@@ -202,25 +195,6 @@ pub(crate) fn assemble(args: &[std::ffi::OsString], release: bool) -> io::Result
         link_args.push("--debug-mode".as_ref());
     }
     run(&aapt, &link_args)?;
-    if release {
-        let mut check = Command::new(&aapt);
-        check.args(["dump", "badging"]).arg(&unsigned);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            check.creation_flags(0x08000000);
-        }
-        let result = check.output()?;
-        if !result.status.success()
-            || String::from_utf8_lossy(&result.stdout)
-                .lines()
-                .any(|line| line.trim() == "application-debuggable")
-        {
-            return Err(io::Error::other(
-                "release APK must have a readable, non-debuggable manifest",
-            ));
-        }
-    }
     let staging = output.join("staging");
     let native_relative = PathBuf::from(format!("lib/{abi}/libphone_friction_control.so"));
     let native = staging.join(&native_relative);
@@ -254,6 +228,12 @@ pub(crate) fn assemble(args: &[std::ffi::OsString], release: bool) -> io::Result
             "classes.dex".as_ref(),
         ],
     )?;
+    if let Some(signing) = &signing {
+        let apk = output.join(format!("phone-control-{abi}-release.apk"));
+        publish_release(&unsigned, &output, &tools, &jdk, signing, &apk)?;
+        println!("{}", apk.display());
+        return Ok(());
+    }
     let aligned = output.join("aligned.apk");
     let zipalign = tool(&tools, "zipalign");
     run(
@@ -278,80 +258,26 @@ pub(crate) fn assemble(args: &[std::ffi::OsString], release: bool) -> io::Result
     )
     .join(".android/debug.keystore");
     let signer = tools.join("lib/apksigner.jar");
-    if let Some(signing) = &signing {
-        let mut command = Command::new(&java);
-        command
-            .args(["-jar"])
-            .arg(&signer)
-            .arg("sign")
-            .arg("--ks")
-            .arg(&signing.keystore)
-            .arg("--ks-key-alias")
-            .arg(&signing.alias)
-            .args([
-                "--ks-pass",
-                "env:PHONE_CONTROL_KS_PASS",
-                "--key-pass",
-                "env:PHONE_CONTROL_KEY_PASS",
-                "--out",
-            ])
-            .arg(&candidate)
-            .arg(&aligned);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000);
-        }
-        // Signer diagnostics can expose secret material; return only its exit status.
-        let status = command
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if !status.success() {
-            return Err(io::Error::other(format!(
-                "release signing failed: {status}"
-            )));
-        }
-        let mut verify = Command::new(&java);
-        verify
-            .args(["-Duser.language=en", "-Duser.country=US", "-jar"])
-            .arg(&signer)
-            .args(["verify", "--verbose", "--print-certs"])
-            .arg(&candidate);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            verify.creation_flags(0x08000000);
-        }
-        let verified = verify.output()?;
-        if !verified.status.success() {
-            return Err(io::Error::other("release signature verification failed"));
-        }
-        verify_release_certificate(
-            &String::from_utf8_lossy(&verified.stdout),
-            &signing.certificate_sha256,
-        )?;
-    } else {
-        run(
-            &java,
-            &[
-                "-jar".as_ref(),
-                signer.as_os_str(),
-                "sign".as_ref(),
-                "--ks".as_ref(),
-                keystore.as_os_str(),
-                "--ks-key-alias".as_ref(),
-                "androiddebugkey".as_ref(),
-                "--ks-pass".as_ref(),
-                "pass:android".as_ref(),
-                "--key-pass".as_ref(),
-                "pass:android".as_ref(),
-                "--out".as_ref(),
-                candidate.as_os_str(),
-                aligned.as_os_str(),
-            ],
-        )?;
-    }
+
+    run(
+        &java,
+        &[
+            "-jar".as_ref(),
+            signer.as_os_str(),
+            "sign".as_ref(),
+            "--ks".as_ref(),
+            keystore.as_os_str(),
+            "--ks-key-alias".as_ref(),
+            "androiddebugkey".as_ref(),
+            "--ks-pass".as_ref(),
+            "pass:android".as_ref(),
+            "--key-pass".as_ref(),
+            "pass:android".as_ref(),
+            "--out".as_ref(),
+            candidate.as_os_str(),
+            aligned.as_os_str(),
+        ],
+    )?;
     run(
         &java,
         &[
@@ -377,6 +303,126 @@ pub(crate) fn assemble(args: &[std::ffi::OsString], release: bool) -> io::Result
     Ok(())
 }
 
+pub(super) fn require_signing_passwords() -> io::Result<()> {
+    for name in ["PHONE_CONTROL_KS_PASS", "PHONE_CONTROL_KEY_PASS"] {
+        if env::var_os(name).is_none_or(|v| v.is_empty()) {
+            return Err(io::Error::other(format!("{name} missing")));
+        }
+    }
+    Ok(())
+}
+
+/// Complete unsigned release APKs through the same quiet signer and pinned-certificate checks.
+/// Only publish the final filename after the manifest, signature and 16KB alignment pass.
+pub(super) fn publish_release(
+    unsigned: &Path,
+    output: &Path,
+    tools: &Path,
+    jdk: &Path,
+    signing: &Release,
+    apk: &Path,
+) -> io::Result<()> {
+    let aapt = tool(tools, "aapt2");
+    let java = tool(jdk, "java");
+    let signer = tools.join("lib/apksigner.jar");
+    let candidate = output.join("signed-candidate.apk");
+
+    let mut check = Command::new(&aapt);
+    check.args(["dump", "badging"]).arg(unsigned);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        check.creation_flags(0x08000000);
+    }
+    let result = check.output()?;
+    if !result.status.success()
+        || String::from_utf8_lossy(&result.stdout)
+            .lines()
+            .any(|line| line.trim() == "application-debuggable")
+    {
+        return Err(io::Error::other(
+            "release APK must have a readable, non-debuggable manifest",
+        ));
+    }
+    let aligned = output.join("aligned.apk");
+    let zipalign = tool(tools, "zipalign");
+    run(
+        &zipalign,
+        &[
+            "-P".as_ref(),
+            "16".as_ref(),
+            "-f".as_ref(),
+            "4".as_ref(),
+            unsigned.as_os_str(),
+            aligned.as_os_str(),
+        ],
+    )?;
+
+    let mut command = Command::new(&java);
+    command
+        .args(["-jar"])
+        .arg(&signer)
+        .arg("sign")
+        .arg("--ks")
+        .arg(&signing.keystore)
+        .arg("--ks-key-alias")
+        .arg(&signing.alias)
+        .args([
+            "--ks-pass",
+            "env:PHONE_CONTROL_KS_PASS",
+            "--key-pass",
+            "env:PHONE_CONTROL_KEY_PASS",
+            "--out",
+        ])
+        .arg(&candidate)
+        .arg(&aligned);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    // Signer diagnostics can expose secret material; return only its exit status.
+    let status = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "release signing failed: {status}"
+        )));
+    }
+    let mut verify = Command::new(&java);
+    verify
+        .args(["-Duser.language=en", "-Duser.country=US", "-jar"])
+        .arg(&signer)
+        .args(["verify", "--verbose", "--print-certs"])
+        .arg(&candidate);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        verify.creation_flags(0x08000000);
+    }
+    let verified = verify.output()?;
+    if !verified.status.success() {
+        return Err(io::Error::other("release signature verification failed"));
+    }
+    verify_release_certificate(
+        &String::from_utf8_lossy(&verified.stdout),
+        &signing.certificate_sha256,
+    )?;
+    run(
+        &zipalign,
+        &[
+            "-c".as_ref(),
+            "-P".as_ref(),
+            "16".as_ref(),
+            "4".as_ref(),
+            candidate.as_os_str(),
+        ],
+    )?;
+    fs::rename(candidate, apk)?;
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
