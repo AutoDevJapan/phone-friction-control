@@ -1,0 +1,50 @@
+name: Manual iOS SDK audit
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  sdk-audit:
+    runs-on: macos-14
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-18
+          targets: aarch64-apple-ios, aarch64-apple-ios-sim
+      - name: Inspect installed SDK and compiler output
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/ios-sdk-audit"
+          mkdir "$OUT"
+          xcodebuild -version > "$OUT/versions.txt"
+          xcrun swiftc --version >> "$OUT/versions.txt"
+          rustc --version --verbose >> "$OUT/versions.txt"
+          SDK=$(xcrun --sdk iphonesimulator --show-sdk-path)
+          VERSION=$(xcrun --sdk iphonesimulator --show-sdk-version)
+          printf 'Simulator SDK: %s\n' "$VERSION" >> "$OUT/versions.txt"
+          TARGET="arm64-apple-ios${VERSION%%.*}.0-simulator"
+          for MODULE in FamilyControls DeviceActivity ManagedSettings; do
+            FRAMEWORK="$SDK/System/Library/Frameworks/$MODULE.framework"
+            test -d "$FRAMEWORK"
+            # Dump to scratch space only; do not publish the complete SDK declarations.
+            xcrun swift-api-digester -dump-sdk -module "$MODULE" -sdk "$SDK" -target "$TARGET" -o "$RUNNER_TEMP/$MODULE.json"
+            jq '[.. | objects | select(.name? | IN("AuthorizationCenter", "shared", "requestAuthorization", "FamilyActivityPicker", "FamilyActivitySelection", "DeviceActivityCenter", "startMonitoring", "DeviceActivityEvent", "DeviceActivityMonitor", "ManagedSettingsStore", "ShieldSettings", "applications")) | {kind, name, printedName, usr, mangledName}]' "$RUNNER_TEMP/$MODULE.json" > "$OUT/$MODULE-symbols.json"
+            test "$(jq length "$OUT/$MODULE-symbols.json")" -gt 0
+          done
+          for TARGET in aarch64-apple-ios aarch64-apple-ios-sim; do
+            mkdir "$OUT/$TARGET"
+            rustc tools/ios-abi-probe.rs --crate-name ios_abi_probe --crate-type lib --target "$TARGET" --emit llvm-ir,asm,obj --out-dir "$OUT/$TARGET"
+            grep -q 'call swiftcc void @abi_probe_external' "$OUT/$TARGET/ios_abi_probe.ll"
+            xcrun nm "$OUT/$TARGET/ios_abi_probe.o" > "$OUT/$TARGET/symbols.txt"
+            grep 'U _abi_probe_external' "$OUT/$TARGET/symbols.txt"
+          done
+          printf 'compiler_codegen=true\nsdk_declarations_collected=true\nframework_linked=false\nos_executed=false\nauthorization=false\nmonitoring=false\nshielding=false\n' > "$OUT/scope.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-sdk-audit
+          path: ${{ runner.temp }}/ios-sdk-audit
+          retention-days: 1
+          if-no-files-found: error

@@ -14,6 +14,16 @@ Appleの[DeviceActivityEvent](https://developer.apple.com/documentation/deviceac
 
 次の技術検証には、対象iOS SDKの実際の公開宣言とABI、利用できるmacOSビルド環境、署名済みアプリと拡張の起動確認が必要です。推測した呼出規約やモックの成功をOS接続の証拠にしません。
 
+## Rustコンパイラーで確認した境界（2026-10-10追加）
+
+Rustの[Swift呼出規約の実験](https://github.com/rust-lang/rust/issues/156481)を、インストール済みのnightlyで追加検証しました。`tools/ios-abi-probe.rs` はApple APIを呼ばない、未定義の外部関数を使う小さなコンパイラー実験です。製品ライブラリの一部ではありません。
+
+`rustc 1.99.0-nightly (eff8269f7 2026-07-18)` で、`aarch64-apple-ios` と `aarch64-apple-ios-sim` のLLVM IR生成は両方終了コード0でした。実際のIRには `call swiftcc void @abi_probe_external()` と `declare swiftcc void @abi_probe_external()` がありました。同じコードをWindowsのターゲットでコンパイルすると、E0570（対象ターゲットでSwift ABIをサポートしない）でした。この違いは、RustからSwift呼出規約を出力する経路が存在する証拠です。
+
+これはSDKの型レイアウト、SwiftUIのgeneric metadataやprotocol witness table、非同期コンテキスト、Appleフレームワークのリンク、実行を確認した結果ではありません。特に、空の外部関数の呼出規約を、許可要求・アプリ選択・監視・遮蔽の接続成功へ読み替えません。Swiftコードの生成や追加も行っていません。
+
+実SDKの確認用に、手動起動だけの `Manual iOS SDK audit` を準備しました。XcodeのSDKから対象APIの識別子を収集し、同じRust実験のIR・assembly・未解決シンボルと、実施範囲を保存します。SDK全体の宣言は成果物へ含めません。OS実行や署名は行わない検査です。このmacOSジョブはまだ実行していません。リポジトリは非公開で、[GitHubの標準macOS runner](https://docs.github.com/en/actions/concepts/billing-and-usage)を無料と決めつけず、追加費用または検査コードだけの公開を許可する判断を待ちます。
+
 ## アカウントと配布
 
 Apple Developerのログインは完了しておらず、会員・既存署名・配布許可の状態は未確認です。保存済み自動入力は表示されず、指定表のApple検索結果は0件でした。iPhoneによるサインインは検証中の表示から先へ進まず、本人の承認画面へ到達したとは記録していません。新規有料契約は行っていません。
