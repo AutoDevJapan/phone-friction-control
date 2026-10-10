@@ -68,3 +68,25 @@ jobs:
           mkdir -p "$HOME/.android"
           keytool -genkeypair -keystore "$HOME/.android/debug.keystore" -alias androiddebugkey -storepass android -keypass android -dname 'CN=Android Debug,O=Android,C=US' -keyalg RSA -keysize 2048 -validity 30
           cargo run --locked -p android-bridge -- pack . target/x86_64-linux-android/debug/libphone_friction_control.so x86_64 apk-out
+      - name: Verify release packaging with an ephemeral signer
+        shell: bash
+        run: |
+          export PHONE_CONTROL_KS_PASS="$(openssl rand -hex 32)"
+          export PHONE_CONTROL_KEY_PASS="$PHONE_CONTROL_KS_PASS"
+          keytool -genkeypair -keystore fixture.p12 -alias fixture -storepass:env PHONE_CONTROL_KS_PASS -keypass:env PHONE_CONTROL_KEY_PASS -dname 'CN=AutoDevJapan Release Fixture' -keyalg RSA -keysize 3072 -validity 30
+          keytool -exportcert -keystore fixture.p12 -alias fixture -storepass:env PHONE_CONTROL_KS_PASS -file fixture.der
+          PIN=$(sha256sum fixture.der | cut -d ' ' -f1)
+          LIB=target/x86_64-linux-android/debug/libphone_friction_control.so
+          target/debug/android-bridge pack-release . "$LIB" x86_64 release3 fixture.p12 fixture 3 0.3.0 "$PIN"
+          target/debug/android-bridge pack-release . "$LIB" x86_64 release4 fixture.p12 fixture 4 0.3.1 "$PIN"
+          "$ANDROID_HOME/build-tools/36.1.0/aapt2" dump badging release4/phone-control-x86_64-release.apk > release-badging.txt
+          if grep -q '^application-debuggable' release-badging.txt; then exit 1; fi
+          grep "versionCode='4'" release-badging.txt
+          if target/debug/android-bridge pack-release . "$LIB" x86_64 wrong-pin fixture.p12 fixture 5 0.3.2 "$(printf '0%.0s' {1..64})"; then exit 1; fi
+          test ! -e wrong-pin/phone-control-x86_64-release.apk
+          export PHONE_CONTROL_KS_PASS=android PHONE_CONTROL_KEY_PASS=android
+          keytool -exportcert -keystore "$HOME/.android/debug.keystore" -alias androiddebugkey -storepass:env PHONE_CONTROL_KS_PASS -file debug.der
+          DEBUG_PIN=$(sha256sum debug.der | cut -d ' ' -f1)
+          if target/debug/android-bridge pack-release . "$LIB" x86_64 debug-reject "$HOME/.android/debug.keystore" androiddebugkey 5 0.3.2 "$DEBUG_PIN"; then exit 1; fi
+          test ! -e debug-reject/phone-control-x86_64-release.apk
+          unset PHONE_CONTROL_KS_PASS PHONE_CONTROL_KEY_PASS
