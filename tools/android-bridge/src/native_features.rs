@@ -48,7 +48,7 @@ pub(super) fn validate(bytes: &[u8], abi: &str, expected: Flavor) -> io::Result<
         return Err(invalid());
     }
     let mut names = Vec::new();
-    for section in sections.chunks_exact(64) {
+    for section in sections.as_chunks::<64>().0 {
         if number(section, 4, 4)? != 11 {
             continue;
         } // SHT_DYNSYM
@@ -71,7 +71,7 @@ pub(super) fn validate(bytes: &[u8], abi: &str, expected: Flavor) -> io::Result<
             number(strings_section, 24, 8)?,
             number(strings_section, 32, 8)?,
         )?;
-        for symbol in symbols.chunks_exact(24) {
+        for symbol in symbols.as_chunks::<24>().0 {
             // Only externally visible, defined global/weak functions count, not incidental strings.
             if ![1, 2].contains(&(symbol[4] >> 4))
                 || symbol[4] & 15 != 2
