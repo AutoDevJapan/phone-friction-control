@@ -2,6 +2,18 @@ name: Manual iOS SDK audit
 on:
   workflow_dispatch:
     inputs:
+      authorization_status_entry_probe:
+        description: Inspect public authorization status metadata and getter entry without requesting access or calling the getter
+        type: boolean
+        default: false
+      authorization_status_value_probe:
+        description: Read the app's public status and reflected enum case in the isolated request-free process
+        type: boolean
+        default: false
+      authorization_status_consent_probe:
+        description: Read the public status on the main thread after the isolated OS consent test completes
+        type: boolean
+        default: false
       authorization_probe:
         description: Call the public individual authorization API once in the isolated Simulator
         type: boolean
@@ -26,6 +38,15 @@ on:
         description: Inspect the selected public XCTest declarations before executing UI tests
         type: boolean
         default: false
+      selection_inspection_mode:
+        description: Inspect verified selection layout, public entries, or initial value lifetime without requesting access
+        type: choice
+        default: none
+        options:
+          - none
+          - layout
+          - entries
+          - values
 permissions:
   contents: read
 jobs:
@@ -44,6 +65,37 @@ jobs:
           set -euo pipefail
           OUT="$RUNNER_TEMP/ios-sdk-audit"
           mkdir "$OUT"
+          SELECTION_MODE='${{ inputs.selection_inspection_mode }}'
+          case "$SELECTION_MODE" in
+            none|layout|entries|values) ;;
+            *) echo 'Unknown selection inspection mode' >&2; exit 1 ;;
+          esac
+          if [ "$SELECTION_MODE" != none ]; then
+            test '${{ inputs.xcode_signed_host }}' = true
+            test '${{ inputs.native_uikit_host }}' = true
+            test '${{ inputs.authorization_probe }}' = true
+            test '${{ inputs.ui_consent_test }}' = false
+            test '${{ inputs.ui_continue }}' = false
+            test '${{ inputs.authorization_status_entry_probe }}' = false
+            test '${{ inputs.authorization_status_value_probe }}' = false
+            test '${{ inputs.authorization_status_consent_probe }}' = false
+            test '${{ inputs.collect_xctest_headers }}' = false
+            printf 'phase=layout\nselection_layout_verified=false\nselection_values_constructed=0\nselection_values_read=0\ngrant_verified=false\nmonitoring_verified=false\nshielding_verified=false\n' > "$OUT/selection-layout-scope.txt"
+          fi
+          if [ '${{ inputs.authorization_status_value_probe }}' = true ]; then
+            test '${{ inputs.authorization_status_entry_probe }}' = true
+          fi
+          if [ '${{ inputs.authorization_status_entry_probe }}' = true ]; then
+            test '${{ inputs.authorization_status_consent_probe }}' = false
+            test '${{ inputs.authorization_probe }}' = false
+            test '${{ inputs.native_uikit_host }}' = false
+            test '${{ inputs.xcode_signed_host }}' = false
+            test '${{ inputs.ui_consent_test }}' = false
+            test '${{ inputs.collect_xctest_headers }}' = false
+          fi
+          if [ '${{ inputs.authorization_status_consent_probe }}' = true ]; then
+            test '${{ inputs.ui_consent_test }}' = true
+          fi
           xcodebuild -version > "$OUT/versions.txt"
           xcrun swiftc --version >> "$OUT/versions.txt"
           rustc --version --verbose >> "$OUT/versions.txt"
@@ -95,7 +147,7 @@ jobs:
             xcrun swift-api-digester -dump-sdk -module "$MODULE" -sdk "$SDK" -target "$TARGET" -o "$RUNNER_TEMP/$MODULE.json"
             jq '[.. | objects | select(.name? | IN("AuthorizationCenter", "shared", "requestAuthorization", "FamilyActivityPicker", "FamilyActivitySelection", "DeviceActivityCenter", "startMonitoring", "DeviceActivityEvent", "DeviceActivityMonitor", "ManagedSettingsStore", "ShieldSettings", "applications")) | {kind, name, printedName, usr, mangledName}]' "$RUNNER_TEMP/$MODULE.json" > "$OUT/$MODULE-symbols.json"
             test "$(jq length "$OUT/$MODULE-symbols.json")" -gt 0
-            jq '[.. | objects | select(.kind? == "TypeDecl" and (.name? | IN("AuthorizationCenter", "FamilyActivityPicker", "FamilyActivitySelection", "DeviceActivityCenter", "DeviceActivityMonitor", "DeviceActivityEvent", "ManagedSettingsStore", "ShieldSettings"))) | {name, usr, declKind, genericSig, members: [.children[]? | select(.name? | IN("shared", "requestAuthorization", "authorizationStatus", "init", "startMonitoring", "intervalDidStart", "intervalDidEnd", "eventDidReachThreshold", "shield", "applications"))]}]' "$RUNNER_TEMP/$MODULE.json" > "$OUT/$MODULE-selected-declarations.json"
+            jq '[.. | objects | select(.kind? == "TypeDecl" and (.name? | IN("AuthorizationCenter", "AuthorizationStatus", "FamilyActivityPicker", "FamilyActivitySelection", "DeviceActivityCenter", "DeviceActivityMonitor", "DeviceActivityEvent", "ManagedSettingsStore", "ShieldSettings"))) | {name, usr, declKind, genericSig, members: [.children[]? | select(.name? | IN("shared", "requestAuthorization", "authorizationStatus", "notDetermined", "denied", "approved", "rawValue", "init", "startMonitoring", "intervalDidStart", "intervalDidEnd", "eventDidReachThreshold", "shield", "applications"))]}]' "$RUNNER_TEMP/$MODULE.json" > "$OUT/$MODULE-selected-declarations.json"
             if [ "$MODULE" = FamilyControls ]; then
               grep -oE '\$s14FamilyControls19AuthorizationCenterC[[:alnum:]_]+' "$FRAMEWORK/$MODULE.tbd" | sort -u > "$OUT/authorization-center-exports.txt"
               test -s "$OUT/authorization-center-exports.txt"
@@ -124,7 +176,7 @@ jobs:
             grep 'U _abi_probe_external' "$OUT/$TARGET/symbols.txt"
           done
           printf 'compiler_codegen=true\nsdk_declarations_collected=true\ncodegen_framework_linked=false\ncodegen_os_executed=false\nauthorization=false\nmonitoring=false\nshielding=false\n' > "$OUT/scope.txt"
-      - name: Inspect the public SDK singleton from a Rust Simulator process
+      - name: Prepare the public SDK runtime inputs
         if: ${{ !inputs.collect_xctest_headers || inputs.ui_consent_test }}
         shell: bash
         run: |
@@ -144,6 +196,22 @@ jobs:
           export AUTH_ASYNC_SYMBOL="${AUTH_REQUEST_SYMBOL}TjTu"
           grep -Fx "$AUTH_ASYNC_SYMBOL" "$OUT/authorization-center-exports.txt"
           REQUEST_ARGS=()
+          if [ '${{ inputs.authorization_status_entry_probe }}' = true ] || [ '${{ inputs.authorization_status_consent_probe }}' = true ]; then
+            export AUTH_STATUS_METADATA_SYMBOL=$(jq -er '[.[] | select(.name == "AuthorizationStatus" and .declKind == "Enum" and .genericSig == null and .usr == "s:14FamilyControls19AuthorizationStatusO") | .usr | sub("^s:"; "\u0024s") + "Ma"] | if length == 1 then .[0] else error("expected public status enum metadata") end' "$OUT/FamilyControls-selected-declarations.json")
+            export AUTH_STATUS_GET_SYMBOL=$(jq -er '[.[] | select(.name == "AuthorizationCenter") | .members[] | select(.name == "authorizationStatus" and .children[0].usr == "s:14FamilyControls19AuthorizationStatusO") | .accessors[] | select(.accessorKind == "get" and .mangledName == "\u0024s14FamilyControls19AuthorizationCenterC19authorizationStatusAA0cF0Ovg") | .mangledName + "Tj"] | if length == 1 then .[0] else error("expected public status getter") end' "$OUT/FamilyControls-selected-declarations.json")
+            export AUTH_STATUS_RAW_GET_SYMBOL=$(jq -er '[.[] | select(.name == "AuthorizationStatus") | .members[] | select(.name == "rawValue" and .children[0].printedName == "Swift.Int") | .accessors[] | select(.accessorKind == "get" and .mangledName == "\u0024s14FamilyControls19AuthorizationStatusO8rawValueSivg") | .mangledName] | if length == 1 then .[0] else error("expected public status raw value getter") end' "$OUT/FamilyControls-selected-declarations.json")
+            grep -oE '\$s14FamilyControls19AuthorizationStatusO[[:alnum:]_]+' "$SDK/System/Library/Frameworks/FamilyControls.framework/FamilyControls.tbd" | sort -u > "$RUNNER_TEMP/status-candidate-exports.txt"
+            { grep -Fx "$AUTH_STATUS_METADATA_SYMBOL" "$RUNNER_TEMP/status-candidate-exports.txt"; grep -Fx "$AUTH_STATUS_GET_SYMBOL" "$OUT/authorization-center-exports.txt"; grep -Fx "$AUTH_STATUS_RAW_GET_SYMBOL" "$RUNNER_TEMP/status-candidate-exports.txt"; } > "$OUT/authorization-status-public-entries.txt"
+            test "$(wc -l < "$OUT/authorization-status-public-entries.txt" | tr -d ' ')" = 3
+            grep -Eq '^#define[[:space:]]+RTLD_DEFAULT[[:space:]]+\(\(void[[:space:]]*\*\)[[:space:]]*-2\)' "$SDK/usr/include/dlfcn.h"
+            grep -n -A 12 -B 3 'dli_fname' "$SDK/usr/include/dlfcn.h" > "$OUT/status-dladdr-declaration.txt"
+            grep -n -A 18 -B 2 'public enum AuthorizationStatus :' "$SDK/System/Library/Frameworks/FamilyControls.framework/Modules/FamilyControls.swiftmodule/arm64-apple-ios-simulator.swiftinterface" > "$OUT/authorization-status-enum-definition.txt"
+            if [ '${{ inputs.authorization_status_entry_probe }}' = true ]; then REQUEST_ARGS=(--cfg authorization_status_entry_probe); fi
+            if [ '${{ inputs.authorization_status_value_probe }}' = true ] || [ '${{ inputs.authorization_status_consent_probe }}' = true ]; then
+              grep -F '_swift_EnumCaseName' "$SDK/usr/lib/swift/libswiftCore.tbd" > "$OUT/status-reflection-export.txt"
+              if [ '${{ inputs.authorization_status_value_probe }}' = true ]; then REQUEST_ARGS+=(--cfg authorization_status_value_probe); fi
+            fi
+          fi
           if [ '${{ inputs.authorization_probe }}' = true ]; then
             grep -F '_swift_stdlib_bridgeErrorToNSError' "$SDK/usr/lib/swift/libswiftCore.tbd"
             INTERFACE="$SDK/System/Library/Frameworks/FamilyControls.framework/Modules/FamilyControls.swiftmodule/arm64-apple-ios-simulator.swiftinterface"
@@ -162,6 +230,66 @@ jobs:
             test '${{ inputs.authorization_probe }}' = true
             REQUEST_ARGS+=(--cfg uikit_host)
           fi
+          SELECTION_ARGS=()
+          if [ '${{ inputs.selection_inspection_mode }}' != none ]; then
+            # Require the exact public type and constructor signatures, not a
+            # substring match that could accept an overload or private symbol.
+            SELECTION_METADATA_SYMBOL=$(jq -er '[.[] | select(.name == "FamilyActivitySelection" and .declKind == "Struct" and .genericSig == null and .usr == "s:14FamilyControls0A17ActivitySelectionV") | .usr | sub("^s:"; "\u0024s") + "Ma"] | if length == 1 then .[0] else error("expected one Selection metadata accessor") end' "$OUT/FamilyControls-selected-declarations.json")
+            SELECTION_INIT_SYMBOL=$(jq -er '[.[] | select(.name == "FamilyActivitySelection") | .members[] | select(.kind == "Constructor" and .printedName == "init()" and .moduleName == "FamilyControls" and .throwing != true and (.children | length) == 1 and .children[0].usr == "s:14FamilyControls0A17ActivitySelectionV" and .mangledName == "\u0024s14FamilyControls0A17ActivitySelectionVACycfc") | .mangledName | sub("cfc$"; "cfC")] | if length == 1 then .[0] else error("expected one public Selection init()") end' "$OUT/FamilyControls-selected-declarations.json")
+            BINDING_METADATA_SYMBOL=$(jq -er '[.[] | select(.name == "Binding" and .declKind == "Struct" and .genericSig == "<Value>" and .usr == "s:7SwiftUI7BindingV") | .usr | sub("^s:"; "\u0024s") + "Ma"] | if length == 1 then .[0] else error("expected one Binding metadata accessor") end' "$OUT/SwiftUI-selected-declarations.json")
+            BINDING_INIT_SYMBOL=$(jq -er '[.[] | select(.name == "Binding") | .members[] | select(.kind == "Constructor" and .printedName == "init(get:set:)" and .moduleName == "SwiftUI" and .genericSig == "<Value>" and .throwing != true and (.children | map(.printedName)) == ["SwiftUI.Binding<Value>", "() -> Value", "(Value) -> Swift.Void"] and .mangledName == "\u0024s7SwiftUI7BindingV3get3setACyxGxyc_yxctcfc") | .mangledName | sub("cfc$"; "cfC")] | if length == 1 then .[0] else error("expected one public Binding init without Transaction") end' "$OUT/SwiftUI-selected-declarations.json")
+            export SELECTION_METADATA_SYMBOL SELECTION_INIT_SYMBOL BINDING_METADATA_SYMBOL BINDING_INIT_SYMBOL
+            # The digester identifies initializing constructors (fc). The ABI's
+            # allocating constructor entry (fC) is exported for these structs.
+            # Require that exact public entry. Only the separate value phase
+            # may invoke Selection.init(); Binding entries remain inspection-only.
+            # Candidate exports stay in scratch. Publish only the seven exact
+            # entries needed here; never publish complete tbd/SDK dumps.
+            grep -oE '\$s14FamilyControls0A17ActivitySelectionV[[:alnum:]_]+' "$SDK/System/Library/Frameworks/FamilyControls.framework/FamilyControls.tbd" | sort -u > "$RUNNER_TEMP/selection-candidate-exports.txt"
+            grep -oE '\$s7SwiftUI7BindingV[[:alnum:]_]+' "$SDK/System/Library/Frameworks/SwiftUI.framework/SwiftUI.tbd" | sort -u > "$RUNNER_TEMP/binding-candidate-exports.txt"
+            grep -oE '_swift_(allocBox|projectBox|deallocBox)[[:alnum:]_]*' "$SDK/usr/lib/swift/libswiftCore.tbd" | sort -u > "$RUNNER_TEMP/box-candidate-exports.txt"
+            grep -E '(VMa|VACycf[Cc]|V3get3setACyxGxyc_yxctcf[Cc])$' "$RUNNER_TEMP/selection-candidate-exports.txt" "$RUNNER_TEMP/binding-candidate-exports.txt" > "$OUT/selection-constructor-entries.txt" || true
+            {
+              grep -Fx "$SELECTION_METADATA_SYMBOL" "$RUNNER_TEMP/selection-candidate-exports.txt"
+              grep -Fx "$SELECTION_INIT_SYMBOL" "$RUNNER_TEMP/selection-candidate-exports.txt"
+              grep -Fx "$BINDING_METADATA_SYMBOL" "$RUNNER_TEMP/binding-candidate-exports.txt"
+              grep -Fx "$BINDING_INIT_SYMBOL" "$RUNNER_TEMP/binding-candidate-exports.txt"
+              grep -Fx '_swift_allocBox' "$RUNNER_TEMP/box-candidate-exports.txt"
+              grep -Fx '_swift_projectBox' "$RUNNER_TEMP/box-candidate-exports.txt"
+              grep -Fx '_swift_deallocBox' "$RUNNER_TEMP/box-candidate-exports.txt"
+            } > "$OUT/selection-public-exports.txt"
+            test "$(wc -l < "$OUT/selection-public-exports.txt" | tr -d ' ')" = 7
+            # Verify the Darwin special dlsym handle against this SDK as well.
+            grep -Eq '^#define[[:space:]]+RTLD_DEFAULT[[:space:]]+\(\(void[[:space:]]*\*\)[[:space:]]*-2\)' "$SDK/usr/include/dlfcn.h"
+            SELECTION_ARGS=(--cfg selection_layout_probe)
+            if [ '${{ inputs.selection_inspection_mode }}' = values ]; then
+              SELECTION_ARGS+=(--cfg selection_value_probe)
+            fi
+            if [ '${{ inputs.selection_inspection_mode }}' = entries ]; then
+              BINDING_GET_SYMBOL=$(jq -er '[.[] | select(.usr == "s:7SwiftUI7BindingV") | .members[] | select(.kind == "Var" and .printedName == "wrappedValue") | .accessors[] | select(.accessorKind == "get" and .mangledName == "\u0024s7SwiftUI7BindingV12wrappedValuexvg") | .mangledName] | if length == 1 then .[0] else error("expected one public Binding getter") end' "$OUT/SwiftUI-selected-declarations.json")
+              BINDING_SET_SYMBOL=$(jq -er '[.[] | select(.usr == "s:7SwiftUI7BindingV") | .members[] | select(.kind == "Var" and .printedName == "wrappedValue") | .accessors[] | select(.accessorKind == "set" and .mangledName == "\u0024s7SwiftUI7BindingV12wrappedValuexvs") | .mangledName] | if length == 1 then .[0] else error("expected one public Binding setter") end' "$OUT/SwiftUI-selected-declarations.json")
+              export BINDING_GET_SYMBOL BINDING_SET_SYMBOL
+              { grep -Fx "$BINDING_GET_SYMBOL" "$RUNNER_TEMP/binding-candidate-exports.txt"; grep -Fx "$BINDING_SET_SYMBOL" "$RUNNER_TEMP/binding-candidate-exports.txt"; } > "$OUT/binding-accessor-exports.txt"
+              grep -n -A 12 -B 3 'dli_fname' "$SDK/usr/include/dlfcn.h" > "$OUT/dladdr-selected-declaration.txt"
+              SELECTION_ARGS+=(--cfg binding_entry_probe)
+            fi
+          fi
+          # Only SDK symbols and inspection options cross this step boundary.
+          # Bash preserves export attributes and array elements without eval.
+          BUILD_ENV="$RUNNER_TEMP/ios-probe-build-env.sh"
+          : > "$BUILD_ENV"
+          for PROBE_VAR in SDKROOT IPHONEOS_DEPLOYMENT_TARGET AUTH_SHARED_SYMBOL AUTH_METADATA_SYMBOL AUTH_ASYNC_SYMBOL AUTH_INDIVIDUAL_VALUE AUTH_STATUS_METADATA_SYMBOL AUTH_STATUS_GET_SYMBOL AUTH_STATUS_RAW_GET_SYMBOL UI_SYSTEM_BUTTON_TYPE UI_TOUCH_UP_INSIDE_EVENT SELECTION_METADATA_SYMBOL SELECTION_INIT_SYMBOL BINDING_METADATA_SYMBOL BINDING_INIT_SYMBOL BINDING_GET_SYMBOL BINDING_SET_SYMBOL; do
+            if declare -p "$PROBE_VAR" >/dev/null 2>&1; then declare -p "$PROBE_VAR" >> "$BUILD_ENV"; fi
+          done
+          declare -p REQUEST_ARGS SELECTION_ARGS >> "$BUILD_ENV"
+      - name: Build and sign the Rust Simulator probe
+        if: ${{ !inputs.collect_xctest_headers || inputs.ui_consent_test }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/ios-sdk-audit"
+          SDK=$(xcrun --sdk iphonesimulator --show-sdk-path)
+          source "$RUNNER_TEMP/ios-probe-build-env.sh"
           PROBE_APP="$OUT/authorization-center-probe.app"
           mkdir "$PROBE_APP"
           if [ '${{ inputs.xcode_signed_host }}' != true ]; then
@@ -193,10 +321,11 @@ jobs:
             /usr/libexec/PlistBuddy -c 'Delete :UIDeviceFamily' "$XCODE_ROOT/Info.plist"
             UI_HOST_ARGS=()
             if [ '${{ inputs.ui_consent_test }}' = true ]; then UI_HOST_ARGS=(--cfg ui_test_host); fi
+            if [ '${{ inputs.authorization_status_consent_probe }}' = true ]; then UI_HOST_ARGS+=(--cfg authorization_status_consent_probe); fi
             # An object input is required: Xcode deliberately skips the link
             # when a target has libraries but no compiled/linked object files.
             # Emit our Rust object and its dependency archive in one invocation.
-            rustc tools/ios-abi-probe.rs --crate-name ios_xcode_probe --crate-type staticlib --edition 2024 --cfg runtime_probe --cfg auth_request --cfg uikit_host --cfg xcode_host ${UI_HOST_ARGS[@]+"${UI_HOST_ARGS[@]}"} --target aarch64-apple-ios-sim --emit="obj=$XCODE_ROOT/probe.o,link" --print native-static-libs -o "$XCODE_ROOT/libprobe.a" 2> "$OUT/rust-static-link.txt"
+            rustc tools/ios-abi-probe.rs --crate-name ios_xcode_probe --crate-type staticlib --edition 2024 --cfg runtime_probe --cfg auth_request --cfg uikit_host --cfg xcode_host ${UI_HOST_ARGS[@]+"${UI_HOST_ARGS[@]}"} ${SELECTION_ARGS[@]+"${SELECTION_ARGS[@]}"} --target aarch64-apple-ios-sim --emit="obj=$XCODE_ROOT/probe.o,link" --print native-static-libs -o "$XCODE_ROOT/libprobe.a" 2> "$OUT/rust-static-link.txt"
             test "$(grep -c '^note: native-static-libs: ' "$OUT/rust-static-link.txt")" = 1
             NATIVE_LIBS=$(sed -n 's/^note: native-static-libs: //p' "$OUT/rust-static-link.txt")
             test -n "$NATIVE_LIBS"
@@ -288,6 +417,78 @@ jobs:
           xcrun simctl boot "$SIM_ID"
           xcrun simctl bootstatus "$SIM_ID" -b
           xcrun simctl install "$SIM_ID" "$PROBE_APP"
+          if [ '${{ inputs.selection_inspection_mode }}' != none ]; then
+            # Preserve partial selection diagnostics even when the process fails.
+            LAUNCH_STATUS=0
+            xcrun simctl launch --console "$SIM_ID" com.autodevjapan.phonecontrol1614abiprobe > "$OUT/singleton-runtime.txt" 2>&1 || LAUNCH_STATUS=$?
+            grep -E '^(Selection (layout:|box:|entry bytes:|layout inspection complete;)|Binding (control transfer:|accessor inspection complete;))' "$OUT/singleton-runtime.txt" > "$OUT/selection-layout.txt" || true
+            if [ '${{ inputs.selection_inspection_mode }}' = values ]; then
+              # Preserve actual partial counts on failure; never synthesize
+              # successful value counts from the requested input.
+              grep '^Selection value result: ' "$OUT/singleton-runtime.txt" | sed 's/^Selection value result: //' > "$OUT/selection-value-results.txt" || true
+            fi
+            test "$LAUNCH_STATUS" = 0
+            grep -F 'Selection box: buffer_aligned=true; project_matches=true; uninitialized_deallocated=true' "$OUT/selection-layout.txt"
+            grep -F 'Selection layout inspection complete; phase=layout; selection_values_constructed=0; selection_values_read=0; initializer_calls=0; closure_calls=0; value_witness_calls=0; authorization_requests=0;' "$OUT/selection-layout.txt"
+            test "$(grep -c '^Selection layout:' "$OUT/selection-layout.txt")" = 2
+            grep -Fx 'Selection layout: FamilyActivitySelection; size=56; stride=56; alignment=8; metadata_complete=true; kind_struct=true' "$OUT/selection-layout.txt"
+            grep -Fx 'Selection layout: Binding<FamilyActivitySelection>; size=72; stride=72; alignment=8; metadata_complete=true; kind_struct=true' "$OUT/selection-layout.txt"
+            test "$(grep -Ec '^Selection entry bytes: (FamilyActivitySelection\.|Binding<FamilyActivitySelection>\.|Binding.init\(get:set:\) without Transaction;)' "$OUT/selection-layout.txt")" = 6
+            if [ '${{ inputs.selection_inspection_mode }}' = entries ]; then
+              grep -F 'Binding accessor inspection complete; helper_calls=0; getter_calls=0; setter_calls=0; closure_calls=0; ownership_verified=false' "$OUT/selection-layout.txt"
+              test "$(grep -c '^Selection entry bytes: Binding.wrappedValue getter;' "$OUT/selection-layout.txt")" = 1
+              test "$(grep -c '^Selection entry bytes: Binding.wrappedValue setter;' "$OUT/selection-layout.txt")" = 1
+              # Validate the actual control transfers, not an assumed BL in
+              # every entry. The setter's first call is indirect in this SDK.
+              grep -Fx 'Binding control transfer: Binding.set; source_offset=40; kind=indirect_call; target_read=false' "$OUT/selection-layout.txt"
+              grep -F 'Binding control transfer: Binding.get; source_offset=0; kind=direct_branch;' "$OUT/selection-layout.txt" | grep -F 'same_image=true'
+              test "$(grep -Fc 'Selection entry bytes: Binding.get.offset0 direct_branch target;' "$OUT/selection-layout.txt")" = 1
+              for OFFSET in 8 40; do
+                grep -F "Binding control transfer: Binding.init; source_offset=$OFFSET; kind=direct_call;" "$OUT/selection-layout.txt" | grep -F 'same_image=true'
+                test "$(grep -Fc "Selection entry bytes: Binding.init.offset$OFFSET direct_call target;" "$OUT/selection-layout.txt")" = 1
+              done
+            fi
+            printf 'phase=layout\nselection_layout_verified=true\nmetadata_complete=true\nmetadata_kind_struct=true\nbox_buffer_aligned=true\nbox_project_matches=true\nbox_uninitialized_deallocated=true\nentry_prefix_max_bytes=128\nentry_reads_page_bounded=true\nentry_registers_verified=false\nselection_values_constructed=0\nselection_values_read=0\ninitializer_calls=0\nclosure_calls=0\nvalue_witness_calls=0\ngrant_verified=false\nmonitoring_verified=false\nshielding_verified=false\n' > "$OUT/selection-layout-scope.txt"
+            if [ '${{ inputs.selection_inspection_mode }}' = values ]; then
+              RESULTS="$OUT/selection-value-results.txt"
+              for EXPECTED in phase=value_lifecycle lifecycle_verified=true allocations=3 deallocations=3 initializer_calls=1 initializer_wrapper_calls=1 initialize_with_copy_calls=2 assign_with_copy_calls=1 destroy_calls=3 value_witness_calls=6 selection_values_constructed=3 selection_values_read=6 returned_destination_checks=3 byte_comparisons=3 independent_allocations=true source_destroyed_before_copy=true; do
+                test "$(grep -Fxc "$EXPECTED" "$RESULTS")" = 1
+              done
+              for FIELD in binding_values_constructed binding_initializer_calls binding_getter_calls binding_setter_calls closure_calls authorization_requests private_api_calls private_api_reads; do
+                test "$(grep -Fxc "$FIELD=0" "$RESULTS")" = 1
+              done
+              for FIELD in mutable_binding_verified mutable_values_verified picker_verified grant_verified monitoring_verified shielding_verified selection_contents_output; do
+                test "$(grep -Fxc "$FIELD=false" "$RESULTS")" = 1
+              done
+              test "$(wc -l < "$RESULTS" | tr -d ' ')" = 31
+            fi
+            grep -F 'SDK singleton class: FamilyControls.AuthorizationCenter' "$OUT/singleton-runtime.txt"
+            grep -F 'Rust UIKit active callback observed' "$OUT/singleton-runtime.txt"
+            if grep -Fq 'Public individual authorization request starting;' "$OUT/singleton-runtime.txt"; then exit 1; fi
+            printf 'authorization_requested=false\n' >> "$OUT/selection-layout-scope.txt"
+            # Layout/box and optional default-value lifecycle only. Separate consent
+            # fixture checks the authorization continuation after a UI choice.
+            exit 0
+          fi
+          if [ '${{ inputs.authorization_status_entry_probe }}' = true ]; then
+            xcrun simctl launch --console "$SIM_ID" com.autodevjapan.phonecontrol1614abiprobe > "$OUT/singleton-runtime.txt" 2>&1
+            grep -F 'SDK singleton class: FamilyControls.AuthorizationCenter' "$OUT/singleton-runtime.txt"
+            grep -E '^Authorization status (layout:|getter entry:|getter implementation:|raw value getter entry:|dispatch observed:|entry inspection complete;)' "$OUT/singleton-runtime.txt" > "$OUT/authorization-status-entry.txt"
+            test "$(grep -c '^Authorization status layout:' "$OUT/authorization-status-entry.txt")" = 1
+            test "$(grep -c '^Authorization status getter entry:' "$OUT/authorization-status-entry.txt")" = 1
+            test "$(grep -c '^Authorization status getter implementation:' "$OUT/authorization-status-entry.txt")" = 1
+            test "$(grep -c '^Authorization status raw value getter entry:' "$OUT/authorization-status-entry.txt")" = 1
+            grep -Fx 'Authorization status dispatch observed: same_image=true; slot_derived=true; implementation_calls=0; raw_value_getter_calls=0' "$OUT/authorization-status-entry.txt"
+            grep -Fx 'Authorization status entry inspection complete; phase=entry; status_getter_calls=0; enum_values_constructed=0; value_witness_calls=0; authorization_requests=0; grant_verified=false' "$OUT/authorization-status-entry.txt"
+            if grep -Eq 'Public individual authorization request starting;|Rust async task entry observed;' "$OUT/singleton-runtime.txt"; then exit 1; fi
+            printf 'phase=entry\nstatus_metadata_verified=true\nstatus_getter_called=false\nauthorization_requested=false\nauthorization_status_verified=false\ngrant_verified=false\nmonitoring=false\nshielding=false\n' > "$OUT/authorization-status-entry-scope.txt"
+            if [ '${{ inputs.authorization_status_value_probe }}' = true ]; then
+              grep -E '^Authorization status value read: raw_value=[012]; label=(notDetermined|denied|approved); status_getter_calls=1; raw_value_getter_calls=1; enum_case_name_calls=1; status_value_verified=true; authorization_requests=0; grant_verified=false$' "$OUT/singleton-runtime.txt" > "$OUT/authorization-status-value.txt"
+              test "$(wc -l < "$OUT/authorization-status-value.txt" | tr -d ' ')" = 1
+              printf 'status_value_verified=true\npublic_status_getter_called=true\npublic_raw_value_getter_called=true\nstatus_case_name_observed=true\nauthorization_requested=false\ngrant_flow_verified=false\nmonitoring=false\nshielding=false\n' > "$OUT/authorization-status-value-scope.txt"
+            fi
+            exit 0
+          fi
           if [ '${{ inputs.ui_consent_test }}' = true ]; then
 
             mkdir -p "$XCODE_ROOT/Probe.xcodeproj/xcshareddata/xcschemes"
@@ -319,7 +520,26 @@ jobs:
             else
               grep -Fx 'error_present=false' "$OUT/public-authorization-result.txt"
             fi
-            printf 'xcode_host_launched=true\nordinary_permission_button_tested=true\nauthorization_status_verified=false\nmonitoring=false\nshielding=false\n' > "$OUT/consent-ui-scope.txt"
+            if [ '${{ inputs.authorization_status_consent_probe }}' = true ]; then
+              grep -Fx 'authorization_status_verified=true' "$OUT/public-authorization-result.txt"
+              grep -Fx 'status_read_on_main_thread=true' "$OUT/public-authorization-result.txt"
+              grep -Fx 'status_getter_calls=1' "$OUT/public-authorization-result.txt"
+              grep -Fx 'raw_value_getter_calls=1' "$OUT/public-authorization-result.txt"
+              grep -Fx 'enum_case_name_calls=1' "$OUT/public-authorization-result.txt"
+              if [ '${{ inputs.ui_continue }}' = false ]; then
+                # SDK17.5 individual cancellation returned error + notDetermined
+                # in run38081982214. Refusal must never count as approved; the
+                # Rust reader already checks the exact raw/reflected-case pair.
+                grep -Eq '^status_raw_value=[01]$' "$OUT/public-authorization-result.txt"
+                grep -Eq '^status_label=(notDetermined|denied)$' "$OUT/public-authorization-result.txt"
+              else
+                grep -Fx 'status_raw_value=2' "$OUT/public-authorization-result.txt"
+                grep -Fx 'status_label=approved' "$OUT/public-authorization-result.txt"
+              fi
+              printf 'xcode_host_launched=true\nordinary_permission_button_tested=true\nauthorization_status_verified=true\nmonitoring=false\nshielding=false\n' > "$OUT/consent-ui-scope.txt"
+            else
+              printf 'xcode_host_launched=true\nordinary_permission_button_tested=true\nauthorization_status_verified=false\nmonitoring=false\nshielding=false\n' > "$OUT/consent-ui-scope.txt"
+            fi
             exit 0
           fi
           if [ '${{ inputs.xcode_signed_host }}' = true ]; then
@@ -363,9 +583,40 @@ jobs:
           fi
           printf 'simulator_process_executed=true\npublic_singleton_called=true\npublic_async_descriptor_read=true\nrust_async_task_entry_observed=true\nuikit_host_active=%s\nruntime_teardown_verified=false\nauthorization_requested=%s\nauthorization_status_verified=false\nmonitoring=false\nshielding=false\n' "$UIKIT_ACTIVE" "$REQUESTED" > "$OUT/singleton-runtime-scope.txt"
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && inputs.selection_inspection_mode == 'none'
         with:
           name: ios-sdk-audit
           path: ${{ runner.temp }}/ios-sdk-audit
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.selection_inspection_mode != 'none'
+        with:
+          name: ios-selection-layout-audit
+          path: |
+            ${{ runner.temp }}/ios-sdk-audit/singleton-runtime.txt
+            ${{ runner.temp }}/ios-sdk-audit/versions.txt
+            ${{ runner.temp }}/ios-sdk-audit/xcode-build.txt
+            ${{ runner.temp }}/ios-sdk-audit/rust-static-link.txt
+            ${{ runner.temp }}/ios-sdk-audit/selection-layout.txt
+            ${{ runner.temp }}/ios-sdk-audit/selection-layout-scope.txt
+            ${{ runner.temp }}/ios-sdk-audit/selection-public-exports.txt
+            ${{ runner.temp }}/ios-sdk-audit/selection-constructor-entries.txt
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.selection_inspection_mode == 'values'
+        with:
+          name: ios-selection-value-audit
+          path: ${{ runner.temp }}/ios-sdk-audit/selection-value-results.txt
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.selection_inspection_mode == 'entries'
+        with:
+          name: ios-binding-entry-audit
+          path: |
+            ${{ runner.temp }}/ios-sdk-audit/binding-accessor-exports.txt
+            ${{ runner.temp }}/ios-sdk-audit/dladdr-selected-declaration.txt
           retention-days: 1
           if-no-files-found: error
