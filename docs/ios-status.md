@@ -1,4 +1,4 @@
-# iOSの未達条件（2026-10-10確認）
+# iOSの未達条件（2026-10-11確認）
 
 iOS製品の許可画面・アプリ選択・計測・遮蔽は未実装です。検査用のRustコードから公開の個人向け許可APIを呼び、エラーの戻りを受け取るところまで確認しました。許可の承認や、Androidの計測結果をiOSの制御成功として扱いません。
 
@@ -53,6 +53,64 @@ SDKの公開宣言から、個人向けの許可要求が `requestAuthorization(
 [検査PR4](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/pull/4)の[実行38061084706](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38061084706)では、戻ったエラーをNSErrorへ変換し、`NSCocoaErrorDomain` のコード4097を取得しました。使った変換はSwift 5.10の実行系が持つSPIです。Family Controlsの内部の許可関数を呼ぶものではなく、この版を固定した検査のための処理です。エラーの参照は変換が消費し、返ったNSErrorだけを解放します。ドメインとコード以外の個人情報や選択値は読んでいません。
 
 [Foundationの定義](https://github.com/swiftlang/swift-corelibs-foundation/blob/main/Sources/Foundation/NSError.swift)では4097はXPC接続の中断に当たります。通信が中断した理由はこの値だけでは確定しません。署名や許可設定の不足と断定せず、一時署名の設定と試験アプリに限った接続ログを比較して原因を調べます。Simulatorの一時署名にFamily Controlsの設定を含める検査も、Appleが開発・配布を許可した証拠にはなりません。
+
+## UIKitの起動とSimulator向け署名（2026-10-11追加）
+
+[検査PR5](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/pull/5)では、Family Controlsのキーを直接の一時署名に追加する比較を行いました。導入はできましたが、[実行38063806271](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38063806271)の起動は拒否されました。対象アプリに絞ったログは `NSPOSIXErrorDomain` の162で、プロセスの起動失敗を示しました。署名にはXMLとDERの両方があり、DERがないことを原因としていません。この失敗を成功へ変更せず、Xcodeの通常のSimulator向け署名工程と比較します。
+
+[検査PR6](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/pull/6)では、Rustから公開の `UIApplicationMain` を呼ぶ検査用ホストを実装しました。Rustで登録するdelegateが空のwindowとcontrollerを設定し、アプリがactiveになったときに公開許可要求を一度だけ開始します。結果待ちは別のworkerに置き、UIKitのmain threadを待機ループで塞ぎません。
+
+先行実行はmain queueの関数を外部シンボルとして呼び、リンクで失敗しました。公開ヘッダーにあるinline定義に合わせ、main queueの不透明なglobalのアドレスを取得する処理へ直しました。ソース `110c807` の[実行38064979076](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38064979076)は成功し、起動とactiveのcallback、公開の個人向け許可要求、呼出し元への復帰、NSError4097を確認しました。
+
+空windowの設定と表示要求が戻ったことは確認しましたが、画面の画像や描画結果を確認した意味ではありません。製品画面の完成、許可の承認、選択、監視、遮蔽、実再生時間の取得、実行系内部の全タスクの終了も未確認です。
+
+[検査PR7](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/pull/7)では、Rustのobjectと静的ライブラリをXcodeの通常のapplication targetでリンクします。SwiftやCのダミーソースは追加せず、Simulator向けのFamily Controls設定をXcodeの工程で埋め込みます。開発用teamの登録、証明書の発行、provisioningの更新は行っていません。
+
+先行の `f04f320` はビルド成功を返しても実行ファイルがありませんでした。objectを直接リンク入力へ加えた `aec9875` はリンクまで進み、ライブラリの検索先がないため失敗しました。検索先を修正した `e950b07` の[実行38067019902](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38067019902)で、Xcodeのビルド、arm64の実行ファイル、入口シンボル、署名、導入、UIKitの起動を確認しました。
+
+このXcode版の公開許可要求は、20秒の待機とキャンセル後5秒の待機で結果が戻らず、検査は失敗しました。通常の起動ができたことと、許可の承認・非同期の完了を区別します。
+
+画像と対象processのログを追加した `80d7902` の[実行38067742836](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38067742836)でも、検査全体は結果待ちの期限切れで失敗しました。一方、要求開始に合わせた3枚のSimulator画像で、Screen Timeへのアクセスを求めるOSの画面と「Continue」「Don’t Allow」の選択肢を確認しました。以前の即時エラー4097から、通常の許可画面での選択待ちへ進んだことが今回の成果です。選択肢を押していないため、承認・拒否後の継続と許可状態はまだ確認していません。
+
+## Rustによる許可画面の操作検査（2026-10-11追加）
+
+ソース `2eedf31` の[実行38075160045](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38075160045)では、Xcodeのテスト用ビルド、Rustで登録したXCTestCaseの発見、検査アプリの起動、公開の要求ボタンのタップまで成功しました。ホストのリンク先にXCTestがないことも実ファイルで確認しました。以前の起動待ちは、ホストとテストへ共通で渡したリンク設定によりXCTestをホストへ混入させたことが原因でした。各targetの設定へ分けて修正しています。
+
+この実行は、アプリ自身の画面からOSの許可画面を探した検査で失敗しました。アプリのアクセシビリティツリーは検査用ボタンだけでした。一方、終了時の画像には、ホーム画面上のScreen Timeの許可画面が残っていました。要求とOS表示は確認できましたが、OSの選択肢のタップ・許可結果の戻りはまだ確認できていません。OS側の画面を公開XCTestから観測する修正を別モデルで確認し、ソース `849ec48` の追加検査を開始しました。
+
+ソース `849ec48` の[実行38075928010](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38075928010)は全工程成功しました。公開のXCUIApplicationでSpringBoardの許可画面を観測し、「Don’t Allow」のタップ後に検査ホストの結果表示を待ちます。結果ファイルに公開APIの継続観測と `error_present=true` があり、1件のXCTestが18.664秒で成功しました。OSの拒否操作と公開APIのエラー受取りを確認した結果です。許可状態getterの確認と、Continue側の結果は別の検査条件です。
+
+同じソースのContinue側の[実行38076292581](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38076292581)では、Continueのタップは成功しました。その先に別のOS画面があり、「Allow with Passcode」と「Don’t Allow」が表示されました。検査がこの2段目を操作していないため、公開APIの戻りはなく、結果表示の30秒待機で失敗しました。Continueだけで許可済みとは判定せず、表示された2段目の操作と、その後の画面・戻りを追加検証します。パスコードの入力や、認証を迂回する呼出しは行っていません。
+
+ソース `5cce94b` の[実行38077076147](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38077076147)で、2段目のボタンのタップに成功しました。その後の画像と画面ツリーは「Passcode field」という入力欄を示しました。未入力のため公開APIは戻らず、検査は失敗しました。次の検査は、毎回新しく作成するarm64 Simulatorに限定し、通常の入力欄から非秘密の合成値を1回だけ送ります。入力後の結果と許可状態はまだ未確認です。
+
+ソース `0afb76e` の[実行38078299191](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38078299191)では、公開の入力APIをSDKヘッダーと照合し、1回の合成入力でOSの「Approved to Access Screen Time」画面まで進みました。最後のDoneを押していなかったため、全体は完了待ちで失敗しました。Done操作を追加した最終ソース `65f67e2` の[実行38079380084](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38079380084)は全工程成功し、1件のXCTestが29.209秒で成功しました。公開APIからの戻りと `error_present=false` を確認しています。
+
+最終統合レビューはMust 0件、CodeQLも成功し、[検査PR7](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/pull/7)をマージしました。公開mainの `e211950` のCodeQLも成功しています。製品リポジトリへ同期した2ファイルは、この公開mainと同じソースです。状態getter・可変Binding・製品統合の追加検査は別の作業ブランチにあります。今回の無エラーの戻りを、状態getterの取得や製品UI・監視・遮蔽の完成とは判定しません。
+
+## 許可状態を読むための型情報（2026-10-11追加）
+
+ソース `64ced79` の[実行38077790004](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38077790004)は全工程成功しました。SDKの公開宣言とexportを照合したうえで、AuthorizationStatusの完全なenumメタデータを取得しました。サイズ・stride・alignmentはいずれも1です。公開のauthorizationStatus getter入口は、ページ内の最大128バイトだけ採取しました。
+
+この検査は許可要求をしない独立プロセスで行いました。getter・値の操作表・enum値の構築は呼んでいません。型情報と入口の取得を、許可状態の取得や承認の確認とは扱いません。最初の起動要求はGitHubがHTTP 500を返しましたが、実行一覧に同じソースの受付があることを確認し、再送していません。
+
+## 選択値とBindingの型情報（2026-10-11追加）
+
+ソース `4db3afa` の[実行38070513964](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38070513964)で、公開のメタデータと値の操作表を読み、型のサイズと配置を取得しました。`FamilyActivitySelection` はサイズ56・stride56・alignment8、`Binding<FamilyActivitySelection>` は72・72・8でした。固定値を仮定してメモリへ値を詰めた結果ではなく、実行系が返した情報です。
+
+Swiftの保持用boxを確保し、未初期化の値領域が要求されたアラインメントを満たすことと、投影した領域が返された領域と一致することを確認しました。未初期化の値を破棄する操作は使わず、その状態のbox専用の解放を行いました。
+
+公開コンストラクターとコピー操作の入口を、ページ境界内の最大128バイトに限って記録しました。SDKの宣言にある初期化用の記号と、実際に公開される値を作る入口の記号は異なります。[Swift 5.10の名前の規則](https://github.com/swiftlang/swift/blob/swift-5.10-RELEASE/docs/ABI/Mangling.rst)に合わせ、公開宣言と実際のexportを正確に照合してから取得しています。
+
+この検査では、選択値の構築、値の読取り、初期化関数・クロージャ・コピー関数の呼出し、許可要求を行っていません。Bindingの可変な選択を受け取るには、引数の配置、getter/setterの文脈、値と参照の所有権を追加確認し、実際の受渡しを検証する必要があります。型情報とメモリ処理の成功を、アプリ選択や製品対応の成功として扱いません。
+
+ソース `4ea0160` の[実行38075174827](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38075174827)でgetter・setterの公開入口も採取しました。setterに直接呼出しを要求したチェックで検査全体は失敗しました。実際のsetterは間接呼出しを使い、getterは最初の無条件分岐で別の実装へ進みます。最初の直接呼出しを単純に探す旧方式は、その分岐を無視して隣接コードを拾っていました。実行が分岐する位置で止める方式へ修正し、ソース `8d0d2a6` で追加検査を開始しました。SDK命令の再配置後の絶対アドレスを元のSDKの分岐先とは扱いません。
+
+ソース `8d0d2a6` の[実行38075934628](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38075934628)は全工程成功しました。getterの先頭の直接分岐先、コンストラクターの直接呼出し先を、元の入口からの相対値と同一イメージの照合で採取しました。setterはoffset40の間接呼出しまでを確認し、間接呼出し先は読みません。値の構築・API呼出し・クロージャ呼出し・許可要求はすべて0件です。
+
+ソース `7591545` の[実行38077219284](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38077219284)では、独立した値の寿命を調べる検査も全工程成功しました。Rustで別々の領域を3つ確保し、公開のSelection.init()を1回、コピーを2回、代入を1回、破棄を3回呼びました。元の値を破棄した後も複製した値を別の領域へコピーでき、3つの領域をそれぞれ解放しました。値の内容は出力しません。
+
+これは初期状態のSelection値の寿命を確認した前提工程です。可変Bindingの生成・getter/setter・クロージャはまだ呼んでおらず、アプリ選択・許可要求・監視・遮蔽も行っていません。初期状態の値を可変Bindingの代用品にはしていません。
 
 ## アカウントと配布
 
