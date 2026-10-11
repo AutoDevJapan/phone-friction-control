@@ -39,7 +39,7 @@ on:
         type: boolean
         default: false
       selection_inspection_mode:
-        description: Inspect selection layout, entries, values, mutable Binding, or Picker entries/lifetime without requesting access
+        description: Inspect selection values, Picker lifetime, or a real hosting window without requesting access
         type: choice
         default: none
         options:
@@ -50,6 +50,7 @@ on:
           - mutable
           - picker-entries
           - picker-values
+          - picker-hosting
 permissions:
   contents: read
 jobs:
@@ -70,13 +71,13 @@ jobs:
           mkdir "$OUT"
           SELECTION_MODE='${{ inputs.selection_inspection_mode }}'
           case "$SELECTION_MODE" in
-            none|layout|entries|values|mutable|picker-entries|picker-values) ;;
+            none|layout|entries|values|mutable|picker-entries|picker-values|picker-hosting) ;;
             *) echo 'Unknown selection inspection mode' >&2; exit 1 ;;
           esac
           if [ "$SELECTION_MODE" != none ]; then
             test '${{ inputs.xcode_signed_host }}' = true
             test '${{ inputs.native_uikit_host }}' = true
-            if [ '${{ inputs.selection_inspection_mode }}' = picker-values ]; then
+            if [ "$SELECTION_MODE" = picker-values ] || [ "$SELECTION_MODE" = picker-hosting ]; then
               test '${{ inputs.authorization_probe }}' = false
             else
               test '${{ inputs.authorization_probe }}' = true
@@ -238,7 +239,7 @@ jobs:
             REQUEST_ARGS=(--cfg auth_request)
           fi
           if [ '${{ inputs.native_uikit_host }}' = true ]; then
-            if [ '${{ inputs.selection_inspection_mode }}' = picker-values ]; then
+            if [ '${{ inputs.selection_inspection_mode }}' = picker-values ] || [ '${{ inputs.selection_inspection_mode }}' = picker-hosting ]; then
               test '${{ inputs.authorization_probe }}' = false
             else
               test '${{ inputs.authorization_probe }}' = true
@@ -277,7 +278,7 @@ jobs:
             # Verify the Darwin special dlsym handle against this SDK as well.
             grep -Eq '^#define[[:space:]]+RTLD_DEFAULT[[:space:]]+\(\(void[[:space:]]*\*\)[[:space:]]*-2\)' "$SDK/usr/include/dlfcn.h"
             SELECTION_ARGS=(--cfg selection_layout_probe)
-            if [ '${{ inputs.selection_inspection_mode }}' = picker-entries ] || [ '${{ inputs.selection_inspection_mode }}' = picker-values ]; then
+            if [ '${{ inputs.selection_inspection_mode }}' = picker-entries ] || [ '${{ inputs.selection_inspection_mode }}' = picker-values ] || [ '${{ inputs.selection_inspection_mode }}' = picker-hosting ]; then
               export PICKER_METADATA_SYMBOL=$(jq -er '[.[] | select(.name == "FamilyActivityPicker" and .declKind == "Struct" and .genericSig == null and .usr == "s:14FamilyControls0A14ActivityPickerV") | .usr | sub("^s:"; "\u0024s") + "Ma"] | if length == 1 then .[0] else error("expected nongeneric Picker struct") end' "$OUT/FamilyControls-selected-declarations.json")
               export PICKER_INIT_SYMBOL=$(jq -er '[.[] | select(.usr == "s:14FamilyControls0A14ActivityPickerV") | .members[] | select(.kind == "Constructor" and .printedName == "init(selection:)" and .moduleName == "FamilyControls" and .genericSig == null and .throwing != true and (.children | map(.printedName)) == ["FamilyControls.FamilyActivityPicker", "SwiftUI.Binding<FamilyControls.FamilyActivitySelection>"] and (.children | map(.usr)) == ["s:14FamilyControls0A14ActivityPickerV", "s:7SwiftUI7BindingV"] and .children[1].children[0].usr == "s:14FamilyControls0A17ActivitySelectionV" and .mangledName == "\u0024s14FamilyControls0A14ActivityPickerV9selectionAC7SwiftUI7BindingVyAA0aC9SelectionVG_tcfc") | .mangledName | sub("cfc$"; "cfC")] | if length == 1 then .[0] else error("expected exact Picker selection initializer") end' "$OUT/FamilyControls-selected-declarations.json")
               export HOSTING_METADATA_SYMBOL=$(jq -er '[.[] | select(.name == "UIHostingController" and .declKind == "Class" and .genericSig == "<Content where Content : SwiftUI.View>" and .usr == "s:7SwiftUI19UIHostingControllerC") | .usr | sub("^s:"; "\u0024s") + "Ma"] | if length == 1 then .[0] else error("expected hosting class with one View constraint") end' "$OUT/SwiftUI-selected-declarations.json")
@@ -295,17 +296,18 @@ jobs:
               xcrun swift-demangle --compact < "$OUT/picker-hosting-public-exports.txt" > "$OUT/picker-hosting-public-demangled.txt"
               grep -n -A 12 -B 3 'dli_fname' "$SDK/usr/include/dlfcn.h" > "$OUT/picker-hosting-dladdr-declaration.txt"
               if [ '${{ inputs.selection_inspection_mode }}' = picker-entries ]; then SELECTION_ARGS+=(--cfg picker_entry_probe); else SELECTION_ARGS+=(--cfg picker_value_probe); fi
+              if [ '${{ inputs.selection_inspection_mode }}' = picker-hosting ]; then SELECTION_ARGS+=(--cfg picker_hosting_probe); fi
             fi
             if [ '${{ inputs.selection_inspection_mode }}' = values ]; then
               SELECTION_ARGS+=(--cfg selection_value_probe)
             fi
-            if [ '${{ inputs.selection_inspection_mode }}' = mutable ] || [ '${{ inputs.selection_inspection_mode }}' = picker-values ]; then
+            if [ '${{ inputs.selection_inspection_mode }}' = mutable ] || [ '${{ inputs.selection_inspection_mode }}' = picker-values ] || [ '${{ inputs.selection_inspection_mode }}' = picker-hosting ]; then
               export SELECTION_CATEGORY_INIT_SYMBOL=$(jq -er '[.[] | select(.name == "FamilyActivitySelection") | .members[] | select(.kind == "Constructor" and .printedName == "init(includeEntireCategory:)" and .moduleName == "FamilyControls" and .throwing != true and (.children | map(.usr)) == ["s:14FamilyControls0A17ActivitySelectionV", "s:Sb"] and .mangledName == "\u0024s14FamilyControls0A17ActivitySelectionV21includeEntireCategoryACSb_tcfc") | .mangledName | sub("cfc$"; "cfC")] | if length == 1 then .[0] else error("expected one public category Bool initializer") end' "$OUT/FamilyControls-selected-declarations.json")
               grep -Fx "$SELECTION_CATEGORY_INIT_SYMBOL" "$RUNNER_TEMP/selection-candidate-exports.txt" > "$OUT/selection-category-init-export.txt"
               test "$(wc -l < "$OUT/selection-category-init-export.txt" | tr -d ' ')" = 1
               if [ '${{ inputs.selection_inspection_mode }}' = mutable ]; then SELECTION_ARGS+=(--cfg mutable_binding_probe); fi
             fi
-            if [ '${{ inputs.selection_inspection_mode }}' = entries ] || [ '${{ inputs.selection_inspection_mode }}' = mutable ] || [ '${{ inputs.selection_inspection_mode }}' = picker-values ]; then
+            if [ '${{ inputs.selection_inspection_mode }}' = entries ] || [ '${{ inputs.selection_inspection_mode }}' = mutable ] || [ '${{ inputs.selection_inspection_mode }}' = picker-values ] || [ '${{ inputs.selection_inspection_mode }}' = picker-hosting ]; then
               BINDING_GET_SYMBOL=$(jq -er '[.[] | select(.usr == "s:7SwiftUI7BindingV") | .members[] | select(.kind == "Var" and .printedName == "wrappedValue") | .accessors[] | select(.accessorKind == "get" and .mangledName == "\u0024s7SwiftUI7BindingV12wrappedValuexvg") | .mangledName] | if length == 1 then .[0] else error("expected one public Binding getter") end' "$OUT/SwiftUI-selected-declarations.json")
               BINDING_SET_SYMBOL=$(jq -er '[.[] | select(.usr == "s:7SwiftUI7BindingV") | .members[] | select(.kind == "Var" and .printedName == "wrappedValue") | .accessors[] | select(.accessorKind == "set" and .mangledName == "\u0024s7SwiftUI7BindingV12wrappedValuexvs") | .mangledName] | if length == 1 then .[0] else error("expected one public Binding setter") end' "$OUT/SwiftUI-selected-declarations.json")
               export BINDING_GET_SYMBOL BINDING_SET_SYMBOL
@@ -322,6 +324,78 @@ jobs:
             if declare -p "$PROBE_VAR" >/dev/null 2>&1; then declare -p "$PROBE_VAR" >> "$BUILD_ENV"; fi
           done
           declare -p REQUEST_ARGS SELECTION_ARGS >> "$BUILD_ENV"
+      - name: Require exact public hosting UIKit signatures
+        if: inputs.selection_inspection_mode == 'picker-hosting'
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/ios-sdk-audit"
+          SDK=$(xcrun --sdk iphonesimulator --show-sdk-path)
+          HEADERS="$SDK/System/Library/Frameworks/UIKit.framework/Headers"
+          # Fail before compiling/executing if a required selector signature is
+          # absent. No Swift, C, ObjC source or guessed selector type is generated.
+          : > "$OUT/picker-hosting-uikit-declarations.txt"
+          # Gather only the selectors/types this probe uses before validation,
+          # so a failed declaration guard retains its actual SDK context.
+          : > "$OUT/picker-hosting-uikit-candidates.txt"
+          for HEADER in UIScreen UIView UIWindow UIViewController; do
+            grep -nE '(mainScreen|CGRect[[:space:]]+bounds|initWithFrame:|layoutIfNeeded|UIWindow.*window|isHidden|rootViewController|makeKeyAndVisible|UIView.*view;|parentViewController)' "$HEADERS/$HEADER.h" >> "$OUT/picker-hosting-uikit-candidates.txt" || true
+          done
+          require() {
+            # C/ObjC declaration whitespace is insignificant. Canonicalize
+            # horizontal blanks per line before matching the same type/name.
+            if ! sed -E 's/[[:blank:]]+/ /g' "$1" | grep -E "$2" >> "$OUT/picker-hosting-uikit-declarations.txt"; then
+              printf 'Required public declaration missing: %s; pattern=%s\n' "${1##*/}" "$2" >&2
+              exit 1
+            fi
+          }
+          require "$HEADERS/UIScreen.h" '(\+.*\(UIScreen \*\)mainScreen|@property\(class,.*UIScreen \*mainScreen)'
+          require "$HEADERS/UIScreen.h" '@property.*CGRect bounds([[:space:]]+(API_|NS_)[^;]*)?;'
+          require "$HEADERS/UIView.h" '\-.*\(instancetype\)initWithFrame:\(CGRect\)frame'
+          require "$HEADERS/UIView.h" '\-.*\(void\)layoutIfNeeded;'
+          require "$HEADERS/UIView.h" '@property.*UIWindow \*window([[:space:]]+(API_|NS_)[^;]*)?;'
+          require "$HEADERS/UIView.h" '@property.*getter=isHidden.*BOOL hidden([[:space:]]+(API_|NS_)[^;]*)?;'
+          require "$HEADERS/UIWindow.h" '@property.*strong.*UIViewController \*rootViewController([[:space:]]+(API_|NS_)[^;]*)?;'
+          require "$HEADERS/UIWindow.h" '\-.*\(void\)makeKeyAndVisible;'
+          require "$HEADERS/UIViewController.h" '@property.*UIView \*view([[:space:]]+(API_|NS_)[^;]*)?;'
+          require "$HEADERS/UIViewController.h" '@property.*UIViewController \*parentViewController([[:space:]]+(API_|NS_)[^;]*)?;'
+          # Inspect semantic declarations from the existing vendor header only.
+          # No authored C/ObjC input, object, executable, or new SDK call.
+          RUNTIME_HEADER="$SDK/usr/include/objc/runtime.h"
+          require_runtime_function() {
+            local SYMBOL=$1 EXPECTED=$2 RAW_AST="$RUNNER_TEMP/runtime-$1-ast.json" SELECTED="$OUT/runtime-$1-signature.json"
+            xcrun clang -target arm64-apple-ios17.5-simulator -isysroot "$SDK" -x objective-c -fsyntax-only -Wno-pragma-once-outside-header -Xclang -ast-dump=json -Xclang "-ast-dump-filter=$SYMBOL" "$RUNTIME_HEADER" > "$RAW_AST"
+            jq -s --arg symbol "$SYMBOL" '[.[] | select(.kind == "FunctionDecl" and .name == $symbol) | {name, type: .type.qualType, parameters: [.inner[]? | select(.kind == "ParmVarDecl") | .type.qualType]}] | if length > 0 then . else error("public runtime declaration absent") end' "$RAW_AST" > "$SELECTED"
+            jq -e --arg expected "$EXPECTED" 'def abi_type: gsub("(_Nullable|_Nonnull|_Null_unspecified)"; "") | gsub("[[:space:]]+"; " ") | gsub("^ | $"; "") | gsub(" [)]"; ")"); all(.[]; (.type | abi_type) == $expected and (.parameters | length) == 1)' "$SELECTED"
+            printf 'public_runtime_function=%s; semantic_type=%s\n' "$SYMBOL" "$EXPECTED" >> "$OUT/picker-hosting-uikit-declarations.txt"
+          }
+          require_runtime_function object_getClass 'Class (id)'
+          require_runtime_function class_getSuperclass 'Class (Class)'
+          GEOMETRY="$SDK/System/Library/Frameworks/CoreGraphics.framework/Headers/CGGeometry.h"
+          require_record() {
+            local SYMBOL=$1 EXPECTED=$2 RAW_AST="$RUNNER_TEMP/record-$1-ast.json" SELECTED="$OUT/record-$1-layout.json"
+            xcrun clang -target arm64-apple-ios17.5-simulator -isysroot "$SDK" -x objective-c -fsyntax-only -Wno-pragma-once-outside-header -Xclang -ast-dump=json -Xclang "-ast-dump-filter=$SYMBOL" "$GEOMETRY" > "$RAW_AST"
+            jq -s --arg symbol "$SYMBOL" '[.[] | select(.kind == "RecordDecl" and .name == $symbol and .completeDefinition == true) | {name, tag: .tagUsed, unsafe_layout_attributes: [.inner[]? | select(.kind == "PackedAttr" or .kind == "AlignedAttr") | .kind], fields: [.inner[]? | select(.kind == "FieldDecl") | {name, type: (.type.desugaredQualType // .type.qualType), bitfield: (.isBitfield // false)}]}] | if length > 0 then . else error("public geometry record absent") end' "$RAW_AST" > "$SELECTED"
+            jq -e --argjson expected "$EXPECTED" 'all(.[]; .tag == "struct" and .unsafe_layout_attributes == [] and [.fields[] | {name, type}] == $expected and all(.fields[]; .bitfield == false))' "$SELECTED"
+          }
+          require_record CGPoint '[{"name":"x","type":"double"},{"name":"y","type":"double"}]'
+          require_record CGSize '[{"name":"width","type":"double"},{"name":"height","type":"double"}]'
+          require_record CGRect '[{"name":"origin","type":"struct CGPoint"},{"name":"size","type":"struct CGSize"}]'
+          grep -oE '_swift_unknownObjectRelease([[:space:],]|$)' "$SDK/usr/lib/swift/libswiftCore.tbd" | sed -E 's/[[:space:],]+$//' | sort -u > "$OUT/picker-hosting-release-export.txt"
+          test "$(cat "$OUT/picker-hosting-release-export.txt")" = _swift_unknownObjectRelease
+          # Primary compiler rules: generic class metatype fulfills Content and
+          # Content:View, so allocating init has no trailing generic arguments.
+          # Keep the exact source/version for the parent's unsafe-call review.
+          curl --fail --silent --show-error --location 'https://raw.githubusercontent.com/swiftlang/swift/swift-5.10-RELEASE/lib/IRGen/GenProto.cpp' -o "$RUNNER_TEMP/hosting-GenProto.cpp"
+          sed -n '197,245p;307,312p;383,446p;3847,3908p' "$RUNNER_TEMP/hosting-GenProto.cpp" > "$OUT/picker-hosting-generic-abi-primary.txt"
+          grep -F 'Thick metatypes are sources of metadata.' "$OUT/picker-hosting-generic-abi-primary.txt"
+          grep -F 'enumerateUnfulfilledRequirements' "$OUT/picker-hosting-generic-abi-primary.txt"
+          curl --fail --silent --show-error --location 'https://raw.githubusercontent.com/swiftlang/swift/swift-5.10-RELEASE/include/swift/Runtime/HeapObject.h' -o "$RUNNER_TEMP/hosting-HeapObject.h"
+          sed -n '686,690p' "$RUNNER_TEMP/hosting-HeapObject.h" > "$OUT/picker-hosting-release-primary.txt"
+          grep -Fx 'void swift_unknownObjectRelease(void *value);' "$OUT/picker-hosting-release-primary.txt"
+          curl --fail --silent --show-error --location 'https://raw.githubusercontent.com/swiftlang/swift/swift-5.10-RELEASE/include/swift/Runtime/RuntimeFunctions.def' -o "$RUNNER_TEMP/hosting-RuntimeFunctions.def"
+          sed -n '335,342p' "$RUNNER_TEMP/hosting-RuntimeFunctions.def" >> "$OUT/picker-hosting-release-primary.txt"
+          grep -Fx '         C_CC, AlwaysAvailable,' "$OUT/picker-hosting-release-primary.txt"
       - name: Build and sign the Rust Simulator probe
         if: ${{ !inputs.collect_xctest_headers || inputs.ui_consent_test }}
         shell: bash
@@ -381,7 +455,7 @@ jobs:
           PLIST
           if [ '${{ inputs.xcode_signed_host }}' = true ]; then
             test '${{ inputs.native_uikit_host }}' = true
-            if [ '${{ inputs.selection_inspection_mode }}' = picker-values ]; then
+            if [ '${{ inputs.selection_inspection_mode }}' = picker-values ] || [ '${{ inputs.selection_inspection_mode }}' = picker-hosting ]; then
               test '${{ inputs.authorization_probe }}' = false
             else
               test '${{ inputs.authorization_probe }}' = true
@@ -399,8 +473,8 @@ jobs:
             # when a target has libraries but no compiled/linked object files.
             # Emit our Rust object and its dependency archive in one invocation.
             rustc tools/ios-abi-probe.rs --crate-name ios_xcode_probe --crate-type staticlib --edition 2024 --cfg runtime_probe ${REQUEST_ARGS[@]+"${REQUEST_ARGS[@]}"} --cfg uikit_host --cfg xcode_host ${UI_HOST_ARGS[@]+"${UI_HOST_ARGS[@]}"} ${SELECTION_ARGS[@]+"${SELECTION_ARGS[@]}"} --target aarch64-apple-ios-sim --emit="obj=$XCODE_ROOT/probe.o,link" --print native-static-libs -o "$XCODE_ROOT/libprobe.a" 2> "$OUT/rust-static-link.txt"
-            if [ '${{ inputs.selection_inspection_mode }}' = picker-values ]; then
-              rustc tools/ios-abi-probe.rs --crate-name ios_picker_noauth_check --crate-type staticlib --edition 2024 --cfg runtime_probe --cfg uikit_host --cfg xcode_host ${SELECTION_ARGS[@]+"${SELECTION_ARGS[@]}"} --target aarch64-apple-ios-sim --emit="llvm-ir=$OUT/picker-noauth.ll"
+            if [ '${{ inputs.selection_inspection_mode }}' = picker-values ] || [ '${{ inputs.selection_inspection_mode }}' = picker-hosting ]; then
+              rustc tools/ios-abi-probe.rs --crate-name ios_picker_noauth_check --crate-type staticlib --edition 2024 -D warnings --cfg runtime_probe --cfg uikit_host --cfg xcode_host ${SELECTION_ARGS[@]+"${SELECTION_ARGS[@]}"} --target aarch64-apple-ios-sim --emit="llvm-ir=$OUT/picker-noauth.ll"
               if grep -Eq 'request_probe|async_inspection|swift_task_create|rust_authorization_' "$OUT/picker-noauth.ll"; then exit 1; fi
               printf 'authorization_request_path_compiled=false\n' > "$OUT/picker-noauth-compile-scope.txt"
             fi
@@ -495,8 +569,55 @@ jobs:
           fi
           codesign --display --entitlements :- "$PROBE_APP" > "$OUT/signed-entitlements.plist" 2> "$OUT/signature-diagnostics.txt"
           printf 'PROBE_APP=%s\nXCODE_ROOT=%s\n' "$PROBE_APP" "${XCODE_ROOT:-}" >> "$GITHUB_ENV"
+      - name: Execute the bounded request-free hosting window
+        if: inputs.selection_inspection_mode == 'picker-hosting'
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/ios-sdk-audit"
+          VERSION=$(xcrun --sdk iphonesimulator --show-sdk-version)
+          RUNTIME=$(xcrun simctl list runtimes -j | jq -er --arg version "$VERSION" '[.runtimes[] | select(.isAvailable and .version == $version and (.identifier | contains("iOS"))) | .identifier] | if length == 1 then .[0] else error("SDK-matching Simulator runtime missing or ambiguous") end')
+          SIM_ID=$(xcrun simctl create phone-control1614-hosting com.apple.CoreSimulator.SimDeviceType.iPhone-15 "$RUNTIME")
+          LAUNCH_PID=''
+          trap 'if [ -n "$LAUNCH_PID" ]; then kill "$LAUNCH_PID" 2>/dev/null || true; wait "$LAUNCH_PID" 2>/dev/null || true; fi; xcrun simctl shutdown "$SIM_ID" || true; xcrun simctl delete "$SIM_ID" || true' EXIT
+          xcrun simctl boot "$SIM_ID"
+          xcrun simctl bootstatus "$SIM_ID" -b
+          xcrun simctl install "$SIM_ID" "$PROBE_APP"
+          xcrun simctl launch --console "$SIM_ID" com.autodevjapan.phonecontrol1614abiprobe > "$OUT/singleton-runtime.txt" 2>&1 &
+          LAUNCH_PID=$!
+          READY=false
+          for ((i=0; i<120; i++)); do
+            if grep -Fxq 'Picker hosting capture ready: actual_hosting_window=true; picker_contents_unverified=true' "$OUT/singleton-runtime.txt"; then READY=true; break; fi
+            if ! kill -0 "$LAUNCH_PID" 2>/dev/null; then break; fi
+            sleep 0.1
+          done
+          CAPTURE_STATUS=1
+          if [ "$READY" = true ]; then
+            sleep 2
+            # A real Simulator framebuffer only. Name/scope do not claim the
+            # image contains a usable OS Picker or prove authorization/selection.
+            xcrun simctl io "$SIM_ID" screenshot "$OUT/picker-hosting-window.png" > "$OUT/picker-hosting-capture.txt" 2>&1 && CAPTURE_STATUS=0
+          fi
+          LAUNCH_STATUS=0
+          wait "$LAUNCH_PID" || LAUNCH_STATUS=$?
+          LAUNCH_PID=''
+          sed -n 's/^Picker hosting result: //p' "$OUT/singleton-runtime.txt" > "$OUT/picker-hosting-window-results.txt"
+          grep -E '^Picker hosting entry bytes: ' "$OUT/singleton-runtime.txt" > "$OUT/picker-hosting-bl24-entry.txt" || true
+          printf 'launch_status=%s\ncapture_status=%s\ncapture_scope=actual_hosting_window\nos_picker_contents_verified=false\n' "$LAUNCH_STATUS" "$CAPTURE_STATUS" > "$OUT/picker-hosting-window-scope.txt"
+          cat "$OUT/picker-hosting-window-scope.txt" "$OUT/picker-hosting-window-results.txt" >> "$GITHUB_STEP_SUMMARY"
+          test "$LAUNCH_STATUS" = 0
+          test "$CAPTURE_STATUS" = 0
+          test -s "$OUT/picker-hosting-window.png"
+          RESULTS="$OUT/picker-hosting-window-results.txt"
+          for FIELD in hosting_constructor_calls root_picker_inputs_transferred controller_allocation_reference_releases window_allocation_reference_releases binding_initializer_calls binding_copy_calls binding_destroy_calls picker_constructor_calls picker_copy_calls picker_rust_destroy_calls binding_inputs_transferred; do test "$(grep -Fxc "$FIELD=1" "$RESULTS")" = 1; done
+          for FIELD in hosting_class_identity_verified hosting_superclass_verified root_controller_parent_nil root_view_window_identity_verified window_visible root_detached state_process_pinned; do test "$(grep -Fxc "$FIELD=true" "$RESULTS")" = 1; done
+          for FIELD in authorization_requests status_getter_calls picker_contents_read private_api_calls callbacks_active extra_generic_arguments binding_public_getter_calls binding_public_setter_calls; do test "$(grep -Fxc "$FIELD=0" "$RESULTS")" = 1; done
+          for FIELD in full_teardown_verified state_pointer_cleared selection_contents_output picker_ui_verified tokens_verified grant_verified monitoring_verified shielding_verified; do test "$(grep -Fxc "$FIELD=false" "$RESULTS")" = 1; done
+          for EXPECTED in phase=picker_hosting_window returned_reference_ownership=plus_one sdk_deferred_owners=unknown rust_value_allocations=5 rust_value_deallocations=4; do test "$(grep -Fxc "$EXPECTED" "$RESULTS")" = 1; done
+          test "$(grep -c '^Picker hosting entry bytes: public allocator BL24 initializing helper;' "$OUT/picker-hosting-bl24-entry.txt")" = 1
+          if grep -Eq 'request_probe|SDK singleton class:|Public individual authorization request starting;|Rust async task entry observed;|^Authorization status |^Picker value result:|^Mutable binding result:' "$OUT/singleton-runtime.txt"; then exit 1; fi
       - name: Execute the isolated Simulator inspection
-        if: ${{ !inputs.collect_xctest_headers || inputs.ui_consent_test }}
+        if: ${{ inputs.selection_inspection_mode != 'picker-hosting' && (!inputs.collect_xctest_headers || inputs.ui_consent_test) }}
         shell: bash
         run: |
           set -euo pipefail
@@ -733,6 +854,37 @@ jobs:
           retention-days: 1
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
+        if: always() && inputs.selection_inspection_mode == 'picker-hosting'
+        with:
+          name: ios-picker-hosting-window-audit
+          path: |
+            ${{ runner.temp }}/ios-sdk-audit/picker-hosting-window.png
+            ${{ runner.temp }}/ios-sdk-audit/picker-hosting-window-results.txt
+            ${{ runner.temp }}/ios-sdk-audit/picker-hosting-window-scope.txt
+            ${{ runner.temp }}/ios-sdk-audit/picker-hosting-capture.txt
+            ${{ runner.temp }}/ios-sdk-audit/picker-hosting-bl24-entry.txt
+            ${{ runner.temp }}/ios-sdk-audit/picker-hosting-uikit-declarations.txt
+            ${{ runner.temp }}/ios-sdk-audit/picker-hosting-uikit-candidates.txt
+            ${{ runner.temp }}/ios-sdk-audit/runtime-object_getClass-signature.json
+            ${{ runner.temp }}/ios-sdk-audit/runtime-class_getSuperclass-signature.json
+            ${{ runner.temp }}/ios-sdk-audit/record-CGPoint-layout.json
+            ${{ runner.temp }}/ios-sdk-audit/record-CGSize-layout.json
+            ${{ runner.temp }}/ios-sdk-audit/record-CGRect-layout.json
+            ${{ runner.temp }}/ios-sdk-audit/picker-hosting-generic-abi-primary.txt
+            ${{ runner.temp }}/ios-sdk-audit/picker-hosting-release-primary.txt
+            ${{ runner.temp }}/ios-sdk-audit/picker-hosting-release-export.txt
+            ${{ runner.temp }}/ios-sdk-audit/picker-hosting-public-exports.txt
+            ${{ runner.temp }}/ios-sdk-audit/picker-hosting-public-demangled.txt
+            ${{ runner.temp }}/ios-sdk-audit/picker-noauth-compile-scope.txt
+            ${{ runner.temp }}/ios-sdk-audit/FamilyControls-selected-declarations.json
+            ${{ runner.temp }}/ios-sdk-audit/SwiftUI-selected-declarations.json
+            ${{ runner.temp }}/ios-sdk-audit/rust-static-link.txt
+            ${{ runner.temp }}/ios-sdk-audit/xcode-build.txt
+            ${{ runner.temp }}/ios-sdk-audit/singleton-runtime.txt
+            ${{ runner.temp }}/ios-sdk-audit/versions.txt
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
         if: always() && inputs.selection_inspection_mode == 'none'
         with:
           name: ios-sdk-audit
@@ -740,7 +892,7 @@ jobs:
           retention-days: 1
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
-        if: always() && inputs.selection_inspection_mode != 'none' && inputs.selection_inspection_mode != 'picker-entries' && inputs.selection_inspection_mode != 'picker-values'
+        if: always() && inputs.selection_inspection_mode != 'none' && inputs.selection_inspection_mode != 'picker-entries' && inputs.selection_inspection_mode != 'picker-values' && inputs.selection_inspection_mode != 'picker-hosting'
         with:
           name: ios-selection-layout-audit
           path: |
