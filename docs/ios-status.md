@@ -157,3 +157,23 @@ Apple Developerのログインは完了しておらず、会員・既存署名�
 [Appleの配布許可手順](https://developer.apple.com/documentation/familycontrols/requesting-the-family-controls-entitlement)では、Account HolderによるFamily Controlsの配布許可申請が必要です。使うScreen Time拡張にも申請し、承認後の能力と対応する配布方法を確認します。開発用の能力が存在することを、配布許可の証拠にしません。
 
 これらは共有ToDo1614で継続する条件です。
+
+## 選択画面と表示用クラスの型情報（2026-10-11追加）
+
+[検査PR11](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/pull/11)の[実行38087686599](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38087686599)で、公開のFamilyActivityPickerの型情報とSwiftUI.Viewへの適合、UIHostingControllerの特殊化したクラス情報を取得しました。Pickerはsize146・stride152・alignment8で、表示用クラスの直接の親がUIViewControllerであることを照合しました。
+
+公開初期化子の入口と、その最初の直接呼出し先を最大128バイトの範囲で採取しました。命令を別のファイルへ移した後の表示アドレスは、SDKの呼出し先として使いません。型情報の取得と公開宣言の照合を、画面表示や値の生成とは区別します。
+
+この実行ではPickerと表示用コントローラーの初期化子を呼んでいません。値の生成、画面表示、アプリ選択、選択token、監視、遮蔽は未確認です。前担当が準備したPicker値の生成・コピー・破棄の検査は、別モデルで引数と所有権を確認してから実行します。
+
+## 選択画面の値の生成・コピー・破棄（2026-10-12追加）
+
+[検査PR12](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/pull/12)のソース`666e160`を、[実行38149959145](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/38149959145)で確認しました。Xcodeによるビルドと署名、iOS17.5のSimulatorでの起動、結果照合は全工程成功しました。
+
+Rustが保持する実Bindingの専用コピーを公開のFamilyActivityPicker初期化子へ一度だけ渡しました。Pickerを1回生成し、その値の操作表で1回コピーして、元と複製をそれぞれ破棄しました。入力のBindingの所有権はSDKへ移し、Rustはその入力を二重に破棄しません。Bindingの保存値は、すべてのPickerとBindingの所有者を破棄するまで保持します。
+
+Rustが確保した領域は全体で13個、解放も13個です。残るPickerとBindingの所有者、処理中のcallbackはすべて0で、保存値を指すポインターの解除を確認しました。これらはRustが直接管理する領域と呼出しの集計であり、SDK内部の全確保・全参照の解放を数えた意味ではありません。
+
+レビューで、要求を呼ばない検査にも許可要求の入力を必須にする矛盾が見つかりました。このモードは入力をfalseに限定し、許可要求のコードをコンパイルから除外します。独立して生成したIRにも要求経路の関数がないことを確認してから、Simulatorへ導入します。修正後の別モデルレビューはMust0、CodeQLも成功しました。
+
+今回の結果は、選択画面を構成する値の寿命の確認です。UIHostingControllerの生成・画面表示・利用者によるアプリ選択・選択token・監視・遮蔽・製品への統合・正式配布は未確認です。許可取得の過去の成功を繰り返さず、次は表示用コントローラーと実際の選択へ進めます。

@@ -32,7 +32,12 @@ compile_error!("the permission UI fixture is limited to arm64 iOS Simulator");
 
 #[cfg(all(
     ui_test_host,
-    not(all(runtime_probe, uikit_host, auth_request, xcode_host))
+    not(all(
+        runtime_probe,
+        uikit_host,
+        any(auth_request, picker_value_probe),
+        xcode_host
+    ))
 ))]
 compile_error!("the UI test host requires the Xcode UIKit authorization mode");
 #[cfg(all(ui_test_continue, not(ui_test_bundle)))]
@@ -64,7 +69,7 @@ struct MetadataResponse {
     state: usize,
 }
 
-#[cfg(runtime_probe)]
+#[cfg(all(runtime_probe, not(any(picker_entry_probe, picker_value_probe))))]
 #[link(name = "FamilyControls", kind = "framework")]
 unsafe extern "Swift" {
     // Non-generic accessor: MetadataRequest -> MetadataResponse (Swift 5.10 ABI).
@@ -76,7 +81,7 @@ unsafe extern "Swift" {
 // on Darwin arm64. This Rust-owned assembly boundary preserves the C caller's
 // callee-saved x20 and return address. It makes no type-layout assumptions about
 // the Swift object beyond its documented single class-reference pointer.
-#[cfg(runtime_probe)]
+#[cfg(all(runtime_probe, not(any(picker_entry_probe, picker_value_probe))))]
 core::arch::global_asm!(concat!(
     ".text\n.p2align 2\n.globl _rust_shared_with_metadata\n",
     "_rust_shared_with_metadata:\n.cfi_startproc\n",
@@ -88,19 +93,19 @@ core::arch::global_asm!(concat!(
     ".cfi_def_cfa_offset 0\nret\n.cfi_endproc\n",
 ));
 
-#[cfg(runtime_probe)]
+#[cfg(all(runtime_probe, not(any(picker_entry_probe, picker_value_probe))))]
 unsafe extern "C" {
     fn rust_shared_with_metadata(metadata: *const std::ffi::c_void) -> *mut std::ffi::c_void;
 }
 
-#[cfg(runtime_probe)]
+#[cfg(all(runtime_probe, not(any(picker_entry_probe, picker_value_probe))))]
 #[link(name = "objc")]
 unsafe extern "C" {
     fn object_getClass(object: *mut std::ffi::c_void) -> *const std::ffi::c_void;
     fn class_getName(class: *const std::ffi::c_void) -> *const std::ffi::c_char;
 }
 
-#[cfg(runtime_probe)]
+#[cfg(all(runtime_probe, not(any(picker_entry_probe, picker_value_probe))))]
 fn inspect_singleton() -> *mut std::ffi::c_void {
     // This deliberately does not request authorization or read another app's data.
     // Request 0 means a blocking request for complete metadata.
@@ -435,17 +440,25 @@ mod authorization_status_entry {
     }
 }
 
-#[cfg(all(uikit_host, not(auth_request)))]
+#[cfg(all(uikit_host, not(any(auth_request, picker_value_probe))))]
 compile_error!("UIKit host inspection requires auth_request");
 
-#[cfg(all(runtime_probe, xcode_host, uikit_host, auth_request))]
+#[cfg(all(
+    runtime_probe,
+    xcode_host,
+    uikit_host,
+    any(auth_request, picker_value_probe)
+))]
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_: i32, _: *mut *mut std::ffi::c_char) -> i32 {
     native_host::run();
     1
 }
 
-#[cfg(all(xcode_host, not(all(runtime_probe, uikit_host, auth_request))))]
+#[cfg(all(
+    xcode_host,
+    not(all(runtime_probe, uikit_host, any(auth_request, picker_value_probe)))
+))]
 compile_error!("Xcode static library host requires the UIKit authorization mode");
 
 #[cfg(all(
@@ -453,7 +466,9 @@ compile_error!("Xcode static library host requires the UIKit authorization mode"
         selection_layout_probe,
         binding_entry_probe,
         selection_value_probe,
-        mutable_binding_probe
+        mutable_binding_probe,
+        picker_entry_probe,
+        picker_value_probe
     ),
     any(
         ui_test_host,
@@ -469,7 +484,12 @@ compile_error!("selection inspection cannot be combined with UI or status inspec
 compile_error!("choose either selection entry inspection or value lifecycle");
 #[cfg(all(
     selection_layout_probe,
-    not(all(runtime_probe, uikit_host, auth_request, xcode_host))
+    not(all(
+        runtime_probe,
+        uikit_host,
+        any(auth_request, picker_value_probe),
+        xcode_host
+    ))
 ))]
 compile_error!("selection layout inspection requires the Xcode UIKit authorization host");
 #[cfg(all(binding_entry_probe, not(selection_layout_probe)))]
@@ -480,9 +500,31 @@ compile_error!("selection value lifecycle requires the selection layout mode");
 compile_error!("mutable binding inspection requires the selection layout mode");
 #[cfg(all(mutable_binding_probe, any(binding_entry_probe, selection_value_probe)))]
 compile_error!("mutable binding inspection is a separate finite value experiment");
+#[cfg(all(picker_entry_probe, not(selection_layout_probe)))]
+compile_error!("picker entry inspection requires the selection layout mode");
+#[cfg(all(
+    picker_entry_probe,
+    any(mutable_binding_probe, selection_value_probe, binding_entry_probe)
+))]
+compile_error!("picker entry inspection is a separate metadata-only experiment");
+#[cfg(all(picker_value_probe, auth_request))]
+compile_error!("picker value inspection excludes authorization request code");
+#[cfg(all(picker_value_probe, not(selection_layout_probe)))]
+compile_error!("picker values require the selection inspection host");
+#[cfg(all(
+    picker_value_probe,
+    any(
+        picker_entry_probe,
+        mutable_binding_probe,
+        selection_value_probe,
+        binding_entry_probe
+    )
+))]
+compile_error!("picker values are a separate finite lifecycle experiment");
 
 // Layout and entry-byte evidence only; no Selection or Binding value is built.
 #[cfg(selection_layout_probe)]
+#[cfg_attr(any(picker_entry_probe, picker_value_probe), allow(dead_code))]
 mod selection_layout {
     use super::MetadataResponse;
     use std::ffi::{CString, c_char, c_void};
@@ -524,10 +566,10 @@ mod selection_layout {
     unsafe extern "C" {
         fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
         fn getpagesize() -> i32;
-        #[cfg(binding_entry_probe)]
+        #[cfg(any(binding_entry_probe, picker_entry_probe))]
         fn dladdr(address: *const c_void, information: *mut DlInfo) -> i32;
     }
-    #[cfg(binding_entry_probe)]
+    #[cfg(any(binding_entry_probe, picker_entry_probe))]
     #[repr(C)]
     struct DlInfo {
         filename: *const c_char,
@@ -577,11 +619,14 @@ mod selection_layout {
         unsafe { pointer.read() }
     }
     fn entry_bytes(label: &str, pointer: *const c_void, page: usize) {
+        prefix_bytes("Selection", label, pointer, page);
+    }
+    pub(super) fn prefix_bytes(scope: &str, label: &str, pointer: *const c_void, page: usize) {
         // This is a bounded entry prefix, not a claim about argument registers,
         // ownership, or a whole function. Do not follow branches or call it.
         let count = 128.min(page_remaining(pointer, page));
         let bytes = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), count) };
-        print!("Selection entry bytes: {label}; length={count}; hex=");
+        print!("{scope} entry bytes: {label}; length={count}; hex=");
         for byte in bytes {
             print!("{byte:02x}");
         }
@@ -589,6 +634,17 @@ mod selection_layout {
     }
     #[cfg(binding_entry_probe)]
     fn control_transfer_prefixes(label: &str, entry: *const c_void, page: usize) {
+        bounded_control_transfer_prefixes("Binding", "Selection", label, entry, page, false);
+    }
+    #[cfg(any(binding_entry_probe, picker_entry_probe))]
+    pub(super) fn bounded_control_transfer_prefixes(
+        scope: &str,
+        byte_scope: &str,
+        label: &str,
+        entry: *const c_void,
+        page: usize,
+        first_only: bool,
+    ) {
         // Inspect a bounded straight-line prefix, stopping at its first branch,
         // indirect call or return. A getter may forward with B; a setter may
         // call indirectly. Bytes after those edges are not its executed prefix.
@@ -615,7 +671,7 @@ mod selection_layout {
                     "conditional_branch"
                 };
                 println!(
-                    "Binding control transfer: {label}; source_offset={offset}; kind={kind}; target_read=false"
+                    "{scope} control transfer: {label}; source_offset={offset}; kind={kind}; target_read=false"
                 );
                 return;
             }
@@ -661,23 +717,24 @@ mod selection_layout {
                 && source_info.base == target_info.base
             {
                 println!(
-                    "Binding control transfer: {label}; source_offset={offset}; kind={kind}; relative_bytes={relative}; same_image=true"
+                    "{scope} control transfer: {label}; source_offset={offset}; kind={kind}; relative_bytes={relative}; same_image=true"
                 );
-                entry_bytes(
+                prefix_bytes(
+                    byte_scope,
                     &format!("{label}.offset{offset} {kind} target"),
                     target,
                     page,
                 );
             } else {
                 println!(
-                    "Binding control transfer: {label}; source_offset={offset}; kind={kind}; skipped_cross_image=true"
+                    "{scope} control transfer: {label}; source_offset={offset}; kind={kind}; skipped_cross_image=true"
                 );
             }
-            if direct_branch {
+            if first_only || direct_branch {
                 return;
             }
         }
-        println!("Binding control transfer: {label}; straight_line_prefix_end=true");
+        println!("{scope} control transfer: {label}; straight_line_prefix_end=true");
     }
 
     fn layout(label: &str, response: MetadataResponse, page: usize) -> usize {
@@ -800,6 +857,183 @@ mod selection_layout {
             "Selection layout inspection complete; phase=layout; selection_values_constructed=0; selection_values_read=0; initializer_calls=0; closure_calls=0; value_witness_calls=0; authorization_requests=0; authorization_status_verified=false; monitoring=false; shielding=false"
         );
         selection_pointer
+    }
+}
+
+// Prerequisite only: metadata and bounded public code prefixes, no Picker value
+// or hosting instance. Constructor registers/ownership remain unverified.
+#[cfg(all(picker_entry_probe, selection_layout_probe))]
+mod picker_entry {
+    use super::MetadataResponse;
+    use super::selection_layout::{
+        ValueWitnessTable, bounded_control_transfer_prefixes, prefix_bytes, read, resolve,
+    };
+    use std::ffi::{c_char, c_void};
+
+    #[link(name = "swiftCore")]
+    unsafe extern "C" {
+        // swift-5.10-RELEASE include/swift/Runtime/RuntimeFunctions.def:1636:
+        // C_CC, WitnessTablePtrTy, (TypeMetadataPtrTy, ProtocolDescriptorPtrTy).
+        // ProtocolConformance.cpp:1185 accepts an unsigned descriptor pointer
+        // and signs it internally; use neither conformsToProtocol2 nor a PAC shim.
+        fn swift_conformsToProtocol(
+            metadata: *const c_void,
+            protocol: *const c_void,
+        ) -> *const c_void;
+    }
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn class_getSuperclass(class: *const c_void) -> *const c_void;
+    }
+    #[link(name = "System")]
+    unsafe extern "C" {
+        fn getpagesize() -> i32;
+    }
+
+    pub(super) fn inspect() {
+        let page = unsafe { getpagesize() };
+        assert!(page > 0, "invalid Darwin page size");
+        let page = page as usize;
+        // Primary Swift 5.10 ABI/Metadata.h:3529/3546 declares SwiftCC Fn0/Fn2.
+        // IRGen/GenMeta.cpp:2630 + GenericArguments.h:56 collect nominal generic
+        // requirements. ABI/TypeMetadata.rst Generic Argument Vector orders type
+        // metadata before conformance witnesses. Exact SDK guards require a
+        // nongeneric Picker struct and UIHostingController<Content: SwiftUI.View>:
+        // Fn2(request, Content metadata, Content:View witness), no Binding Self.
+        let picker_accessor: unsafe extern "Swift" fn(usize) -> MetadataResponse =
+            unsafe { std::mem::transmute(resolve(env!("PICKER_METADATA_SYMBOL"))) };
+        let hosting_accessor: unsafe extern "Swift" fn(
+            usize,
+            *const c_void,
+            *const c_void,
+        ) -> MetadataResponse =
+            unsafe { std::mem::transmute(resolve(env!("HOSTING_METADATA_SYMBOL"))) };
+        let picker = unsafe { picker_accessor(0) };
+        assert!(
+            picker.state == 0 && !picker.value.is_null(),
+            "incomplete Picker metadata"
+        );
+        assert!(
+            unsafe { read(picker.value.cast::<usize>(), page) } == 0x200,
+            "Picker metadata must be a struct"
+        );
+        let witnesses = unsafe {
+            read(
+                picker
+                    .value
+                    .cast::<*const ValueWitnessTable>()
+                    .wrapping_sub(1),
+                page,
+            )
+        };
+        assert!(!witnesses.is_null(), "null Picker value witness table");
+        let size = unsafe { read(&raw const (*witnesses).size, page) };
+        let stride = unsafe { read(&raw const (*witnesses).stride, page) };
+        let flags = unsafe { read(&raw const (*witnesses).flags, page) };
+        let alignment = (flags as usize & 0xff) + 1;
+        // MetadataValues.h: AlignmentMask, Incomplete and IsNonPOD. Record POD
+        // polarity rather than assuming a payload shape or a concrete size.
+        assert!(flags & 0x0040_0000 == 0, "incomplete Picker value layout");
+        assert!(
+            size <= 65536 && stride <= 65536 && alignment.is_power_of_two(),
+            "Picker layout outside inspection bounds"
+        );
+        assert!(
+            stride == ((size + alignment - 1) & !(alignment - 1)).max(1),
+            "invalid Picker stride"
+        );
+        let pod = flags & 0x0001_0000 == 0;
+        println!(
+            "Picker/hosting layout: FamilyActivityPicker; size={size}; stride={stride}; alignment={alignment}; flags={flags:#010x}; pod={pod}; metadata_complete=true; kind_struct=true"
+        );
+
+        let protocol = resolve(env!("VIEW_PROTOCOL_SYMBOL"));
+        let witness = unsafe { swift_conformsToProtocol(picker.value, protocol) };
+        assert!(
+            !witness.is_null(),
+            "Picker has no SwiftUI.View conformance witness"
+        );
+        println!(
+            "Picker/hosting conformance: FamilyActivityPicker:SwiftUI.View; witness_nonnull=true; conformance_calls=1"
+        );
+        let hosting = unsafe { hosting_accessor(0, picker.value, witness) };
+        assert!(
+            hosting.state == 0 && !hosting.value.is_null(),
+            "incomplete hosting metadata"
+        );
+        // Metadata.h:288: Swift class metadata is itself an ObjC class object.
+        // Do not use object_getClass (which would inspect the metaclass).
+        let controller = unsafe { objc_getClass(c"UIViewController".as_ptr()) }.cast_const();
+        assert!(!controller.is_null(), "UIViewController class is missing");
+        let mut class = hosting.value;
+        let mut depth = 0;
+        while class != controller && depth < 16 {
+            assert!(
+                !class.is_null(),
+                "hosting superclass chain ended before UIViewController"
+            );
+            class = unsafe { class_getSuperclass(class) };
+            depth += 1;
+        }
+        assert!(
+            class == controller,
+            "hosting superclass chain exceeds inspection bound"
+        );
+        println!(
+            "Picker/hosting class: UIHostingController<FamilyActivityPicker>; metadata_complete=true; uiviewcontroller_reached=true; superclass_steps={depth}; superclass_bound=16"
+        );
+        for (label, symbol) in [
+            (
+                "FamilyActivityPicker.init(selection:)",
+                env!("PICKER_INIT_SYMBOL"),
+            ),
+            (
+                "UIHostingController.init(rootView:) allocating",
+                env!("HOSTING_INIT_SYMBOL"),
+            ),
+        ] {
+            let entry = resolve(symbol);
+            prefix_bytes("Picker/hosting", label, entry, page);
+            // Stop at the first B/BL or other control edge. Follow one direct
+            // same-image target prefix at most, without recursion or invocation.
+            // No ADRP reconstruction is used as an address or SDK symbol.
+            bounded_control_transfer_prefixes(
+                "Picker/hosting",
+                "Picker/hosting",
+                label,
+                entry,
+                page,
+                true,
+            );
+        }
+        for result in [
+            "phase=picker_hosting_entry",
+            "picker_metadata_calls=1",
+            "hosting_metadata_calls=1",
+            "conformance_calls=1",
+            "picker_constructor_calls=0",
+            "hosting_constructor_calls=0",
+            "picker_values_constructed=0",
+            "hosting_instances_constructed=0",
+            "value_witness_calls=0",
+            "box_api_calls=0",
+            "authorization_requests=0",
+            "status_getter_calls=0",
+            "private_api_calls=0",
+            "private_api_reads=0",
+            "entry_prefix_max_bytes=128",
+            "entry_reads_page_bounded=true",
+            "direct_helper_max_depth=1",
+            "metadata_inspection_verified=true",
+            "constructor_arguments_verified=false",
+            "constructor_ownership_verified=false",
+            "picker_ui_verified=false",
+            "selection_contents_output=false",
+            "reconstructed_addresses_used=false",
+        ] {
+            println!("Picker/hosting result: {result}");
+        }
     }
 }
 
@@ -1139,7 +1373,7 @@ mod selection_value {
 // Finite, request-free mutable value experiment. Evidence: Selection VWT
 // run38077219284, category entry run38082809973, and null-context boundary
 // research050528 (Swift 5.10 SILFunctionType/CallingConvention/HeapObject).
-#[cfg(all(mutable_binding_probe, selection_layout_probe))]
+#[cfg(all(any(mutable_binding_probe, picker_value_probe), selection_layout_probe))]
 mod mutable_binding {
     use super::MetadataResponse;
     use super::selection_layout::{ValueWitnessTable, read, resolve};
@@ -1405,6 +1639,8 @@ mod mutable_binding {
         verified: AtomicBool,
         comparisons: [AtomicBool; 5],
         started: Instant,
+        #[cfg(picker_value_probe)]
+        picker: picker_values::Proof,
     }
     impl Proof {
         fn new() -> Self {
@@ -1413,6 +1649,8 @@ mod mutable_binding {
                 verified: AtomicBool::new(false),
                 comparisons: std::array::from_fn(|_| AtomicBool::new(false)),
                 started: Instant::now(),
+                #[cfg(picker_value_probe)]
+                picker: picker_values::Proof::new(),
             }
         }
         fn inc(&self, c: Count) {
@@ -1432,6 +1670,8 @@ mod mutable_binding {
             );
         }
         fn emit(&self) {
+            #[cfg(picker_value_probe)]
+            self.picker.emit(self);
             println!("Mutable binding result: phase=mutable_value");
             println!(
                 "Mutable binding result: mutable_binding_verified={}",
@@ -1573,11 +1813,19 @@ mod mutable_binding {
             let result = unsafe {
                 (self.witnesses.initialize)(self.ptr(), source.ptr(), self.witnesses.metadata)
             };
-            self.initialized = true;
+            #[cfg(not(picker_value_probe))]
+            {
+                self.initialized = true;
+            }
             assert!(
                 result == self.ptr(),
                 "mutable copy returned another destination"
             );
+            #[cfg(picker_value_probe)]
+            {
+                // Never destroy a copy of unknown initialization on failure.
+                self.initialized = true;
+            }
             self.proof.inc(Count::Returned);
         }
         fn compare(&self, other: &Self, slot: usize, equal: bool) {
@@ -1603,9 +1851,12 @@ mod mutable_binding {
             // The generic accessor receives Binding<Value> metadata, then
             // projects its Value argument at +16. The initializer instead
             // receives the direct Value metadata argument.
+            #[cfg(not(picker_value_probe))]
             unsafe {
                 rust_mutable_binding_get(self.ptr(), output.ptr(), self.witnesses.metadata, entry)
             };
+            #[cfg(picker_value_probe)]
+            picker_values::get_binding(self, output, entry);
             output.initialized = true; // only after the public getter returns
             assert!(
                 self.proof.n(Count::ClosureGet) > before,
@@ -1623,9 +1874,12 @@ mod mutable_binding {
             input.taken = true;
             self.proof.inc(Count::Taken);
             self.proof.inc(Count::PublicSet);
+            #[cfg(not(picker_value_probe))]
             unsafe {
                 rust_mutable_binding_set(self.ptr(), input.ptr(), self.witnesses.metadata, entry)
             };
+            #[cfg(picker_value_probe)]
+            picker_values::set_binding(self, input, entry);
         }
     }
     impl Drop for Value<'_> {
@@ -1918,9 +2172,24 @@ mod mutable_binding {
         let page = unsafe { getpagesize() };
         assert!(page > 0);
         let page = page as usize;
+        #[cfg(picker_value_probe)]
+        let metadata = {
+            assert!(
+                metadata.is_null(),
+                "Picker mode must query its own Selection metadata"
+            );
+            let accessor: unsafe extern "Swift" fn(usize) -> MetadataResponse =
+                unsafe { std::mem::transmute(resolve(env!("SELECTION_METADATA_SYMBOL"))) };
+            proof.picker.inc(picker_values::Count::SelectionMetadata);
+            let response = unsafe { accessor(0) };
+            assert!(response.state == 0 && !response.value.is_null());
+            response.value
+        };
         let selection = Witnesses::load(metadata, 56, page);
         let accessor: unsafe extern "Swift" fn(usize, *const c_void) -> MetadataResponse =
             unsafe { std::mem::transmute(resolve(env!("BINDING_METADATA_SYMBOL"))) };
+        #[cfg(picker_value_probe)]
+        proof.picker.inc(picker_values::Count::BindingMetadata);
         let response = unsafe { accessor(0, metadata) };
         assert!(
             response.state == 0 && !response.value.is_null(),
@@ -1940,6 +2209,8 @@ mod mutable_binding {
         let get = resolve(env!("BINDING_GET_SYMBOL"));
         let set = resolve(env!("BINDING_SET_SYMBOL"));
         verify_entries(category, init, get, set, page);
+        #[cfg(picker_value_probe)]
+        let picker_plan = picker_values::Plan::load(&proof, page);
         let mut initial = Value::allocate(&selection, &proof, false);
         initial.category(false, category);
         let mut changed = Value::allocate(&selection, &proof, false);
@@ -1952,6 +2223,7 @@ mod mutable_binding {
         let state = Installed::install(stable, &proof);
         let mut binding = Value::allocate(&binding_type, &proof, true);
         proof.inc(Count::BindingInit);
+        #[cfg(not(picker_value_probe))]
         unsafe {
             rust_mutable_binding_init(
                 binding.ptr(),
@@ -1961,6 +2233,12 @@ mod mutable_binding {
                 init,
             )
         };
+        #[cfg(picker_value_probe)]
+        picker_values::initialize_binding(
+            &binding,
+            picker_values::SelectionValueMetadata(metadata),
+            init,
+        );
         binding.initialized = true;
         // Copy/destroy the ENTIRE initialized Binding using its own VWT, then
         // continue with the copy after destroying the original allocation.
@@ -1998,6 +2276,8 @@ mod mutable_binding {
         drop(first);
         drop(after);
         drop(last);
+        #[cfg(picker_value_probe)]
+        picker_plan.execute(&binding_copy, &proof);
         drop(binding_copy); // no remaining owned Binding or callable closure
         assert!(proof.n(Count::Active) == 0);
         drop(state);
@@ -2008,7 +2288,7 @@ mod mutable_binding {
             proof.n(Count::Alloc) == proof.n(Count::Dealloc)
                 && proof.n(Count::Category) == 2
                 && proof.n(Count::BindingInit) == 1
-                && proof.n(Count::BindingCopy) == 1
+                && proof.n(Count::BindingCopy) == 1 + usize::from(cfg!(picker_value_probe))
                 && proof.n(Count::BindingDestroy) == 2
                 && proof.n(Count::PublicGet) == 3
                 && proof.n(Count::PublicSet) == 2
@@ -2026,11 +2306,415 @@ mod mutable_binding {
                 && proof.n(Count::Active) == 0,
             "mutable lifecycle counts inconsistent"
         );
+        #[cfg(picker_value_probe)]
+        proof.picker.verify(&proof);
         proof.verified.store(true, Ordering::SeqCst);
+    }
+
+    // Parent must review this new unsafe boundary before any Mac execution.
+    // Picker-only: no hosting allocator, controller instance, rootView access,
+    // presentation, token inspection or authorization. The old mutable-mode
+    // bridges, category/Binding guards and false->true->false proof are retained.
+    #[cfg(picker_value_probe)]
+    mod picker_values {
+        use super::*;
+        core::arch::global_asm!(
+            ".text",
+            ".p2align 2",
+            ".globl _rust_picker_value_init",
+            "_rust_picker_value_init:",
+            ".cfi_startproc",
+            "stp x20, x30, [sp, #-16]!",
+            ".cfi_def_cfa_offset 16",
+            ".cfi_offset 20, -16",
+            ".cfi_offset 30, -8",
+            "mov x8, x0", // C dst -> Swift indirect result (zeroed stride 152).
+            "mov x0, x1", // C input -> Swift owned indirect Binding (72 bytes).
+            "blr x2",     // Nongeneric struct allocator: no extra generic args.
+            "ldp x20, x30, [sp], #16",
+            ".cfi_restore 20",
+            ".cfi_restore 30",
+            ".cfi_def_cfa_offset 0",
+            "ret",
+            ".cfi_endproc",
+        );
+        unsafe extern "C" {
+            fn rust_picker_value_init(dst: *mut c_void, input: *mut c_void, entry: *const c_void);
+            fn swift_conformsToProtocol(
+                metadata: *const c_void,
+                protocol: *const c_void,
+            ) -> *const c_void;
+            fn objc_getClass(name: *const c_char) -> *mut c_void;
+            fn class_getSuperclass(class: *const c_void) -> *const c_void;
+        }
+        // Different C shim wrappers deliberately distinguish Value for init
+        // from Binding Self for public get/set (the latter project Value +16).
+        pub(super) struct SelectionValueMetadata(pub(super) *const c_void);
+        struct BindingSelfMetadata(*const c_void);
+        pub(super) fn initialize_binding(
+            value: &Value<'_>,
+            metadata: SelectionValueMetadata,
+            entry: *const c_void,
+        ) {
+            unsafe {
+                rust_mutable_binding_init(
+                    value.ptr(),
+                    rust_mutable_get_closure as *const c_void,
+                    rust_mutable_set_closure as *const c_void,
+                    metadata.0,
+                    entry,
+                )
+            };
+        }
+        fn binding_self(value: &Value<'_>) -> BindingSelfMetadata {
+            assert!(value.binding && value.initialized && !value.taken);
+            BindingSelfMetadata(value.witnesses.metadata)
+        }
+        pub(super) fn get_binding(value: &Value<'_>, output: &Value<'_>, entry: *const c_void) {
+            let metadata = binding_self(value);
+            unsafe { rust_mutable_binding_get(value.ptr(), output.ptr(), metadata.0, entry) };
+        }
+        pub(super) fn set_binding(value: &Value<'_>, input: &Value<'_>, entry: *const c_void) {
+            let metadata = binding_self(value);
+            unsafe { rust_mutable_binding_set(value.ptr(), input.ptr(), metadata.0, entry) };
+        }
+        #[derive(Clone, Copy)]
+        pub(super) enum Count {
+            SelectionMetadata,
+            BindingMetadata,
+            PickerMetadata,
+            HostingMetadata,
+            Conformance,
+            ClassLookup,
+            Superclass,
+            Constructor,
+            Constructed,
+            Copy,
+            Destroy,
+            Alloc,
+            Free,
+            Transferred,
+            Returned,
+        }
+        const NAMES: [&str; 15] = [
+            "selection_metadata_calls",
+            "binding_metadata_calls",
+            "picker_metadata_calls",
+            "hosting_metadata_calls",
+            "conformance_calls",
+            "class_lookup_calls",
+            "superclass_calls",
+            "picker_constructor_calls",
+            "picker_values_constructed",
+            "picker_initialize_with_copy_calls",
+            "picker_destroy_calls",
+            "picker_allocations",
+            "picker_deallocations",
+            "binding_inputs_transferred",
+            "picker_returned_destination_checks",
+        ];
+        pub(super) struct Proof {
+            counts: [AtomicUsize; 15],
+            guarded: AtomicBool,
+        }
+        impl Proof {
+            pub(super) fn new() -> Self {
+                Self {
+                    counts: std::array::from_fn(|_| AtomicUsize::new(0)),
+                    guarded: AtomicBool::new(false),
+                }
+            }
+            pub(super) fn inc(&self, count: Count) {
+                self.counts[count as usize].fetch_add(1, Ordering::SeqCst);
+            }
+            fn n(&self, count: Count) -> usize {
+                self.counts[count as usize].load(Ordering::SeqCst)
+            }
+            pub(super) fn emit(&self, outer: &super::Proof) {
+                println!("Picker value result: phase=picker_value_lifecycle");
+                println!(
+                    "Picker value result: lifecycle_verified={}",
+                    outer.verified.load(Ordering::SeqCst)
+                );
+                println!(
+                    "Picker value result: constructor_guards_verified={}",
+                    self.guarded.load(Ordering::SeqCst)
+                );
+                for (i, name) in NAMES.iter().enumerate() {
+                    println!(
+                        "Picker value result: {name}={}",
+                        self.counts[i].load(Ordering::SeqCst)
+                    );
+                }
+                // These are Rust-owned buffer/VWT call counters, not counts of
+                // SDK allocations, internal destroys or global/static teardown.
+                println!(
+                    "Picker value result: all_owned_allocations={}",
+                    outer.n(super::Count::Alloc) + self.n(Count::Alloc)
+                );
+                println!(
+                    "Picker value result: all_owned_deallocations={}",
+                    outer.n(super::Count::Dealloc) + self.n(Count::Free)
+                );
+                println!(
+                    "Picker value result: callbacks_active={}",
+                    outer.n(super::Count::Active)
+                );
+                println!(
+                    "Picker value result: state_pointer_cleared={}",
+                    STATE.load(Ordering::SeqCst).is_null()
+                );
+                println!(
+                    "Picker value result: outstanding_picker_owners={}",
+                    (self.n(Count::Constructed) + self.n(Count::Copy))
+                        .saturating_sub(self.n(Count::Destroy))
+                );
+                println!(
+                    "Picker value result: outstanding_binding_owners={}",
+                    (outer.n(super::Count::BindingInit) + outer.n(super::Count::BindingCopy))
+                        .saturating_sub(
+                            outer.n(super::Count::BindingDestroy) + self.n(Count::Transferred)
+                        )
+                );
+                for field in [
+                    "hosting_constructor_calls",
+                    "hosting_instances_constructed",
+                    "authorization_requests",
+                    "status_getter_calls",
+                    "private_api_calls",
+                    "private_api_reads",
+                    "picker_contents_read",
+                ] {
+                    println!("Picker value result: {field}=0");
+                }
+                for field in [
+                    "picker_ui_verified",
+                    "tokens_verified",
+                    "monitoring_verified",
+                    "shielding_verified",
+                    "selection_contents_output",
+                    "selection_addresses_output",
+                    "reconstructed_addresses_used",
+                ] {
+                    println!("Picker value result: {field}=false");
+                }
+            }
+            pub(super) fn verify(&self, outer: &super::Proof) {
+                for count in [
+                    Count::SelectionMetadata,
+                    Count::BindingMetadata,
+                    Count::PickerMetadata,
+                    Count::HostingMetadata,
+                    Count::Conformance,
+                    Count::ClassLookup,
+                    Count::Superclass,
+                    Count::Constructor,
+                    Count::Constructed,
+                    Count::Copy,
+                    Count::Transferred,
+                    Count::Returned,
+                ] {
+                    assert!(self.n(count) == 1, "Picker phase counter mismatch");
+                }
+                assert!(
+                    self.n(Count::Destroy) == 2
+                        && self.n(Count::Alloc) == 2
+                        && self.n(Count::Free) == 2
+                );
+                assert!(outer.n(super::Count::Alloc) == 11 && outer.n(super::Count::Dealloc) == 11);
+                assert!(
+                    self.guarded.load(Ordering::SeqCst) && STATE.load(Ordering::SeqCst).is_null()
+                );
+            }
+        }
+        pub(super) struct Plan {
+            witnesses: Witnesses,
+            entry: *const c_void,
+        }
+        impl Plan {
+            pub(super) fn load(proof: &super::Proof, page: usize) -> Self {
+                proof.check();
+                // Swift 5.10 Metadata.h Fn0/Fn2, RuntimeFunctions.def C_CC
+                // conformsToProtocol, and actual run38087686599 metadata.
+                let accessor: unsafe extern "Swift" fn(usize) -> MetadataResponse =
+                    unsafe { std::mem::transmute(resolve(env!("PICKER_METADATA_SYMBOL"))) };
+                proof.picker.inc(Count::PickerMetadata);
+                let response = unsafe { accessor(0) };
+                assert!(response.state == 0 && !response.value.is_null());
+                let metadata = response.value;
+                assert!(unsafe { read(metadata.cast::<usize>(), page) } == 0x200);
+                let table = unsafe {
+                    read(
+                        metadata.cast::<*const ValueWitnessTable>().wrapping_sub(1),
+                        page,
+                    )
+                };
+                assert!(!table.is_null());
+                assert!(unsafe { read(&raw const (*table).size, page) } == 146);
+                assert!(unsafe { read(&raw const (*table).stride, page) } == 152);
+                assert!(unsafe { read(&raw const (*table).flags, page) } == 0x0003_0007);
+                let slot = |index| {
+                    let p = unsafe {
+                        read(
+                            (&raw const (*table).functions)
+                                .cast::<*const c_void>()
+                                .add(index),
+                            page,
+                        )
+                    };
+                    assert!(!p.is_null() && p.addr() % 4 == 0);
+                    p
+                };
+                let witnesses = Witnesses {
+                    metadata,
+                    size: 146,
+                    layout: Layout::from_size_align(152, 8).unwrap(),
+                    destroy: unsafe { std::mem::transmute::<*const c_void, Destroy>(slot(1)) },
+                    initialize: unsafe { std::mem::transmute::<*const c_void, Copy>(slot(2)) },
+                    assign: unsafe { std::mem::transmute::<*const c_void, Copy>(slot(3)) },
+                };
+                let protocol = resolve(env!("VIEW_PROTOCOL_SYMBOL"));
+                proof.picker.inc(Count::Conformance);
+                let witness = unsafe { swift_conformsToProtocol(metadata, protocol) };
+                assert!(!witness.is_null());
+                let hosting_accessor: unsafe extern "Swift" fn(
+                    usize,
+                    *const c_void,
+                    *const c_void,
+                )
+                    -> MetadataResponse =
+                    unsafe { std::mem::transmute(resolve(env!("HOSTING_METADATA_SYMBOL"))) };
+                proof.picker.inc(Count::HostingMetadata);
+                let hosting = unsafe { hosting_accessor(0, metadata, witness) };
+                assert!(hosting.state == 0 && !hosting.value.is_null());
+                proof.picker.inc(Count::ClassLookup);
+                let controller =
+                    unsafe { objc_getClass(c"UIViewController".as_ptr()) }.cast_const();
+                assert!(!controller.is_null());
+                proof.picker.inc(Count::Superclass);
+                assert!(unsafe { class_getSuperclass(hosting.value) } == controller);
+                let entry = resolve(env!("PICKER_INIT_SYMBOL"));
+                // ORIGINAL SDK bytes (entries.txt), not addresses displayed by
+                // the relocated prefix .o. Nongeneric public init reads all 72
+                // bytes from x0 and saves x8 in x19 before its first BL64.
+                for (offset, expected) in [
+                    (0, 0xd101_c3ff),
+                    (4, 0xa902_67fa),
+                    (8, 0xa903_5ff8),
+                    (12, 0xa904_57f6),
+                    (16, 0xa905_4ff4),
+                    (20, 0xa906_7bfd),
+                    (24, 0x9101_83fd),
+                    (28, 0xaa08_03f3),
+                    (32, 0xa940_5815),
+                    (36, 0x3940_4017),
+                    (40, 0x3cc1_8001),
+                    (44, 0x3cc2_8000),
+                    (48, 0xad00_07e0),
+                    (52, 0xa943_e418),
+                ] {
+                    assert!(
+                        word(entry, offset, page) == expected,
+                        "Picker public argument prefix changed"
+                    );
+                }
+                assert!(word(entry, 56, page) & 0x9f00_001f == 0x9000_0000);
+                assert!(word(entry, 60, page) & 0xffc0_03ff == 0x9100_0000);
+                let helper = branch(entry, 64, true, page);
+                assert!(word(helper, 0, page) & 0x9f00_001f == 0x9000_0010);
+                assert!(word(helper, 4, page) & 0xffc0_03ff == 0xf940_0210);
+                assert!(word(helper, 8, page) == 0xd61f_0200);
+                // SILFunctionType.cpp 2515-2622/2717: allocator/initializer
+                // normal params Owned => Indirect_In, never borrowed. Calling
+                // Convention.rst 261-276 transfers the returned value to caller.
+                // Hosting PUBLIC entry would require x0=root, x20=metatype;
+                // its first BL12 saves x0 in x19 internally. We do NOT call it:
+                // BL24 helper/collection behavior remain a later review boundary.
+                proof.picker.guarded.store(true, Ordering::SeqCst);
+                println!(
+                    "Picker value entry guards: public_x0_binding=true; public_x8_result=true; input_size=72; result_stride=152; alignment=8; nonpod=true; first_bl64_stub=true; extra_generic_arguments=0; owned_normal_parameter=true"
+                );
+                Self { witnesses, entry }
+            }
+            pub(super) fn execute(&self, binding: &Value<'_>, proof: &super::Proof) {
+                proof.check();
+                let self_metadata = binding_self(binding);
+                assert!(self_metadata.0 == binding.witnesses.metadata);
+                let mut input = Value::allocate(binding.witnesses, proof, true);
+                input.copy(binding); // Entire Binding VWT; keep original owner.
+                let mut picker = Owned::allocate(&self.witnesses, proof);
+                assert!(input.ptr().addr() % 8 == 0 && picker.ptr().addr() % 8 == 0);
+                assert!(input.initialized && !input.taken && !picker.initialized);
+                // Mark consumed BEFORE the foreign call, retain its buffer until
+                // return. A failure never destroys an unknown partial Picker.
+                input.initialized = false;
+                input.taken = true;
+                proof.picker.inc(Count::Transferred);
+                proof.picker.inc(Count::Constructor);
+                unsafe { rust_picker_value_init(picker.ptr(), input.ptr(), self.entry) };
+                picker.initialized = true;
+                proof.picker.inc(Count::Constructed);
+                drop(input); // Allocation only, never Binding destroy.
+                proof.check();
+                let mut copied = Owned::allocate(&self.witnesses, proof);
+                assert!(picker.initialized && !copied.initialized && copied.ptr() != picker.ptr());
+                proof.picker.inc(Count::Copy);
+                let result = unsafe {
+                    (self.witnesses.initialize)(copied.ptr(), picker.ptr(), self.witnesses.metadata)
+                };
+                assert!(
+                    result == copied.ptr(),
+                    "Picker VWT returned another destination"
+                );
+                copied.initialized = true;
+                proof.picker.inc(Count::Returned);
+                // No byte reads: Picker may have undefined padding. Only the
+                // existing fully initialized Selection opaque comparisons run.
+                drop(copied);
+                drop(picker);
+                assert!(proof.n(super::Count::Active) == 0);
+                // Binding original and boxed stable Selection still live here;
+                // the caller destroys both Binding owners before clearing STATE.
+            }
+        }
+        struct Owned<'a> {
+            pointer: NonNull<u8>,
+            initialized: bool,
+            witnesses: &'a Witnesses,
+            proof: &'a super::Proof,
+        }
+        impl<'a> Owned<'a> {
+            fn allocate(witnesses: &'a Witnesses, proof: &'a super::Proof) -> Self {
+                let pointer = NonNull::new(unsafe { alloc_zeroed(witnesses.layout) })
+                    .expect("Picker allocation failed");
+                assert!(pointer.as_ptr().addr() % witnesses.layout.align() == 0);
+                proof.picker.inc(Count::Alloc);
+                Self {
+                    pointer,
+                    initialized: false,
+                    witnesses,
+                    proof,
+                }
+            }
+            fn ptr(&self) -> *mut c_void {
+                self.pointer.as_ptr().cast()
+            }
+        }
+        impl Drop for Owned<'_> {
+            fn drop(&mut self) {
+                if self.initialized {
+                    self.initialized = false;
+                    self.proof.picker.inc(Count::Destroy);
+                    unsafe { (self.witnesses.destroy)(self.ptr(), self.witnesses.metadata) };
+                }
+                unsafe { dealloc(self.pointer.as_ptr(), self.witnesses.layout) };
+                self.proof.picker.inc(Count::Free);
+            }
+        }
     }
 }
 
-#[cfg(runtime_probe)]
+#[cfg(all(runtime_probe, not(picker_value_probe)))]
 #[cfg_attr(any(uikit_host, authorization_status_entry_probe), allow(dead_code))]
 mod async_inspection {
     use std::ffi::c_void;
@@ -2798,9 +3482,15 @@ mod ui_authorization_test {
     static REGISTER: unsafe extern "C" fn() = register;
 }
 
-#[cfg(all(runtime_probe, uikit_host, auth_request))]
+#[cfg(all(runtime_probe, uikit_host, any(auth_request, picker_value_probe)))]
 mod native_host {
+    #[cfg(not(picker_value_probe))]
     use super::request_probe::objc_msgSend;
+    #[cfg(picker_value_probe)]
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        fn objc_msgSend(object: *mut std::ffi::c_void, selector: *const std::ffi::c_void) -> usize;
+    }
     use std::ffi::{CString, c_char, c_void};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
@@ -2808,6 +3498,7 @@ mod native_host {
     use std::time::Instant;
     type Id = *mut c_void;
     type Sel = *const c_void;
+    #[cfg(not(picker_value_probe))]
     #[derive(Clone, Copy)]
     #[repr(C)]
     struct Rect {
@@ -2863,11 +3554,13 @@ mod native_host {
             unsafe { std::mem::transmute(objc_msgSend as unsafe extern "C" fn(Id, Sel) -> usize) };
         unsafe { f(object, sel_registerName(name.as_ptr())) }
     }
+    #[cfg(not(picker_value_probe))]
     unsafe fn send_id(object: Id, name: &std::ffi::CStr, value: Id) {
         let f: unsafe extern "C" fn(Id, Sel, Id) =
             unsafe { std::mem::transmute(objc_msgSend as unsafe extern "C" fn(Id, Sel) -> usize) };
         unsafe { f(object, sel_registerName(name.as_ptr()), value) };
     }
+    #[cfg(not(picker_value_probe))]
     unsafe fn send_void(object: Id, name: &std::ffi::CStr) {
         let f: unsafe extern "C" fn(Id, Sel) =
             unsafe { std::mem::transmute(objc_msgSend as unsafe extern "C" fn(Id, Sel) -> usize) };
@@ -2939,6 +3632,19 @@ mod native_host {
     unsafe extern "C" fn window(_: Id, _: Sel) -> Id {
         WINDOW.load(Ordering::Acquire) as Id
     }
+    #[cfg(picker_value_probe)]
+    unsafe extern "C" fn launched(delegate: Id, _: Sel, _: Id, _: Id) -> bool {
+        // UIApplication lifecycle only. No UIWindow, root controller, view,
+        // attach/present or control action in the Picker value experiment.
+        if delegate.is_null() {
+            eprintln!("Picker inspection launch has no UIKit delegate");
+            std::process::exit(1);
+        }
+        DELEGATE.store(unsafe { objc_retain(delegate) }.addr(), Ordering::Release);
+        println!("Rust UIKit launch callback observed; inspection_without_window=true");
+        true
+    }
+    #[cfg(not(picker_value_probe))]
     unsafe extern "C" fn launched(delegate: Id, _: Sel, _: Id, _: Id) -> bool {
         assert!(!delegate.is_null());
         DELEGATE.store(unsafe { objc_retain(delegate) }.addr(), Ordering::Release);
@@ -3028,13 +3734,24 @@ mod native_host {
             // Catch Rust validation failures before crossing the C callback;
             // value owners unwind and emit their partial lifecycle counts.
             let success = std::panic::catch_unwind(|| {
+                #[cfg(not(any(picker_entry_probe, picker_value_probe)))]
                 let _ = super::inspect_singleton();
+                #[cfg(not(any(picker_entry_probe, picker_value_probe)))]
                 let metadata = super::selection_layout::inspect();
+                #[cfg(picker_entry_probe)]
+                super::picker_entry::inspect();
                 #[cfg(selection_value_probe)]
                 super::selection_value::inspect(metadata);
                 #[cfg(mutable_binding_probe)]
                 super::mutable_binding::inspect(metadata);
-                #[cfg(not(any(selection_value_probe, mutable_binding_probe)))]
+                #[cfg(picker_value_probe)]
+                super::mutable_binding::inspect(std::ptr::null());
+                #[cfg(not(any(
+                    selection_value_probe,
+                    mutable_binding_probe,
+                    picker_entry_probe,
+                    picker_value_probe
+                )))]
                 let _ = metadata;
             })
             .is_ok();
@@ -3132,6 +3849,11 @@ mod native_host {
                 std::thread::sleep(Duration::from_secs(30));
                 #[cfg(selection_layout_probe)]
                 {
+                    #[cfg(picker_value_probe)]
+                    if ACTIVE.load(Ordering::Acquire) {
+                        // The value watchdog emits actual partial counters.
+                        return;
+                    }
                     // Also bound a stalled foreign initializer/witness call.
                     eprintln!("Selection inspection process timed out");
                     std::process::exit(1);
