@@ -509,6 +509,17 @@ compile_error!("picker entry inspection requires the selection layout mode");
 compile_error!("picker entry inspection is a separate metadata-only experiment");
 #[cfg(all(picker_value_probe, auth_request))]
 compile_error!("picker value inspection excludes authorization request code");
+#[cfg(all(
+    picker_hosting_probe,
+    not(all(
+        runtime_probe,
+        uikit_host,
+        xcode_host,
+        selection_layout_probe,
+        picker_value_probe
+    ))
+))]
+compile_error!("picker hosting requires the separate request-free Picker Xcode host");
 #[cfg(all(picker_value_probe, not(selection_layout_probe)))]
 compile_error!("picker values require the selection inspection host");
 #[cfg(all(
@@ -1374,6 +1385,8 @@ mod selection_value {
 // run38077219284, category entry run38082809973, and null-context boundary
 // research050528 (Swift 5.10 SILFunctionType/CallingConvention/HeapObject).
 #[cfg(all(any(mutable_binding_probe, picker_value_probe), selection_layout_probe))]
+// Hosting reuses the audited value machinery, not its old finite test sequence.
+#[cfg_attr(picker_hosting_probe, allow(dead_code))]
 mod mutable_binding {
     use super::MetadataResponse;
     use super::selection_layout::{ValueWitnessTable, read, resolve};
@@ -1641,6 +1654,10 @@ mod mutable_binding {
         started: Instant,
         #[cfg(picker_value_probe)]
         picker: picker_values::Proof,
+        #[cfg(picker_hosting_probe)]
+        hosting_calls: AtomicUsize,
+        #[cfg(picker_hosting_probe)]
+        root_transfers: AtomicUsize,
     }
     impl Proof {
         fn new() -> Self {
@@ -1651,6 +1668,10 @@ mod mutable_binding {
                 started: Instant::now(),
                 #[cfg(picker_value_probe)]
                 picker: picker_values::Proof::new(),
+                #[cfg(picker_hosting_probe)]
+                hosting_calls: AtomicUsize::new(0),
+                #[cfg(picker_hosting_probe)]
+                root_transfers: AtomicUsize::new(0),
             }
         }
         fn inc(&self, c: Count) {
@@ -1669,6 +1690,7 @@ mod mutable_binding {
                 "mutable binding deadline exceeded"
             );
         }
+        #[cfg(not(picker_hosting_probe))]
         fn emit(&self) {
             #[cfg(picker_value_probe)]
             self.picker.emit(self);
@@ -1718,6 +1740,56 @@ mod mutable_binding {
                 "private_api_reads",
             ] {
                 println!("Mutable binding result: {name}=0");
+            }
+        }
+        #[cfg(picker_hosting_probe)]
+        fn emit(&self) {
+            println!(
+                "Picker hosting result: rust_value_allocations={}",
+                self.n(Count::Alloc) + self.picker.n(picker_values::Count::Alloc)
+            );
+            println!(
+                "Picker hosting result: rust_value_deallocations={}",
+                self.n(Count::Dealloc) + self.picker.n(picker_values::Count::Free)
+            );
+            println!(
+                "Picker hosting result: getter_callbacks={}",
+                self.n(Count::ClosureGet)
+            );
+            println!(
+                "Picker hosting result: setter_callbacks={}",
+                self.n(Count::ClosureSet)
+            );
+            println!(
+                "Picker hosting result: callbacks_active={}",
+                self.n(Count::Active)
+            );
+            println!(
+                "Picker hosting result: state_process_pinned={}",
+                !STATE.load(Ordering::SeqCst).is_null()
+            );
+            for (name, count) in [
+                ("binding_initializer_calls", Count::BindingInit),
+                ("binding_copy_calls", Count::BindingCopy),
+                ("binding_destroy_calls", Count::BindingDestroy),
+                ("binding_public_getter_calls", Count::PublicGet),
+                ("binding_public_setter_calls", Count::PublicSet),
+            ] {
+                println!("Picker hosting result: {name}={}", self.n(count));
+            }
+            for (name, count) in [
+                (
+                    "picker_constructor_calls",
+                    picker_values::Count::Constructor,
+                ),
+                ("picker_copy_calls", picker_values::Count::Copy),
+                ("picker_rust_destroy_calls", picker_values::Count::Destroy),
+                (
+                    "binding_inputs_transferred",
+                    picker_values::Count::Transferred,
+                ),
+            ] {
+                println!("Picker hosting result: {name}={}", self.picker.n(count));
             }
         }
     }
@@ -2165,6 +2237,7 @@ mod mutable_binding {
             "Mutable binding entry guards: category_first28=true; binding_register_prefixes=true; setter_outer_destroy=true; reconstructed_addresses_used=false"
         );
     }
+    #[cfg(not(picker_hosting_probe))]
     pub(super) fn inspect(metadata: *const c_void) {
         let proof = Arc::new(Proof::new());
         let _deadline = Deadline::start(proof.clone());
@@ -2311,8 +2384,111 @@ mod mutable_binding {
         proof.verified.store(true, Ordering::SeqCst);
     }
 
+    // Parent MUST review all new unsafe boundaries before Mac execution.
+    // Every reference reachable by a NULL-context SDK closure has a real static
+    // lifetime, even on panic, deferred UIKit release, or a foreign callback.
+    // This intentional process pin is NOT a claim of full SDK/Swift teardown.
+    #[cfg(picker_hosting_probe)]
+    pub(super) fn host() -> *mut c_void {
+        let proof: &'static Arc<Proof> = Box::leak(Box::new(Arc::new(Proof::new())));
+        let _deadline = Box::leak(Box::new(Deadline::start(proof.clone())));
+        proof.check();
+        let page = unsafe { getpagesize() };
+        assert!(page > 0);
+        let page = page as usize;
+        let accessor: unsafe extern "Swift" fn(usize) -> MetadataResponse =
+            unsafe { std::mem::transmute(resolve(env!("SELECTION_METADATA_SYMBOL"))) };
+        let selection = unsafe { accessor(0) };
+        assert!(selection.state == 0 && !selection.value.is_null());
+        proof.picker.inc(picker_values::Count::SelectionMetadata);
+        let selection: &'static Witnesses =
+            Box::leak(Box::new(Witnesses::load(selection.value, 56, page)));
+        let accessor: unsafe extern "Swift" fn(usize, *const c_void) -> MetadataResponse =
+            unsafe { std::mem::transmute(resolve(env!("BINDING_METADATA_SYMBOL"))) };
+        let binding = unsafe { accessor(0, selection.metadata) };
+        assert!(binding.state == 0 && !binding.value.is_null());
+        proof.picker.inc(picker_values::Count::BindingMetadata);
+        let binding_type: &'static Witnesses =
+            Box::leak(Box::new(Witnesses::load(binding.value, 72, page)));
+        assert!(
+            unsafe { read(binding.value.cast::<*const c_void>().wrapping_add(2), page) }
+                == selection.metadata
+        );
+        let category = resolve(env!("SELECTION_CATEGORY_INIT_SYMBOL"));
+        let init = resolve(env!("BINDING_INIT_SYMBOL"));
+        verify_entries(
+            category,
+            init,
+            resolve(env!("BINDING_GET_SYMBOL")),
+            resolve(env!("BINDING_SET_SYMBOL")),
+            page,
+        );
+        let plan: &'static picker_values::Plan =
+            Box::leak(Box::new(picker_values::Plan::load(proof, page)));
+        let mut stable = Value::allocate(selection, proof, false);
+        stable.category(false, category);
+        let _state: &'static Installed<'static> =
+            Box::leak(Box::new(Installed::install(stable, proof)));
+        let mut binding = Value::allocate(binding_type, proof, true);
+        proof.inc(Count::BindingInit);
+        picker_values::initialize_binding(
+            &binding,
+            picker_values::SelectionValueMetadata(selection.metadata),
+            init,
+        );
+        binding.initialized = true;
+        let controller = plan.host(&binding, proof, page);
+        drop(binding);
+        assert!(proof.n(Count::Active) == 0);
+        println!("Picker hosting result: phase=picker_hosting_window");
+        println!(
+            "Picker hosting result: hosting_constructor_calls={}",
+            proof.hosting_calls.load(Ordering::SeqCst)
+        );
+        println!("Picker hosting result: hosting_class_identity_verified=true");
+        println!("Picker hosting result: hosting_superclass_verified=true");
+        println!(
+            "Picker hosting result: root_picker_inputs_transferred={}",
+            proof.root_transfers.load(Ordering::SeqCst)
+        );
+        println!("Picker hosting result: extra_generic_arguments=0");
+        println!("Picker hosting result: returned_reference_ownership=plus_one");
+        controller
+    }
+    #[cfg(picker_hosting_probe)]
+    pub(super) fn hosting_results() {
+        let proof = DIAGNOSTICS
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("pinned diagnostics missing");
+        proof.check();
+        proof.emit();
+        for field in [
+            "authorization_requests",
+            "status_getter_calls",
+            "picker_contents_read",
+            "private_api_calls",
+        ] {
+            println!("Picker hosting result: {field}=0");
+        }
+        for field in [
+            "full_teardown_verified",
+            "state_pointer_cleared",
+            "selection_contents_output",
+            "picker_ui_verified",
+            "tokens_verified",
+            "grant_verified",
+            "monitoring_verified",
+            "shielding_verified",
+        ] {
+            println!("Picker hosting result: {field}=false");
+        }
+        println!("Picker hosting result: sdk_deferred_owners=unknown");
+    }
+
     // Parent must review this new unsafe boundary before any Mac execution.
-    // Picker-only: no hosting allocator, controller instance, rootView access,
+    // picker-values only: no hosting allocator, controller instance, rootView access,
     // presentation, token inspection or authorization. The old mutable-mode
     // bridges, category/Binding guards and false->true->false proof are retained.
     #[cfg(picker_value_probe)]
@@ -2427,7 +2603,7 @@ mod mutable_binding {
             pub(super) fn inc(&self, count: Count) {
                 self.counts[count as usize].fetch_add(1, Ordering::SeqCst);
             }
-            fn n(&self, count: Count) -> usize {
+            pub(super) fn n(&self, count: Count) -> usize {
                 self.counts[count as usize].load(Ordering::SeqCst)
             }
             pub(super) fn emit(&self, outer: &super::Proof) {
@@ -2530,6 +2706,8 @@ mod mutable_binding {
         pub(super) struct Plan {
             witnesses: Witnesses,
             entry: *const c_void,
+            #[cfg(picker_hosting_probe)]
+            hosting: *const c_void,
         }
         impl Plan {
             pub(super) fn load(proof: &super::Proof, page: usize) -> Self {
@@ -2627,16 +2805,21 @@ mod mutable_binding {
                 // SILFunctionType.cpp 2515-2622/2717: allocator/initializer
                 // normal params Owned => Indirect_In, never borrowed. Calling
                 // Convention.rst 261-276 transfers the returned value to caller.
-                // Hosting PUBLIC entry would require x0=root, x20=metatype;
-                // its first BL12 saves x0 in x19 internally. We do NOT call it:
-                // BL24 helper/collection behavior remain a later review boundary.
+                // Hosting PUBLIC entry requires x0=root, x20=metatype;
+                // its first BL12 saves x0 in x19 internally. Only the distinct
+                // hosting mode calls it, using the primary generic ABI below.
                 proof.picker.guarded.store(true, Ordering::SeqCst);
                 println!(
                     "Picker value entry guards: public_x0_binding=true; public_x8_result=true; input_size=72; result_stride=152; alignment=8; nonpod=true; first_bl64_stub=true; extra_generic_arguments=0; owned_normal_parameter=true"
                 );
-                Self { witnesses, entry }
+                Self {
+                    witnesses,
+                    entry,
+                    #[cfg(picker_hosting_probe)]
+                    hosting: hosting.value,
+                }
             }
-            pub(super) fn execute(&self, binding: &Value<'_>, proof: &super::Proof) {
+            fn construct<'a>(&'a self, binding: &Value<'_>, proof: &'a super::Proof) -> Owned<'a> {
                 proof.check();
                 let self_metadata = binding_self(binding);
                 assert!(self_metadata.0 == binding.witnesses.metadata);
@@ -2656,6 +2839,10 @@ mod mutable_binding {
                 proof.picker.inc(Count::Constructed);
                 drop(input); // Allocation only, never Binding destroy.
                 proof.check();
+                picker
+            }
+            pub(super) fn execute(&self, binding: &Value<'_>, proof: &super::Proof) {
+                let picker = self.construct(binding, proof);
                 let mut copied = Owned::allocate(&self.witnesses, proof);
                 assert!(picker.initialized && !copied.initialized && copied.ptr() != picker.ptr());
                 proof.picker.inc(Count::Copy);
@@ -2676,6 +2863,115 @@ mod mutable_binding {
                 // Binding original and boxed stable Selection still live here;
                 // the caller destroys both Binding owners before clearing STATE.
             }
+            #[cfg(picker_hosting_probe)]
+            pub(super) fn host(
+                &self,
+                binding: &Value<'_>,
+                proof: &super::Proof,
+                page: usize,
+            ) -> *mut c_void {
+                let entry = resolve(env!("HOSTING_INIT_SYMBOL"));
+                // Original SDK public allocator prefix, never a branch address
+                // from the relocated .o. BL12 helper preserves root in x19;
+                // BL24 receives root x0 and the allocated controller x20.
+                for (offset, expected) in [
+                    (0, 0xa9be_4ff4),
+                    (4, 0xa901_7bfd),
+                    (8, 0x9100_43fd),
+                    (16, 0xaa00_03f4),
+                    (20, 0xaa13_03e0),
+                    (28, 0xa941_7bfd),
+                ] {
+                    assert!(
+                        word(entry, offset, page) == expected,
+                        "hosting allocator prefix changed"
+                    );
+                }
+                let allocator = branch(entry, 12, true, page);
+                assert!(
+                    word(allocator, 0, page) == 0xaa00_03f3
+                        && word(allocator, 4, page) == 0xaa14_03e0
+                );
+                let _tail = branch(allocator, 8, false, page); // same image, no invocation
+                let initializer = branch(entry, 24, true, page);
+                // Exact, single, bounded extra read of the missing BL24 helper.
+                // Its implementation is NOT used to invent another callable ABI.
+                super::super::selection_layout::prefix_bytes(
+                    "Picker hosting",
+                    "public allocator BL24 initializing helper",
+                    initializer,
+                    page,
+                );
+                // Primary swift-5.10-RELEASE lib/IRGen/GenProto.cpp:
+                // 197-245 considers self first; 432-445 thick metatype is a
+                // metadata source; 3863-3869/3895-3896 add only unfulfilled
+                // requirements. Hosting's sole Content:View requirement is in
+                // the metatype. No trailing generic args or public x19 input.
+                // SILFunctionType.cpp DefaultAllocator/InitializerConventions:
+                // root is Indirect_In (+1), reference result is Owned (+1).
+                let picker = self.construct(binding, proof);
+                let mut input = Owned::allocate(&self.witnesses, proof);
+                proof.picker.inc(Count::Copy);
+                let result = unsafe {
+                    (self.witnesses.initialize)(input.ptr(), picker.ptr(), self.witnesses.metadata)
+                };
+                assert!(
+                    result == input.ptr(),
+                    "hosting root copy destination differs"
+                );
+                input.initialized = true;
+                proof.picker.inc(Count::Returned);
+                drop(picker);
+                input.initialized = false; // transfer exactly once, BEFORE call
+                proof.root_transfers.fetch_add(1, Ordering::SeqCst);
+                proof.hosting_calls.fetch_add(1, Ordering::SeqCst);
+                let controller =
+                    unsafe { rust_picker_hosting_init(input.ptr(), self.hosting, entry) };
+                drop(input); // buffer only; the SDK consumed the root's value
+                assert!(!controller.is_null(), "hosting allocator returned null");
+                assert!(
+                    unsafe { object_getClass(controller) } == self.hosting,
+                    "hosting instance metadata identity differs"
+                );
+                // Already checked this specialization's direct UIViewController
+                // superclass in load(); UIKit owns an actual class reference.
+                controller
+            }
+        }
+        #[cfg(picker_hosting_probe)]
+        core::arch::global_asm!(
+            ".text",
+            ".p2align 2",
+            ".globl _rust_picker_hosting_init",
+            "_rust_picker_hosting_init:",
+            ".cfi_startproc",
+            "stp x19, x20, [sp, #-32]!",
+            ".cfi_def_cfa_offset 32",
+            ".cfi_offset 19, -32",
+            ".cfi_offset 20, -24",
+            "stp x29, x30, [sp, #16]",
+            ".cfi_offset 29, -16",
+            ".cfi_offset 30, -8",
+            "mov x20, x1", // x0=owned root, x20=metatype; x19 is internal.
+            "blr x2",      // public allocating entry; x0=+1 controller reference.
+            "ldp x29, x30, [sp, #16]",
+            ".cfi_restore 29",
+            ".cfi_restore 30",
+            "ldp x19, x20, [sp], #32",
+            ".cfi_restore 19",
+            ".cfi_restore 20",
+            ".cfi_def_cfa_offset 0",
+            "ret",
+            ".cfi_endproc",
+        );
+        #[cfg(picker_hosting_probe)]
+        unsafe extern "C" {
+            fn rust_picker_hosting_init(
+                root: *mut c_void,
+                metatype: *const c_void,
+                entry: *const c_void,
+            ) -> *mut c_void;
+            fn object_getClass(object: *mut c_void) -> *const c_void;
         }
         struct Owned<'a> {
             pointer: NonNull<u8>,
@@ -3498,7 +3794,7 @@ mod native_host {
     use std::time::Instant;
     type Id = *mut c_void;
     type Sel = *const c_void;
-    #[cfg(not(picker_value_probe))]
+    #[cfg(any(not(picker_value_probe), picker_hosting_probe))]
     #[derive(Clone, Copy)]
     #[repr(C)]
     struct Rect {
@@ -3510,6 +3806,8 @@ mod native_host {
     static ACTIVE: AtomicBool = AtomicBool::new(false);
     static WINDOW: AtomicUsize = AtomicUsize::new(0);
     static DELEGATE: AtomicUsize = AtomicUsize::new(0);
+    #[cfg(picker_hosting_probe)]
+    static HOSTING_CONTROLLER: AtomicUsize = AtomicUsize::new(0);
     #[cfg(ui_test_host)]
     static REQUESTED: AtomicBool = AtomicBool::new(false);
     #[cfg(ui_test_host)]
@@ -3537,6 +3835,13 @@ mod native_host {
         #[cfg(ui_test_host)]
         fn objc_release(object: Id);
     }
+    #[cfg(picker_hosting_probe)]
+    #[link(name = "swiftCore")]
+    unsafe extern "C" {
+        // Swift 5.10 RuntimeFunctions.def:336 C_CC, VoidTy, one unknown
+        // reference. HeapObject.h:686-690 covers Swift/ObjC class instances.
+        fn swift_unknownObjectRelease(object: Id);
+    }
     #[link(name = "System")]
     unsafe extern "C" {
         // dispatch/queue.h exposes dispatch_get_main_queue as a C inline
@@ -3554,13 +3859,13 @@ mod native_host {
             unsafe { std::mem::transmute(objc_msgSend as unsafe extern "C" fn(Id, Sel) -> usize) };
         unsafe { f(object, sel_registerName(name.as_ptr())) }
     }
-    #[cfg(not(picker_value_probe))]
+    #[cfg(any(not(picker_value_probe), picker_hosting_probe))]
     unsafe fn send_id(object: Id, name: &std::ffi::CStr, value: Id) {
         let f: unsafe extern "C" fn(Id, Sel, Id) =
             unsafe { std::mem::transmute(objc_msgSend as unsafe extern "C" fn(Id, Sel) -> usize) };
         unsafe { f(object, sel_registerName(name.as_ptr()), value) };
     }
-    #[cfg(not(picker_value_probe))]
+    #[cfg(any(not(picker_value_probe), picker_hosting_probe))]
     unsafe fn send_void(object: Id, name: &std::ffi::CStr) {
         let f: unsafe extern "C" fn(Id, Sel) =
             unsafe { std::mem::transmute(objc_msgSend as unsafe extern "C" fn(Id, Sel) -> usize) };
@@ -3744,8 +4049,10 @@ mod native_host {
                 super::selection_value::inspect(metadata);
                 #[cfg(mutable_binding_probe)]
                 super::mutable_binding::inspect(metadata);
-                #[cfg(picker_value_probe)]
+                #[cfg(all(picker_value_probe, not(picker_hosting_probe)))]
                 super::mutable_binding::inspect(std::ptr::null());
+                #[cfg(picker_hosting_probe)]
+                present_picker(super::mutable_binding::host());
                 #[cfg(not(any(
                     selection_value_probe,
                     mutable_binding_probe,
@@ -3755,6 +4062,22 @@ mod native_host {
                 let _ = metadata;
             })
             .is_ok();
+            #[cfg(picker_hosting_probe)]
+            if success {
+                // Allow actual UIKit rendering and a workflow screenshot.
+                // The worker carries no UIKit pointer and performs no SDK call.
+                std::thread::spawn(|| {
+                    std::thread::sleep(Duration::from_secs(10));
+                    unsafe {
+                        dispatch_async_f(
+                            (&raw const _dispatch_main_q).cast_mut().cast(),
+                            std::ptr::null_mut(),
+                            finish_picker,
+                        )
+                    };
+                });
+                return;
+            }
             unsafe {
                 dispatch_async_f(
                     (&raw const _dispatch_main_q).cast_mut().cast(),
@@ -3767,6 +4090,77 @@ mod native_host {
         start_request(super::inspect_singleton());
         #[cfg(ui_test_host)]
         println!("Rust XCTest host ready; authorization_requested=false");
+    }
+    #[cfg(picker_hosting_probe)]
+    fn present_picker(controller: Id) {
+        // Public SDK declarations are required by the workflow. CGRect is four
+        // CGFloat doubles on this guarded arm64 Simulator; BOOL is bool.
+        // The Swift allocator gives us +1. setRootViewController retains it;
+        // retain that allocation reference until detach, then release via the
+        // Swift runtime's C-ABI unknown-object release (Swift/ObjC compatible).
+        unsafe {
+            assert!(!controller.is_null());
+            assert!(
+                send0(controller, c"parentViewController").is_null(),
+                "root controller already parented"
+            );
+            let screen = send0(objc_getClass(c"UIScreen".as_ptr()), c"mainScreen");
+            assert!(!screen.is_null());
+            let bounds: unsafe extern "C" fn(Id, Sel) -> Rect =
+                std::mem::transmute(objc_msgSend as unsafe extern "C" fn(Id, Sel) -> usize);
+            let rect = bounds(screen, sel_registerName(c"bounds".as_ptr()));
+            assert!(rect.width > 0.0 && rect.height > 0.0);
+            let init: unsafe extern "C" fn(Id, Sel, Rect) -> Id =
+                std::mem::transmute(objc_msgSend as unsafe extern "C" fn(Id, Sel) -> usize);
+            let window = init(
+                send0(objc_getClass(c"UIWindow".as_ptr()), c"alloc"),
+                sel_registerName(c"initWithFrame:".as_ptr()),
+                rect,
+            );
+            assert!(!window.is_null());
+            WINDOW.store(window.addr(), Ordering::Release);
+            HOSTING_CONTROLLER.store(controller.addr(), Ordering::Release);
+            send_id(window, c"setRootViewController:", controller);
+            send_void(window, c"makeKeyAndVisible");
+            send_void(send0(controller, c"view"), c"layoutIfNeeded");
+            assert!(send0(window, c"rootViewController") == controller);
+            assert!(send0(send0(controller, c"view"), c"window") == window);
+            assert!(send0(controller, c"parentViewController").is_null());
+            let hidden: unsafe extern "C" fn(Id, Sel) -> bool =
+                std::mem::transmute(objc_msgSend as unsafe extern "C" fn(Id, Sel) -> usize);
+            assert!(!hidden(window, sel_registerName(c"isHidden".as_ptr())));
+            println!("Picker hosting result: root_controller_parent_nil=true");
+            println!("Picker hosting result: root_view_window_identity_verified=true");
+            println!("Picker hosting result: window_visible=true");
+            // Visibility/attachment does not prove OS picker contents. Never
+            // output labels, tokens, selected contents, or infer screenshot success.
+            println!(
+                "Picker hosting capture ready: actual_hosting_window=true; picker_contents_unverified=true"
+            );
+        }
+    }
+    #[cfg(picker_hosting_probe)]
+    unsafe extern "C" fn finish_picker(_: *mut c_void) {
+        let success = std::panic::catch_unwind(|| unsafe {
+            let window = WINDOW.swap(0, Ordering::AcqRel) as Id;
+            let controller = HOSTING_CONTROLLER.swap(0, Ordering::AcqRel) as Id;
+            assert!(!window.is_null() && !controller.is_null());
+            // Detach only our root and release only our +1 references. UIKit
+            // caches/deferred owners remain unknown; STATE stays process-pinned.
+            send_id(window, c"setRootViewController:", std::ptr::null_mut());
+            let hide: unsafe extern "C" fn(Id, Sel, bool) =
+                std::mem::transmute(objc_msgSend as unsafe extern "C" fn(Id, Sel) -> usize);
+            hide(window, sel_registerName(c"setHidden:".as_ptr()), true);
+            assert!(send0(window, c"rootViewController").is_null());
+            swift_unknownObjectRelease(controller);
+            swift_unknownObjectRelease(window);
+            println!("Picker hosting result: root_detached=true");
+            println!("Picker hosting result: controller_allocation_reference_releases=1");
+            println!("Picker hosting result: window_allocation_reference_releases=1");
+            super::mutable_binding::hosting_results();
+        })
+        .is_ok();
+        std::process::exit(if success { 0 } else { 1 });
     }
     #[cfg(not(selection_layout_probe))]
     fn start_request(object: Id) {
@@ -3849,7 +4243,7 @@ mod native_host {
                 std::thread::sleep(Duration::from_secs(30));
                 #[cfg(selection_layout_probe)]
                 {
-                    #[cfg(picker_value_probe)]
+                    #[cfg(all(picker_value_probe, not(picker_hosting_probe)))]
                     if ACTIVE.load(Ordering::Acquire) {
                         // The value watchdog emits actual partial counters.
                         return;
