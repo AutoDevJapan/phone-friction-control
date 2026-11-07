@@ -101,3 +101,11 @@ CIの非sample IDは構文検査・APK作成専用のfixtureです。AdMobに登
 - [Androidアプリの署名と更新時の鍵の管理](https://developer.android.com/studio/publish/app-signing)
 
 日本語フォントはNoto Sans JPです。ライセンスは `assets/OFL.txt` を参照してください。
+
+## ライセンスと配布範囲
+
+AutoDevJapanが権利を持つ自作コードは [Apache License 2.0](LICENSE) で提供します。著作権表示は [NOTICE](NOTICE) を参照してください。これは「Apache-2.0」であり、将来版への自動変更を含みません。
+
+Rust依存ライブラリ、Android/iOS SDK、Google GMA・UMP、フォント、画像などの第三者著作物には、それぞれの権利者のライセンスが適用されます。このライセンスはSDKの再配布、Google Playへの掲載、AppleのFamily Controls配布許可、広告配信の承認を与えるものではありません。
+
+ソースの公開と、署名付きAPK・ストア配布の受入条件は別です。署名鍵・認証情報を配布物へ含めず、全Git履歴と素材・依存の権利確認が完了するまでリポジトリの一般公開は保留します。既存素材の削除や履歴書換えは行っていません。
