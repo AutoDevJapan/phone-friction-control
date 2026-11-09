@@ -343,8 +343,10 @@ mod tests {
         state.usage_ms.insert("mail".into(), 99);
         state.playback_ms.insert("mail".into(), 99);
         state.raw_ms.insert("mail".into(), 99);
-        let mut old = DayLedger::default();
-        old.day = "yesterday".into();
+        let mut old = DayLedger {
+            day: "yesterday".into(),
+            ..DayLedger::default()
+        };
         old.usage_ms.insert("mail".into(), 99);
         old.playback_ms.insert("mail".into(), 99);
         old.raw_ms.insert("mail".into(), 99);
