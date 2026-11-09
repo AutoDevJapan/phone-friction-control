@@ -223,6 +223,15 @@ impl GuardState {
     }
 
     pub fn retain_selected(&mut self, policy: &Policy) {
+        for record in &mut self.history {
+            for map in [
+                &mut record.usage_ms,
+                &mut record.playback_ms,
+                &mut record.raw_ms,
+            ] {
+                map.retain(|p, _| policy.packages.contains(p));
+            }
+        }
         for map in [&mut self.usage_ms, &mut self.playback_ms, &mut self.raw_ms] {
             map.retain(|p, _| policy.packages.contains(p));
         }
@@ -319,7 +328,16 @@ mod tests {
         state.usage_ms.insert("mail".into(), 99);
         state.playback_ms.insert("mail".into(), 99);
         state.raw_ms.insert("mail".into(), 99);
+        let mut old = DayLedger::default();
+        old.day = "yesterday".into();
+        old.usage_ms.insert("mail".into(), 99);
+        old.playback_ms.insert("mail".into(), 99);
+        old.raw_ms.insert("mail".into(), 99);
+        state.history.push(old);
         state.retain_selected(&policy());
+        assert!(state.history.iter().all(|record| record.usage_ms.is_empty()
+            && record.playback_ms.is_empty()
+            && record.raw_ms.is_empty()));
         assert!(
             state.usage_ms.is_empty() && state.playback_ms.is_empty() && state.raw_ms.is_empty()
         );

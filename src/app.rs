@@ -1166,9 +1166,9 @@ impl ControlApp {
             ui.label(RichText::new("広告").strong());
             ui.label("広告はこのアプリ内だけに表示する想定です。休憩画面には出さず、広告を断っても制限機能は変わりません。");
             #[cfg(all(target_os = "android", feature = "ads-test"))]
-            ui.label("この試験版はGoogleの試験広告に接続します。ホームで表示を選んだときだけ同意を確認し、広告を読み込みます。");
+            ui.label("この試験版はGoogleの試験広告に接続します。ホームで広告表示を選ぶと同意を確認して広告を読み込みます。「広告の同意設定」を選んだ場合もGoogleへ接続して同意情報を確認します。");
             #[cfg(all(target_os = "android", feature = "ads-production"))]
-            ui.label("ホームで表示を選んだときだけ同意を確認し、広告を読み込みます。");
+            ui.label("ホームで広告表示を選ぶと同意を確認して広告を読み込みます。「広告の同意設定」を選んだ場合もGoogleへ接続して同意情報を確認します。");
             #[cfg(not(all(target_os = "android", any(feature = "ads-test", feature = "ads-production"))))]
             ui.label("この版は広告枠だけで、広告配信には接続しません。");
         });
@@ -1468,8 +1468,9 @@ impl eframe::App for ControlApp {
             self.ad_bounds = None;
         }
         let ctx = root_ui.ctx().clone();
+        root_ui.set_style(ctx.style_of(ctx.theme()));
         let is_break = self.screen == Screen::Break;
-        let background = if is_break || ctx.theme() == egui::Theme::Dark {
+        let background = if is_break || root_ui.visuals().dark_mode {
             DARK
         } else {
             PAPER

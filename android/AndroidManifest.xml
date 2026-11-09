@@ -56,5 +56,8 @@
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
+        <activity-alias android:name="android.app.NativeActivity"
+            android:targetActivity="com.autodevjapan.phonefrictioncontrol.ControlActivity"
+            android:exported="true" />
     </application>
 </manifest>
