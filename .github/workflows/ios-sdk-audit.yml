@@ -90,6 +90,7 @@ jobs:
           for OPTION in '${{ inputs.authorization_probe }}' '${{ inputs.native_uikit_host }}' '${{ inputs.xcode_signed_host }}' '${{ inputs.ui_consent_test }}' '${{ inputs.ui_continue }}' '${{ inputs.authorization_status_entry_probe }}' '${{ inputs.authorization_status_value_probe }}' '${{ inputs.authorization_status_consent_probe }}' '${{ inputs.collect_xctest_headers }}'; do test "$OPTION" = false; done
           git rev-parse HEAD > "$OUT/product-source.txt"
           printf 'mode=product_native_storage_acceptance\nsynthetic_scalar_settings_only=true\nproduction_ui_exercised=false\nscreen_time_control_exercised=false\n' > "$OUT/scope.txt"
+          rustc --edition 2024 tools/ios-native-storage-output-gate.rs -o "$OUT/native-output-gate"
           cargo test --locked --release --no-run --lib --features desktop-preview --target aarch64-apple-ios-sim --message-format=json > "$OUT/build-full.json" 2> "$OUT/build-full.txt"
           TEST_EXE=$(jq -ser '[.[] | select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "phone_friction_control") | .executable | select(. != null)] | unique | if length == 1 then .[0] else error("native test executable unavailable") end' "$OUT/build-full.json")
           cp "$TEST_EXE" "$OUT/NativeStorageTests.app/native-storage-tests"
@@ -109,6 +110,7 @@ jobs:
           xcrun simctl install "$SIM_ID" "$OUT/NativeStorageTests.app"
           BID=com.autodevjapan.phonefrictioncontrol.native-storage-tests
           DATA=$(xcrun simctl get_app_container "$SIM_ID" "$BID" data)
+          APP_EXEC="$(xcrun simctl get_app_container "$SIM_ID" "$BID" app)/native-storage-tests"
           test ! -e "$DATA/Documents/usage-state.ron"
           test ! -e "$DATA/Documents/usage-state.pending"
           export SIMCTL_CHILD_PHONE_CONTROL_NATIVE_TEST_HOME="$DATA"
@@ -121,12 +123,48 @@ jobs:
           printf 'launcher_exit_status=%s\n' "$STATUS" > "$OUT/test-status.txt"
           PID=$(awk -v b="$BID" 'index($0,b ": ")==1 {p=substr($0,length(b)+3); if(p ~ /^[0-9]+$/) print p}' "$OUT/launch.txt")
           printf 'test_pid=%s\n' "$PID" > "$OUT/pid.txt"
+          # Observe all target instances, including subsequent launch attempts. A first
+          # successful summary is not a collection boundary. Require no target
+          # process and stable stream sizes across four quiet observations.
+          QUIESCENT=false
+          QUIET=0
+          LAST_BYTES=-1
+          ATTEMPT=0
+          COLLECT_STARTED=$SECONDS
+          COLLECT_DEADLINE=$((SECONDS+60))
+          PS_SNAPSHOT="$RUNNER_TEMP/native-storage-ps-current.txt"
+          : > "$OUT/process-observations.txt"
+          : > "$OUT/target-pids-seen.txt"
           if [ "$STATUS" = 0 ]; then
-            for ATTEMPT in $(seq 1 60); do
-              if grep -Fq 'test result:' "$OUT/test-stdout.txt" "$OUT/test-stderr.txt" 2>/dev/null; then break; fi
-              sleep 1
+            while [ "$SECONDS" -lt "$COLLECT_DEADLINE" ]; do
+              ATTEMPT=$((ATTEMPT+1))
+              REMAINING=$((COLLECT_DEADLINE-SECONDS))
+              if [ "$REMAINING" -le 0 ]; then break; fi
+              PS_LIMIT=5
+              if [ "$REMAINING" -lt "$PS_LIMIT" ]; then PS_LIMIT=$REMAINING; fi
+              PS_STATUS=0
+              perl -e 'alarm shift; exec @ARGV; die "exec failed\n"' "$PS_LIMIT" ps -ww -A -o pid=,comm= > "$PS_SNAPSHOT" 2> "$OUT/process-query-error.txt" || PS_STATUS=$?
+              if [ "$PS_STATUS" != 0 ]; then
+                printf 'process_query_status=%s\n' "$PS_STATUS" >> "$OUT/process-observations.txt"
+                break
+              fi
+              "$OUT/native-output-gate" target-pids "$PS_SNAPSHOT" "$APP_EXEC" > "$OUT/current-target-pids.txt"
+              cat "$OUT/current-target-pids.txt" >> "$OUT/target-pids-seen.txt"
+              printf 'sample=%s; elapsed=%s; target_pids=' "$ATTEMPT" "$((SECONDS-COLLECT_STARTED))" >> "$OUT/process-observations.txt"
+              tr '\n' ',' < "$OUT/current-target-pids.txt" >> "$OUT/process-observations.txt"
+              printf '\n' >> "$OUT/process-observations.txt"
+              BYTES=0
+              for STREAM in test-stdout test-stderr; do
+                if [ -f "$OUT/$STREAM.txt" ]; then BYTES=$((BYTES+$(wc -c < "$OUT/$STREAM.txt"))); fi
+              done
+              if [ ! -s "$OUT/current-target-pids.txt" ] && [ "$BYTES" -eq "$LAST_BYTES" ]; then QUIET=$((QUIET+1)); else QUIET=0; fi
+              LAST_BYTES=$BYTES
+              if [ "$QUIET" -ge 4 ]; then QUIESCENT=true; break; fi
+              if [ "$SECONDS" -lt "$COLLECT_DEADLINE" ]; then sleep 1; fi
             done
           fi
+          printf 'target_processes_quiescent=%s\nquiet_observations=%s\ncollection_attempts=%s\ncollection_elapsed_seconds=%s\n' "$QUIESCENT" "$QUIET" "$ATTEMPT" "$((SECONDS-COLLECT_STARTED))" > "$OUT/collection-status.txt"
+          rm -f "$PS_SNAPSHOT"
           : > "$OUT/test-result.txt"
           for STREAM in test-stdout test-stderr; do
             if [ -f "$OUT/$STREAM.txt" ]; then cat "$OUT/$STREAM.txt" >> "$OUT/test-result.txt"; fi
@@ -137,14 +175,11 @@ jobs:
           if [[ "$PID" =~ ^[0-9]+$ ]]; then ps -p "$PID" -o pid=,comm= > "$OUT/target-process.txt" || true; fi
           test "$STATUS" = 0
           [[ "$PID" =~ ^[0-9]+$ ]]
-          grep -F 'app::tests::runtime_native_documents_roundtrip_preserves_nondefault_state' "$OUT/test-result.txt"
-          grep -F 'app::tests::runtime_native_documents_failed_load_blocks_overwrite' "$OUT/test-result.txt"
-          grep -F 'test result: ok. 2 passed; 0 failed;' "$OUT/test-result.txt"
-          grep -F 'initial_fixture_limit=300; file_readback_limit=360; reconstructed_limit=360; os_permission_verified=false; process_restart_verified=false; owned_fixture_cleanup=true' "$OUT/test-result.txt"
-          grep -F 'runtime_native_documents_failed_load_preserved=true; overwrite_blocked=true; owned_fixture_cleanup=true' "$OUT/test-result.txt"
+          "$OUT/native-output-gate" check "$OUT/test-stdout.txt" "$OUT/test-stderr.txt" "$OUT/collection-status.txt" > "$OUT/output-gate-result.txt"
           test ! -e "$DATA/Documents/usage-state.ron"
           test ! -e "$DATA/Documents/usage-state.pending"
           printf 'native_model_store_roundtrip_verified=true\nfailed_load_overwrite_rejected=true\nowned_fixture_files_absent=true\nproduct_ui_verified=false\nprocess_restart_verified=false\nscreen_time_control_verified=false\n' > "$OUT/result.txt"
+          cat "$OUT/output-gate-result.txt" >> "$OUT/result.txt"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
