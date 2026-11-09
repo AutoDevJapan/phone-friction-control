@@ -464,7 +464,7 @@ pub(crate) fn interrupt_direct(env: &mut JNIEnv, context: &JObject) -> jni::erro
     #[cfg(any(feature = "ads-test", feature = "ads-production"))]
     let activity_class = "com.autodevjapan.phonefrictioncontrol.ControlAdsActivity";
     #[cfg(not(any(feature = "ads-test", feature = "ads-production")))]
-    let activity_class = "android.app.NativeActivity";
+    let activity_class = "com.autodevjapan.phonefrictioncontrol.ControlActivity";
     let class = JObject::from(env.new_string(activity_class)?);
     env.call_method(
         &intent,

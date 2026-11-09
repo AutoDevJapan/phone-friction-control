@@ -11,7 +11,6 @@ const SAVE_KEY: &str = "phone-friction-control-v1";
 const ORANGE: Color32 = Color32::from_rgb(239, 96, 34);
 const PAPER: Color32 = Color32::from_rgb(247, 244, 238);
 const INK: Color32 = Color32::from_rgb(37, 36, 34);
-const MUTED: Color32 = Color32::from_rgb(104, 101, 96);
 const DARK: Color32 = Color32::from_rgb(31, 31, 32);
 const DEFAULT_LIMIT_MINUTES: u32 = 120;
 const DEFAULT_BREAK_MINUTES: u32 = 30;
@@ -849,7 +848,7 @@ impl ControlApp {
                         .strong(),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new("上限").size(14.0).color(MUTED));
+                    ui.label(RichText::new("上限").size(14.0).color(ui.visuals().weak_text_color()));
                 });
             });
             ui.add_space(6.0);
@@ -860,7 +859,7 @@ impl ControlApp {
                     } else {
                         "今日の利用時間"
                     })
-                    .color(MUTED),
+                    .color(ui.visuals().weak_text_color()),
                 );
                 if self.usage_loading {
                     ui.spinner();
@@ -881,7 +880,7 @@ impl ControlApp {
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
-                        RichText::new(format_limit(self.saved.daily_limit_minutes)).color(MUTED),
+                        RichText::new(format_limit(self.saved.daily_limit_minutes)).color(ui.visuals().weak_text_color()),
                     );
                 });
             });
@@ -904,7 +903,7 @@ impl ControlApp {
 
         ui.add_space(10.0);
         egui::Frame::new()
-            .fill(Color32::from_rgb(235, 232, 227))
+            .fill(if ui.visuals().dark_mode { Color32::from_rgb(48, 48, 50) } else { Color32::from_rgb(235, 232, 227) })
             .inner_margin(egui::Margin::same(14))
             .show(ui, |ui| {
                 ui.label("使いすぎを防いで、やりたいことに集中できる毎日へ。");
@@ -912,7 +911,7 @@ impl ControlApp {
 
         ui.add_space(10.0);
         egui::Frame::new()
-            .fill(Color32::from_rgb(225, 220, 211))
+            .fill(if ui.visuals().dark_mode { Color32::from_rgb(48, 48, 50) } else { Color32::from_rgb(225, 220, 211) })
             .inner_margin(egui::Margin::same(12))
             .show(ui, |ui| {
                 #[cfg(all(target_os = "android", any(feature = "ads-test", feature = "ads-production")))]
@@ -939,14 +938,14 @@ impl ControlApp {
                         ui.scroll_to_rect(slot.expand(16.0), Some(Align::Center));
                         ctx.request_repaint();
                     }
-                    ui.label(RichText::new("広告を閉じても休憩や制限は変わりません。").size(12.0).color(MUTED));
+                    ui.label(RichText::new("広告を閉じても休憩や制限は変わりません。").size(12.0).color(ui.visuals().weak_text_color()));
                 }
                 #[cfg(not(all(target_os = "android", any(feature = "ads-test", feature = "ads-production"))))]
                 {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(RichText::new("広告").strong());
-                        ui.label(RichText::new("任意表示の枠（配信準備中）").color(MUTED));
+                        ui.label(RichText::new("任意表示の枠（配信準備中）").color(ui.visuals().weak_text_color()));
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(RichText::new("›").size(24.0).color(ORANGE));
@@ -955,7 +954,7 @@ impl ControlApp {
                 ui.label(
                     RichText::new("休憩時間の解除条件には使いません。")
                         .size(12.0)
-                        .color(MUTED),
+                        .color(ui.visuals().weak_text_color()),
                 );
                 }
             });
@@ -968,7 +967,7 @@ impl ControlApp {
         ui.add_space(8.0);
 
         egui::Frame::new()
-            .fill(Color32::from_rgb(252, 235, 222))
+            .fill(if ui.visuals().dark_mode { Color32::from_rgb(48, 48, 50) } else { Color32::from_rgb(252, 235, 222) })
             .inner_margin(egui::Margin::same(15))
             .show(ui, |ui| {
                 ui.label(format!(
@@ -1033,13 +1032,13 @@ impl ControlApp {
 
         ui.add_space(10.0);
         egui::Frame::new()
-            .fill(Color32::from_rgb(225, 220, 211))
+            .fill(if ui.visuals().dark_mode { Color32::from_rgb(48, 48, 50) } else { Color32::from_rgb(225, 220, 211) })
             .inner_margin(egui::Margin::same(12))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("広告").strong());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new("任意表示・配信準備中").color(MUTED));
+                        ui.label(RichText::new("任意表示・配信準備中").color(ui.visuals().weak_text_color()));
                     });
                 });
             });
@@ -1393,6 +1392,12 @@ impl eframe::App for ControlApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "android")]
+        if let Some(app) = &self.android_app {
+            // Read current Resources: the native configuration can retain its initial value.
+            let dark = crate::platform::system_dark_mode(app).unwrap_or(ctx.theme() == egui::Theme::Dark);
+            ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
+        }
         if self.last_state_reload.elapsed() >= Duration::from_secs(5)
             && let Some(store) = &mut self.state_store
             && !store.is_ready()
@@ -1420,7 +1425,7 @@ impl eframe::App for ControlApp {
         }
         let ctx = root_ui.ctx().clone();
         let is_break = self.screen == Screen::Break;
-        let background = if is_break { DARK } else { PAPER };
+        let background = if is_break || ctx.theme() == egui::Theme::Dark { DARK } else { PAPER };
 
         root_ui.scope_builder(
             egui::UiBuilder::new().max_rect(ctx.content_rect()),
@@ -1460,7 +1465,7 @@ impl eframe::App for ControlApp {
                                 (Screen::Settings, "設定", "●"),
                             ] {
                                 let selected = self.screen == screen;
-                                let color = if selected { ORANGE } else { MUTED };
+                                let color = if selected { ORANGE } else { ui.visuals().weak_text_color() };
                                 let response = ui.add_sized(
                                     [item_width, 48.0],
                                     egui::Button::new(

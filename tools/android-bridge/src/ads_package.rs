@@ -96,8 +96,8 @@ fn ads_manifest(source: &str, app: &str, banner: &str, production: bool) -> io::
     let mut m = source.to_owned();
     replace_once(
         &mut m,
-        "android:name=\"android.app.NativeActivity\"",
-        "android:name=\"com.autodevjapan.phonefrictioncontrol.ControlAdsActivity\" android:enableOnBackInvokedCallback=\"false\"",
+        "android:name=\"com.autodevjapan.phonefrictioncontrol.ControlActivity\"",
+        "android:name=\"com.autodevjapan.phonefrictioncontrol.ControlAdsActivity\"",
     )?;
     // AGP 8 は package 属性と uses-sdk を受け付けないため、build.gradle 側の値に寄せる。
     replace_once(
@@ -514,6 +514,8 @@ mod tests {
     fn ad_activity_routes_back_to_the_persistent_task_handler() {
         let manifest = ads_manifest(DEFAULT_MANIFEST, SAMPLE_APP, SAMPLE_BANNER, false).unwrap();
         assert!(manifest.contains("android:enableOnBackInvokedCallback=\"false\""));
-        assert!(!DEFAULT_MANIFEST.contains("enableOnBackInvokedCallback"));
+        assert!(DEFAULT_MANIFEST.contains("android:enableOnBackInvokedCallback=\"false\""));
+        assert_eq!(manifest.matches("enableOnBackInvokedCallback").count(), 1);
+        assert!(!manifest.contains("com.autodevjapan.phonefrictioncontrol.ControlActivity"));
     }
 }
