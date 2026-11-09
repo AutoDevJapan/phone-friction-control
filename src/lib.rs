@@ -112,7 +112,7 @@ pub fn run_preview() -> eframe::Result {
     eframe::run_native(
         "利用制限",
         options,
-        Box::new(|creation_context| Ok(Box::new(ControlApp::new(creation_context, None)))),
+        Box::new(|creation_context| Ok(Box::new(ControlApp::new_preview(creation_context)))),
     )
 }
 #[cfg(any(all(target_os = "android", feature = "ads-test"), test))]

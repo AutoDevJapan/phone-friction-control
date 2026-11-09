@@ -118,6 +118,24 @@ impl Default for SavedState {
     }
 }
 
+#[cfg(not(target_os = "android"))]
+impl SavedState {
+    fn remove_preview_session(&mut self) {
+        if self.current_day_key != "preview" {
+            return;
+        }
+        self.target_apps
+            .retain(|app| !app.package.starts_with("preview."));
+        self.current_day_key.clear();
+        self.daily_records.clear();
+        self.cooldown_until_ms = None;
+        self.limit_triggered_day = None;
+        self.last_limit_triggered_day = None;
+        self.usage_disclosure_accepted = false;
+        self.service_disclosure_accepted = false;
+    }
+}
+
 #[cfg(any(target_os = "android", test))]
 impl SavedState {
     fn accept_service_break(
@@ -185,6 +203,8 @@ pub struct ControlApp {
     ))]
     ad_pending: bool,
     saved: SavedState,
+    #[cfg(not(target_os = "android"))]
+    mode: AppMode,
     last_persisted: Option<SavedState>,
     last_persist_at: Instant,
     #[cfg(target_os = "android")]
@@ -218,13 +238,44 @@ pub struct ControlApp {
     last_inset_refresh: Instant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppMode {
+    Runtime,
+    #[cfg(not(target_os = "android"))]
+    Preview,
+}
+
+#[cfg(not(target_os = "android"))]
+impl AppMode {
+    fn prepare_saved_state(self, mut state: SavedState) -> SavedState {
+        if self == Self::Runtime {
+            state.remove_preview_session();
+        }
+        state
+    }
+}
+
 impl ControlApp {
     pub fn new(
         creation_context: &eframe::CreationContext<'_>,
         #[cfg_attr(not(target_os = "android"), allow(unused_variables))]
         #[cfg(target_os = "android")]
         android_app: Option<android_activity::AndroidApp>,
+        #[cfg(not(target_os = "android"))] android_app: Option<()>,
+    ) -> Self {
+        Self::new_in_mode(creation_context, android_app, AppMode::Runtime)
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub fn new_preview(creation_context: &eframe::CreationContext<'_>) -> Self {
+        Self::new_in_mode(creation_context, None, AppMode::Preview)
+    }
+
+    fn new_in_mode(
+        creation_context: &eframe::CreationContext<'_>,
+        #[cfg(target_os = "android")] android_app: Option<android_activity::AndroidApp>,
         #[cfg(not(target_os = "android"))] _android_app: Option<()>,
+        #[cfg_attr(target_os = "android", allow(unused_variables))] mode: AppMode,
     ) -> Self {
         configure_fonts_and_style(creation_context);
 
@@ -241,9 +292,13 @@ impl ControlApp {
         let mut state_store = std::env::var_os("HOME")
             .filter(|home| std::path::Path::new(home).is_absolute())
             .map(|home| {
-                crate::persistence::StateStore::new(
-                    std::path::PathBuf::from(home).join("Documents/usage-state.ron"),
-                )
+                crate::persistence::StateStore::new(std::path::PathBuf::from(home).join(
+                    if mode == AppMode::Preview {
+                        "Documents/preview-usage-state.ron"
+                    } else {
+                        "Documents/usage-state.ron"
+                    },
+                ))
             });
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let mut state_store: Option<crate::persistence::StateStore> = None;
@@ -262,6 +317,8 @@ impl ControlApp {
                 Err(_) => storage_error = Some("記録を読み込めないため保存を止めています。元の記録を保持して、もう一度読み込みます。".to_owned()),
             }
         }
+        #[cfg(not(target_os = "android"))]
+        let saved = mode.prepare_saved_state(saved);
         #[cfg(target_os = "android")]
         let (events_tx, events_rx) = mpsc::channel();
         let mut app = Self {
@@ -288,6 +345,8 @@ impl ControlApp {
             storage_error,
             last_state_reload: Instant::now(),
             saved,
+            #[cfg(not(target_os = "android"))]
+            mode,
             screen: Screen::Home,
             permission_granted: false,
             measurement_available: false,
@@ -321,13 +380,18 @@ impl ControlApp {
         }
 
         #[cfg(not(target_os = "android"))]
-        app.load_preview_data();
+        if mode == AppMode::Preview {
+            app.load_preview_data();
+        }
 
         app
     }
 
     #[cfg(not(target_os = "android"))]
     fn load_preview_data(&mut self) {
+        if self.mode != AppMode::Preview {
+            return;
+        }
         self.permission_granted = true;
         self.measurement_available = true;
         self.today_label = "日".to_owned();
@@ -616,6 +680,8 @@ impl ControlApp {
     }
 
     fn restore_saved_state(&mut self, state: SavedState) {
+        #[cfg(not(target_os = "android"))]
+        let state = self.mode.prepare_saved_state(state);
         self.screen = if state
             .cooldown_until_ms
             .is_some_and(|until| until > now_epoch_ms())
@@ -714,8 +780,11 @@ impl ControlApp {
         #[cfg(not(target_os = "android"))]
         {
             let _ = ctx;
-            self.permission_granted = true;
-            self.notice = Some("プレビューでは使用状況へのアクセスを許可した状態です。".to_owned());
+            if self.mode == AppMode::Preview {
+                self.permission_granted = true;
+                self.notice =
+                    Some("プレビューでは使用状況へのアクセスを許可した状態です。".to_owned());
+            }
         }
     }
 
@@ -1642,8 +1711,208 @@ impl eframe::App for ControlApp {
 mod tests {
     use super::*;
 
+    struct LegacyStorage(String);
+    impl eframe::Storage for LegacyStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            (key == SAVE_KEY).then(|| self.0.clone())
+        }
+        fn set_string(&mut self, _: &str, _: String) {}
+        fn remove_string(&mut self, _: &str) {}
+        fn flush(&mut self) {}
+    }
+
+    fn construct_from_legacy(state: &SavedState) -> ControlApp {
+        let storage = LegacyStorage(ron::to_string(state).unwrap());
+        let mut context = eframe::CreationContext::_new_kittest(egui::Context::default());
+        context.storage = Some(&storage);
+        ControlApp::new(&context, None)
+    }
+
+    fn legacy_preview_state() -> SavedState {
+        let mut preview = app();
+        preview.mode = AppMode::Preview;
+        preview.saved.target_apps.clear();
+        preview.saved.daily_limit_minutes = 300;
+        preview.saved.break_minutes = 45;
+        preview.saved.playback_only = true;
+        preview.saved.cooldown_until_ms = Some(now_epoch_ms() + 30 * 60_000);
+        preview.saved.limit_triggered_day = Some("preview".into());
+        preview.saved.last_limit_triggered_day = Some("preview".into());
+        preview.saved.usage_disclosure_accepted = true;
+        preview.saved.service_disclosure_accepted = true;
+        preview.load_preview_data();
+        preview.saved
+    }
+
+    fn assert_preview_session_removed(state: &SavedState) {
+        assert!(state.current_day_key.is_empty());
+        assert!(
+            state
+                .target_apps
+                .iter()
+                .all(|app| !app.package.starts_with("preview."))
+        );
+        assert!(state.daily_records.is_empty());
+        assert_eq!(state.cooldown_until_ms, None);
+        assert_eq!(state.limit_triggered_day, None);
+        assert_eq!(state.last_limit_triggered_day, None);
+        assert!(!state.usage_disclosure_accepted);
+        assert!(!state.service_disclosure_accepted);
+        assert_eq!(state.daily_limit_minutes, 300);
+        assert_eq!(state.break_minutes, 45);
+        assert!(state.playback_only);
+    }
+
+    struct ReloadFixture(std::path::PathBuf);
+    impl ReloadFixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "pfc-runtime-reload-{}-{stamp}-{id}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+        fn path(&self) -> std::path::PathBuf {
+            self.0.join("usage-state.ron")
+        }
+    }
+    impl Drop for ReloadFixture {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_file(self.path())
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!(
+                    "test file cleanup deferred: {}: {error}",
+                    self.path().display()
+                );
+            }
+            if let Err(error) = std::fs::remove_dir(&self.0) {
+                eprintln!(
+                    "test directory cleanup deferred: {}: {error}",
+                    self.0.display()
+                );
+            }
+        }
+    }
+
+    fn recover_store_after_failed_read(
+        model: &mut ControlApp,
+        state: &SavedState,
+        fixture: &ReloadFixture,
+    ) {
+        let path = fixture.path();
+        std::fs::write(&path, b"(corrupt").unwrap();
+        let mut store = crate::persistence::StateStore::new(path.clone());
+        assert!(store.load_and_migrate::<SavedState>().is_err());
+        assert!(!store.is_ready());
+        model.state_store = Some(store);
+        std::fs::write(&path, ron::to_string(state).unwrap()).unwrap();
+        model.last_state_reload = Instant::now() - Duration::from_secs(6);
+        let mut frame = eframe::Frame::_new_kittest();
+        eframe::App::logic(model, &egui::Context::default(), &mut frame);
+        assert!(model.state_store.as_ref().unwrap().is_ready());
+    }
+
+    #[test]
+    fn runtime_reload_after_read_error_removes_preview_session() {
+        let fixture = ReloadFixture::new();
+        let mut model = app();
+        recover_store_after_failed_read(&mut model, &legacy_preview_state(), &fixture);
+        assert_preview_session_removed(&model.saved);
+        assert_eq!(model.screen, Screen::Home);
+    }
+
+    #[test]
+    fn preview_reload_after_read_error_preserves_its_session() {
+        let fixture = ReloadFixture::new();
+        let mut model = app();
+        model.mode = AppMode::Preview;
+        let original = legacy_preview_state();
+        let persisted: SavedState = ron::from_str(&ron::to_string(&original).unwrap()).unwrap();
+        recover_store_after_failed_read(&mut model, &original, &fixture);
+        assert_eq!(model.saved, persisted);
+        assert_eq!(model.screen, Screen::Break);
+    }
+
+    #[test]
+    fn runtime_reload_after_read_error_preserves_ordinary_dated_state() {
+        let fixture = ReloadFixture::new();
+        let mut model = app();
+        let mut original = model.saved.clone();
+        original.current_day_key = "2026-11-09".into();
+        original.daily_limit_minutes = 300;
+        original.break_minutes = 45;
+        original.daily_records.push(DailyRecord {
+            day_key: original.current_day_key.clone(),
+            label: "11月9日".into(),
+            used_ms: 1234,
+            playback_only: false,
+        });
+        recover_store_after_failed_read(&mut model, &original, &fixture);
+        assert_eq!(model.saved, original);
+    }
+
+    #[test]
+    fn runtime_constructor_preserves_ordinary_legacy_storage() {
+        let mut state = app().saved;
+        state.current_day_key = "2026-11-09".into();
+        state.daily_limit_minutes = 300;
+        state.break_minutes = 45;
+        state.daily_records.push(DailyRecord {
+            day_key: state.current_day_key.clone(),
+            label: "11月9日".into(),
+            used_ms: 1234,
+            playback_only: false,
+        });
+        let actual = construct_from_legacy(&state);
+        assert_eq!(actual.saved, state);
+        assert!(!actual.permission_granted);
+        assert!(!actual.measurement_available);
+    }
+
+    #[test]
+    fn runtime_constructor_removes_only_known_preview_session() {
+        let mut state = SavedState {
+            current_day_key: "preview".into(),
+            daily_limit_minutes: 300,
+            break_minutes: 45,
+            playback_only: true,
+            cooldown_until_ms: Some(now_epoch_ms() + 30 * 60_000),
+            limit_triggered_day: Some("preview".into()),
+            last_limit_triggered_day: Some("preview".into()),
+            usage_disclosure_accepted: true,
+            service_disclosure_accepted: true,
+            target_apps: vec![TrackedApp {
+                label: "動画アプリ（プレビュー）".into(),
+                package: "preview.video".into(),
+            }],
+            ..SavedState::default()
+        };
+        state.daily_records.push(DailyRecord {
+            day_key: "preview".into(),
+            label: "サンプル".into(),
+            used_ms: 102 * 60_000,
+            playback_only: false,
+        });
+        let actual = construct_from_legacy(&state);
+        assert_eq!(actual.saved.daily_limit_minutes, 300);
+        assert!(actual.saved.target_apps.is_empty());
+        assert!(actual.saved.daily_records.is_empty());
+        assert!(!actual.permission_granted);
+        assert!(!actual.measurement_available);
+        assert_preview_session_removed(&actual.saved);
+    }
+
     fn app() -> ControlApp {
         ControlApp {
+            mode: AppMode::Runtime,
             saved: SavedState {
                 target_apps: vec![TrackedApp {
                     label: "架空動画".into(),
@@ -1682,6 +1951,62 @@ mod tests {
             boot_count: 1,
             measurement_available: true,
         }
+    }
+
+    #[test]
+    fn runtime_does_not_accept_synthetic_preview_measurements() {
+        let mut app = app();
+        let original_targets = app.saved.target_apps.clone();
+        app.load_preview_data();
+        assert!(!app.permission_granted);
+        assert!(!app.measurement_available);
+        assert!(app.usage_by_package_ms.is_empty());
+        assert!(app.saved.daily_records.is_empty());
+        assert_eq!(app.saved.target_apps, original_targets);
+        app.request_usage_settings(egui::Context::default());
+        assert!(!app.permission_granted);
+    }
+
+    #[test]
+    fn synthetic_measurements_require_an_explicit_preview_mode() {
+        let mut app = app();
+        app.mode = AppMode::Preview;
+        app.load_preview_data();
+        assert!(app.permission_granted);
+        assert!(app.measurement_available);
+        assert_eq!(
+            app.usage_by_package_ms.get("preview.video"),
+            Some(&(102 * 60_000))
+        );
+    }
+
+    #[test]
+    fn legacy_preview_session_is_not_restored_as_runtime_history() {
+        let encoded = ron::to_string(&legacy_preview_state()).unwrap();
+        let mut state: SavedState = ron::from_str(&encoded).unwrap();
+        state.remove_preview_session();
+        assert_eq!(state.daily_limit_minutes, 300);
+        assert!(state.target_apps.is_empty());
+        assert!(state.daily_records.is_empty());
+        assert!(state.current_day_key.is_empty());
+        assert!(!state.usage_disclosure_accepted);
+        assert!(!state.service_disclosure_accepted);
+        assert_preview_session_removed(&state);
+    }
+
+    #[test]
+    fn runtime_history_is_not_removed_as_preview() {
+        let mut state = app().saved;
+        state.current_day_key = "2026-11-09".into();
+        state.daily_records.push(DailyRecord {
+            day_key: state.current_day_key.clone(),
+            label: "11月9日".into(),
+            used_ms: 1234,
+            playback_only: false,
+        });
+        let before = state.clone();
+        state.remove_preview_session();
+        assert_eq!(state, before);
     }
 
     #[test]
