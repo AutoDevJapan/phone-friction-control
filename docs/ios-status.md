@@ -1,4 +1,55 @@
-# iOSの未達条件（2026-10-11確認）
+# iOSの検証状況（2026-11-10更新）
+
+## 最新の受入範囲
+
+iOS 18.5のarm64 Simulatorで、Rustからの所有付き `Binding<Bool>` 操作と、PR19時点の製品ソース（`ebb79b4`）による既存プレビュー画面の起動・設定保存・プロセス再起動後の復元を確認しました。PR21後のPreview保存先（`preview-usage-state.ron`）での再起動復元と、Runtimeの実data containerからの起動復元は未確認です。実アプリの選択・利用時間の計測・製品のScreen Time許可・監視・遮蔽・SwiftUI所有者の完全排出・正式配布は未達です。以下のSDK18.5の結果を、後半に残したSDK17.5の履歴と混ぜません。
+
+### 所有付きBindingの実呼出し
+
+Xcode 16.4 / iOS Simulator SDK18.5で、[実行42595140558](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/42595140558)は公開の `Binding<Bool>` 初期化子、値のcopy、元とコピーのdestroyを実行しました。constructor 1・copy 1・destroy 2は検査側が実行する操作数です。実測したRust owner Drop・context destroy・deallocは各2で、単独owner試験1件とBindingのcontext1件を含みます。
+
+[実行42605442750](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/42605442750)では元のBindingを破棄した後もコピーの公開getter/setterが動作し、getter初期値false、setter後の読み戻しtrue、最初の遅延getterの実測差分1回を確認しました。close後の拒否2回はRust側ガードへの直接呼出しです。解放済みのSwiftオブジェクトを呼ぶ試験ではありません。
+
+これはBool・当該SDK/Simulatorの検査です。setter内部のBL先、getterのfast path、非trivial型、SwiftUI view更新中の所有関係をすべて検証した結果ではありません。`binding_verified=false` と `full_teardown_verified=false` を維持しています。アプリを正に選択した結果や、画面全体の完全排出の代用にはしません。
+
+### 製品の起動修正と保存復元
+
+[PR19](https://github.com/AutoDevJapan/phone-friction-control/pull/19)をmainの `8ec2ceed983c83917d941a20926d1484686870ca` へ統合しました。iOSだけwgpuを選び、Metal adapterが15まで対応するinter-stage shader variablesに既定要求16を送って終了していた問題を修正しています。当該要求値だけをadapter上限との最小値にし、他のdevice要求とwgpuの検証は維持します。Android/desktopは従来のglowです。
+
+検証した製品ソースは `ebb79b4f58898a5557e8806dfa66d55a0820c297` です。Rust 1.97.1で `--locked` ビルドし、追加パッチ・診断loggerを含まない同じバイナリを[実行42631724918](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/42631724918)で再利用しました。
+
+| 対象 | SHA-256 |
+| --- | --- |
+| 実行バイナリ | `231c96d8335abd518bbd86c04b34815cd36155d30b81f6fddfe6fc2f1bd204d0` |
+| 実効Cargo.lock | `ce89b963e268a1dd2b724be1c1a04d54a58864ed1c8db31d05788301c680b661` |
+
+public XCTestで自作アプリの上限設定を120分から300分へ変更し、アプリのdata container内 `Documents/usage-state.ron` の値を確認しました。終了後のPIDは6836から7710に変わり、再起動後20秒foregroundを維持しました。保存値300分と、原スクリーンショットの「5時間」が一致します。単なる既定値の再表示ではありません。
+
+このバイナリを生成した[実行42630176629](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/42630176629)では、ビルド後の `simctl launch` が45秒でSIGALRMとなり、PID行を取得できませんでした。その原因は未特定です。同じバイナリのXCTest経由の成功と区別し、環境起因・コード起因のどちらとも断定しません。
+
+実行対象はpreview entry pointと別のSimulator用bundle IDです。画面の「1時間42分」などは架空のプレビューデータで、実利用時間・アプリ選択・Screen Time許可の証拠ではありません。Android専用の説明や操作がiOSのプレビューにも残る不一致は未解消です。platform capabilityに合う説明・操作の修正と、実制御との接続が引き続き必要です。
+
+今回の受入はiOS18.5 Simulatorのみです。実端末での動作は未検証です。
+
+### PreviewとRuntimeの保存状態の分離
+
+[PR21](https://github.com/AutoDevJapan/phone-friction-control/pull/21)をmainの `0a06976e2ddd402ed69269e0ed8a7fcf77052653` へ統合しました。Runtimeの構築と、保存読取り失敗からの再読込みは、既知のpreviewセッションだけを除去する同じ処理を通ります。通常の日付付き履歴と上限・休憩設定を保持し、Previewモードのセッションは保持します。iOSのPreview用保存先は `Documents/preview-usage-state.ron`、Runtime用は `Documents/usage-state.ron` としてコード上で分離しています。
+
+製品ソース `6dcc3e95880a7d2baac5bee018dd31f266acd16d` の[実行42661582371](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/42661582371)では、追加パッチ・診断loggerなしでビルドし、iOS18.5 Simulator上の構築試験2件と保存読取りエラーからの回復試験3件が成功しました。実行したのは、通常の旧保存値の保持、既知previewだけの除去、Preview再読込みの保持、Runtime再読込みでのpreview除去・通常履歴保持です。保存用fixtureを使うテストであり、Runtimeの実data containerへ保存された状態からの起動復元を示す結果ではありません。
+
+| 対象 | SHA-256 |
+| --- | --- |
+| 実行バイナリ | `3918459bb11ee070418e686b129ba1a4f647ab225b49aa9a80ca6b34b753986d` |
+| 試験バイナリ | `fb4c911303f77f7f8b4173b43e93700420203591c2b3bf52e5bf66cd412c96f3` |
+| 実効Cargo.lock | `ce89b963e268a1dd2b724be1c1a04d54a58864ed1c8db31d05788301c680b661` |
+
+同じ実行でPreviewの起動PID7845が20秒後も生存し、原画像に製品画面を確認しました。表示は上限2時間・架空利用時間1時間42分です。前述のPR19ソースにおける120→300分のUI変更・終了再起動復元とは別の受入で、実利用時間やOS許可を検証した結果ではありません。PR21後のPreview保存先でのUI変更後の終了・再起動復元は未確認です。
+
+### 検査ホストでのカテゴリ操作
+
+iOS18.5の[実行42644663948](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/42644663948)では、公開Picker上のSocialカテゴリを実際に操作し、原画像の未チェックからチェックへの変化と、Selectionのsetter呼出しが0から6へ増えたことを確認しました。公開applications getterの件数は0のままです。カテゴリtoken件数・値の非空性・コピー保存後の所有排出は未確認で、個別アプリの選択・計測・遮蔽の成功には数えません。検査ホストは選択値とcontextを保持しており、画面全体の完全排出も未確認です。
+
+## 2026-10-11確認時点の未達条件（以下は過去の記録）
 
 iOS製品の許可画面・アプリ選択・計測・遮蔽は未実装です。Rustの検査ホストでは、Simulatorの個人向け許可操作と、公開getterによる許可済み状態の取得まで確認しました。検査ホストでの成功と、製品の画面・選択・制御の完成は区別します。
 
