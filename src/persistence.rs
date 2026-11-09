@@ -102,6 +102,32 @@ mod tests {
     }
 
     #[test]
+    fn loading_legacy_file_rewrites_without_a_metric_change() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Legacy {
+            current: u64,
+            #[serde(default, skip_serializing)]
+            history: Vec<u64>,
+            deadline: Option<i64>,
+        }
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.path(),
+            "(current:44,history:[12,13],deadline:Some(123456))",
+        )
+        .unwrap();
+        let mut store = StateStore::new(fixture.path());
+        let state = store.load::<Legacy>().unwrap().unwrap();
+        assert_eq!(state.history, [12, 13]);
+        assert_eq!(state.current, 44);
+        assert_eq!(state.deadline, Some(123456));
+        let disk = fs::read_to_string(fixture.path()).unwrap();
+        assert!(!disk.contains("history"));
+        let restored: Legacy = ron::from_str(&disk).unwrap();
+        assert_eq!(restored.current, 44);
+        assert_eq!(restored.deadline, state.deadline);
+    }
+    #[test]
     fn successful_save_replaces_existing_state() {
         let fixture = Fixture::new();
         assert_eq!(load::<Vec<u64>>(&fixture.path()).unwrap(), None);
