@@ -442,6 +442,12 @@ impl ControlApp {
         self.permission_granted = snapshot.permission_granted;
         self.measurement_available = snapshot.permission_granted && snapshot.measurement_available;
         self.today_label = snapshot.day_label.clone();
+        if !snapshot.day_key.is_empty() && self.saved.current_day_key != snapshot.day_key {
+            self.saved.current_day_key = snapshot.day_key.clone();
+            self.saved
+                .daily_records
+                .retain(|r| r.day_key == snapshot.day_key);
+        }
         if !snapshot.permission_granted || !snapshot.measurement_available {
             // Losing access does not turn an already recorded day into zero usage.
             return;
@@ -1766,7 +1772,7 @@ mod tests {
         let mut app = app();
         app.apply_usage_snapshot(snapshot(1, 44));
         let saved = app.saved.clone();
-        let mut unavailable = snapshot(2, 0);
+        let mut unavailable = snapshot(1, 0);
         unavailable.measurement_available = false;
         app.apply_usage_snapshot(unavailable);
         assert_eq!(app.saved, saved);
@@ -1774,6 +1780,19 @@ mod tests {
         assert_eq!(app.today_usage_ms(), 44 * 60_000);
     }
 
+    #[test]
+    fn known_new_day_without_measurement_drops_previous_day_not_break() {
+        let mut app = app();
+        app.apply_usage_snapshot(snapshot(1, 120));
+        let deadline = app.saved.cooldown_until_ms;
+        let mut unavailable = snapshot(2, 0);
+        unavailable.measurement_available = false;
+        app.apply_usage_snapshot(unavailable);
+        assert_eq!(app.saved.current_day_key, "2026-10-02");
+        assert!(app.saved.daily_records.is_empty());
+        assert_eq!(app.saved.cooldown_until_ms, deadline);
+        assert_eq!(app.display_usage(), "取得できません");
+    }
     #[test]
     fn an_os_history_reset_cannot_erase_a_recorded_day() {
         let mut app = app();

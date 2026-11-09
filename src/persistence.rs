@@ -13,9 +13,17 @@ impl StateStore {
         Self { path, ready: false }
     }
 
-    pub fn load<T: serde::de::DeserializeOwned>(&mut self) -> io::Result<Option<T>> {
+    pub fn load<T: serde::de::DeserializeOwned + serde::Serialize>(
+        &mut self,
+    ) -> io::Result<Option<T>> {
         let result = load(&self.path);
         self.ready = result.is_ok();
+        if let Ok(Some(value)) = &result {
+            let canonical = ron::to_string(value).map_err(io::Error::other)?;
+            if fs::read_to_string(&self.path)? != canonical {
+                save(&self.path, value)?;
+            }
+        }
         result
     }
 
