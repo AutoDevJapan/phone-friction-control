@@ -899,7 +899,7 @@ fn configure_consent_test_geography(
         "(Landroid/content/Context;)V",
         &[JValue::Object(&context)],
     )?;
-    let Some(geography) = crate::ad_config::consent_debug_geography() else {
+    let Some(geography) = crate::consent_debug_geography() else {
         return Ok(());
     };
     // UMP DebugGeography.DEBUG_GEOGRAPHY_EEA = 1; emulators are test devices.
