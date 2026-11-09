@@ -1,0 +1,6 @@
+package: name='com.autodevjapan.phonefrictioncontrol' versionCode='2' versionName='0.2.0' platformBuildVersionName='16' platformBuildVersionCode='36' compileSdkVersion='36' compileSdkVersionCodename='16'
+sdkVersion:'26'
+targetSdkVersion:'36'
+uses-permission: name='android.permission.PACKAGE_USAGE_STATS'
+application-debuggable
+native-code: 'x86_64'

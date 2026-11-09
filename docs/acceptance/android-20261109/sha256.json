@@ -1,0 +1,46 @@
+[
+  {
+    "file": "apk-manifest.txt",
+    "sha256": "515649dfc5b29949e49619a2c290fe636d4f64c83f4958552cc3f3e98d23a76a"
+  },
+  {
+    "file": "break.png",
+    "sha256": "d89616ad615d4f6cb5b4088f817aad338c63dc82e51bb325b25168292720898b"
+  },
+  {
+    "file": "disclosure.png",
+    "sha256": "54ac99a3312f92af48e1e04a2e85f0efd82f3d234c96bac718da8e70f00d3382"
+  },
+  {
+    "file": "expired.png",
+    "sha256": "9e2c44f3a182ecb77803eae9025e917fa29c8681966347d6ec9042e5fb3aad9f"
+  },
+  {
+    "file": "normal-config.ron",
+    "sha256": "10ebbbb22466dcdce16b77038ddd5aeb449be2203bb67210f9ae23dc32ef47dc"
+  },
+  {
+    "file": "observations.json",
+    "sha256": "e17c438fa028b4a06431f95642be3316669a90112400ac3b6c567a052e1b1232"
+  },
+  {
+    "file": "phone-clock-test.log",
+    "sha256": "71f526bb788607786e9edf9c3ddcb0db65ce77cbbb3c45b615990b4b259c3749"
+  },
+  {
+    "file": "phone-midnight-test.log",
+    "sha256": "129c47d55bb289c107c7d58c302cb80ebefd2122c630db064fe02f194fe2682d"
+  },
+  {
+    "file": "README.md",
+    "sha256": "207589397fa0fda4563002d287e14d6a44507f85feb318ce3155fc1281ed73a7"
+  },
+  {
+    "file": "ui-save.png",
+    "sha256": "33b1dad503080ba573e573046fc056d8bc8b308747323e523c6383980582dd21"
+  },
+  {
+    "file": "unavailable.png",
+    "sha256": "09299958350786198b720181fabaed556dab379b173c0ba96d941dd5fb4f4251"
+  }
+]
