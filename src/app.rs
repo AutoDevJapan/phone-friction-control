@@ -185,6 +185,8 @@ pub struct ControlApp {
     ))]
     ad_pending: bool,
     saved: SavedState,
+    #[cfg(not(target_os = "android"))]
+    mode: AppMode,
     last_persisted: Option<SavedState>,
     last_persist_at: Instant,
     #[cfg(target_os = "android")]
@@ -218,13 +220,34 @@ pub struct ControlApp {
     last_inset_refresh: Instant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppMode {
+    Runtime,
+    #[cfg(not(target_os = "android"))]
+    Preview,
+}
+
 impl ControlApp {
     pub fn new(
         creation_context: &eframe::CreationContext<'_>,
         #[cfg_attr(not(target_os = "android"), allow(unused_variables))]
         #[cfg(target_os = "android")]
         android_app: Option<android_activity::AndroidApp>,
+        #[cfg(not(target_os = "android"))] android_app: Option<()>,
+    ) -> Self {
+        Self::new_in_mode(creation_context, android_app, AppMode::Runtime)
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub fn new_preview(creation_context: &eframe::CreationContext<'_>) -> Self {
+        Self::new_in_mode(creation_context, None, AppMode::Preview)
+    }
+
+    fn new_in_mode(
+        creation_context: &eframe::CreationContext<'_>,
+        #[cfg(target_os = "android")] android_app: Option<android_activity::AndroidApp>,
         #[cfg(not(target_os = "android"))] _android_app: Option<()>,
+        #[cfg_attr(target_os = "android", allow(unused_variables))] mode: AppMode,
     ) -> Self {
         configure_fonts_and_style(creation_context);
 
@@ -232,6 +255,10 @@ impl ControlApp {
             .storage
             .and_then(|storage| eframe::get_value(storage, SAVE_KEY))
             .unwrap_or_default();
+        #[cfg(not(target_os = "android"))]
+        if mode == AppMode::Runtime {
+            saved = SavedState::default();
+        }
         #[cfg(target_os = "android")]
         let mut state_store = android_app
             .as_ref()
@@ -241,9 +268,13 @@ impl ControlApp {
         let mut state_store = std::env::var_os("HOME")
             .filter(|home| std::path::Path::new(home).is_absolute())
             .map(|home| {
-                crate::persistence::StateStore::new(
-                    std::path::PathBuf::from(home).join("Documents/usage-state.ron"),
-                )
+                crate::persistence::StateStore::new(std::path::PathBuf::from(home).join(
+                    if mode == AppMode::Preview {
+                        "Documents/preview-usage-state.ron"
+                    } else {
+                        "Documents/usage-state.ron"
+                    },
+                ))
             });
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let mut state_store: Option<crate::persistence::StateStore> = None;
@@ -288,6 +319,8 @@ impl ControlApp {
             storage_error,
             last_state_reload: Instant::now(),
             saved,
+            #[cfg(not(target_os = "android"))]
+            mode,
             screen: Screen::Home,
             permission_granted: false,
             measurement_available: false,
@@ -321,13 +354,18 @@ impl ControlApp {
         }
 
         #[cfg(not(target_os = "android"))]
-        app.load_preview_data();
+        if mode == AppMode::Preview {
+            app.load_preview_data();
+        }
 
         app
     }
 
     #[cfg(not(target_os = "android"))]
     fn load_preview_data(&mut self) {
+        if self.mode != AppMode::Preview {
+            return;
+        }
         self.permission_granted = true;
         self.measurement_available = true;
         self.today_label = "日".to_owned();
@@ -714,8 +752,11 @@ impl ControlApp {
         #[cfg(not(target_os = "android"))]
         {
             let _ = ctx;
-            self.permission_granted = true;
-            self.notice = Some("プレビューでは使用状況へのアクセスを許可した状態です。".to_owned());
+            if self.mode == AppMode::Preview {
+                self.permission_granted = true;
+                self.notice =
+                    Some("プレビューでは使用状況へのアクセスを許可した状態です。".to_owned());
+            }
         }
     }
 
@@ -1644,6 +1685,7 @@ mod tests {
 
     fn app() -> ControlApp {
         ControlApp {
+            mode: AppMode::Runtime,
             saved: SavedState {
                 target_apps: vec![TrackedApp {
                     label: "架空動画".into(),
@@ -1682,6 +1724,33 @@ mod tests {
             boot_count: 1,
             measurement_available: true,
         }
+    }
+
+    #[test]
+    fn runtime_does_not_accept_synthetic_preview_measurements() {
+        let mut app = app();
+        let original_targets = app.saved.target_apps.clone();
+        app.load_preview_data();
+        assert!(!app.permission_granted);
+        assert!(!app.measurement_available);
+        assert!(app.usage_by_package_ms.is_empty());
+        assert!(app.saved.daily_records.is_empty());
+        assert_eq!(app.saved.target_apps, original_targets);
+        app.request_usage_settings(egui::Context::default());
+        assert!(!app.permission_granted);
+    }
+
+    #[test]
+    fn synthetic_measurements_require_an_explicit_preview_mode() {
+        let mut app = app();
+        app.mode = AppMode::Preview;
+        app.load_preview_data();
+        assert!(app.permission_granted);
+        assert!(app.measurement_available);
+        assert_eq!(
+            app.usage_by_package_ms.get("preview.video"),
+            Some(&(102 * 60_000))
+        );
     }
 
     #[test]
