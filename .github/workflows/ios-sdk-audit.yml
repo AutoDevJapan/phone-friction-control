@@ -2,6 +2,10 @@ name: Manual iOS SDK audit
 on:
   workflow_dispatch:
     inputs:
+      product_native_storage_acceptance:
+        description: Test the product Runtime Documents store with synthetic settings in its own fresh Simulator container
+        type: boolean
+        default: false
       authorization_status_entry_probe:
         description: Inspect public authorization status metadata and getter entry without requesting access or calling the getter
         type: boolean
@@ -54,7 +58,84 @@ on:
 permissions:
   contents: read
 jobs:
+  product-native-storage:
+    if: inputs.product_native_storage_acceptance
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          targets: aarch64-apple-ios-sim
+      - name: Run the product native Documents acceptance tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer
+          SDK=$(xcrun --sdk iphonesimulator --show-sdk-path)
+          export SDKROOT="$SDK"
+          export IPHONEOS_DEPLOYMENT_TARGET=18.5
+          OUT="$RUNNER_TEMP/native-storage"
+          mkdir -p "$OUT/NativeStorageTests.app"
+          {
+            xcodebuild -version
+            xcrun --sdk iphonesimulator --show-sdk-version
+            rustc --version --verbose
+            uname -m
+          } > "$OUT/versions.txt"
+          test "$(xcrun --sdk iphonesimulator --show-sdk-version)" = 18.5
+          test "$(uname -m)" = arm64
+          test '${{ inputs.selection_inspection_mode }}' = none
+          for OPTION in '${{ inputs.authorization_probe }}' '${{ inputs.native_uikit_host }}' '${{ inputs.xcode_signed_host }}' '${{ inputs.ui_consent_test }}' '${{ inputs.ui_continue }}' '${{ inputs.authorization_status_entry_probe }}' '${{ inputs.authorization_status_value_probe }}' '${{ inputs.authorization_status_consent_probe }}' '${{ inputs.collect_xctest_headers }}'; do test "$OPTION" = false; done
+          git rev-parse HEAD > "$OUT/product-source.txt"
+          printf 'mode=product_native_storage_acceptance\nsynthetic_scalar_settings_only=true\nproduction_ui_exercised=false\nscreen_time_control_exercised=false\n' > "$OUT/scope.txt"
+          cargo test --locked --release --no-run --lib --features desktop-preview --target aarch64-apple-ios-sim --message-format=json > "$OUT/build-full.json" 2> "$OUT/build-full.txt"
+          TEST_EXE=$(jq -ser '[.[] | select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "phone_friction_control") | .executable | select(. != null)] | unique | if length == 1 then .[0] else error("native test executable unavailable") end' "$OUT/build-full.json")
+          cp "$TEST_EXE" "$OUT/NativeStorageTests.app/native-storage-tests"
+          printf '<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.autodevjapan.phonefrictioncontrol.native-storage-tests</string><key>CFBundleName</key><string>NativeStorageTests</string><key>CFBundleExecutable</key><string>native-storage-tests</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>1</string><key>CFBundleShortVersionString</key><string>0.1.0</string><key>MinimumOSVersion</key><string>18.5</string><key>UIDeviceFamily</key><array><integer>1</integer></array><key>UILaunchScreen</key><dict/><key>CFBundleSupportedPlatforms</key><array><string>iPhoneSimulator</string></array></dict></plist>\n' > "$OUT/NativeStorageTests.app/Info.plist"
+          codesign --sign - "$OUT/NativeStorageTests.app"
+          codesign --verify --strict "$OUT/NativeStorageTests.app"
+          shasum -a 256 "$OUT/NativeStorageTests.app/native-storage-tests" Cargo.lock src/app.rs .github/workflows/ios-sdk-audit.yml > "$OUT/build-hashes.txt"
+          cp Cargo.lock "$OUT/effective-Cargo.lock"
+          RUNTIME=$(xcrun simctl list runtimes -j | jq -er '[.runtimes[] | select(.isAvailable and .version == "18.5" and (.identifier | contains("iOS"))) | .identifier] | if length == 1 then .[0] else error("iOS18.5 runtime unavailable") end')
+          SIM_ID=$(xcrun simctl create native-storage-audit com.apple.CoreSimulator.SimDeviceType.iPhone-15 "$RUNTIME")
+          trap 'xcrun simctl shutdown "$SIM_ID" || true; xcrun simctl delete "$SIM_ID" || true' EXIT
+          xcrun simctl boot "$SIM_ID"
+          perl -e 'alarm 120; exec @ARGV; die "exec failed\n"' xcrun simctl bootstatus "$SIM_ID" -b
+          xcrun simctl install "$SIM_ID" "$OUT/NativeStorageTests.app"
+          BID=com.autodevjapan.phonefrictioncontrol.native-storage-tests
+          DATA=$(xcrun simctl get_app_container "$SIM_ID" "$BID" data)
+          test ! -e "$DATA/Documents/usage-state.ron"
+          test ! -e "$DATA/Documents/usage-state.pending"
+          export SIMCTL_CHILD_PHONE_CONTROL_NATIVE_TEST_HOME="$DATA"
+          STATUS=0
+          perl -e 'alarm 90; exec @ARGV; die "exec failed\n"' xcrun simctl launch --console "$SIM_ID" "$BID" runtime_native_documents_ --nocapture --test-threads=1 > "$OUT/test-result.txt" 2>&1 || STATUS=$?
+          printf 'native_test_exit_status=%s\n' "$STATUS" > "$OUT/test-status.txt"
+          PID=$(awk -v b="$BID" 'index($0,b ": ")==1 {p=substr($0,length(b)+3); if(p ~ /^[0-9]+$/) print p}' "$OUT/test-result.txt")
+          printf 'test_pid=%s\n' "$PID" > "$OUT/pid.txt"
+          test "$STATUS" = 0
+          [[ "$PID" =~ ^[0-9]+$ ]]
+          grep -F 'app::tests::runtime_native_documents_roundtrip_preserves_nondefault_state' "$OUT/test-result.txt"
+          grep -F 'app::tests::runtime_native_documents_failed_load_blocks_overwrite' "$OUT/test-result.txt"
+          grep -F 'test result: ok. 2 passed; 0 failed;' "$OUT/test-result.txt"
+          grep -F 'initial_fixture_limit=300; file_readback_limit=360; reconstructed_limit=360; os_permission_verified=false; process_restart_verified=false; owned_fixture_cleanup=true' "$OUT/test-result.txt"
+          grep -F 'runtime_native_documents_failed_load_preserved=true; overwrite_blocked=true; owned_fixture_cleanup=true' "$OUT/test-result.txt"
+          test ! -e "$DATA/Documents/usage-state.ron"
+          test ! -e "$DATA/Documents/usage-state.pending"
+          printf 'native_model_store_roundtrip_verified=true\nfailed_load_overwrite_rejected=true\nowned_fixture_files_absent=true\nproduct_ui_verified=false\nprocess_restart_verified=false\nscreen_time_control_verified=false\n' > "$OUT/result.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: product-native-storage-acceptance
+          path: |
+            ${{ runner.temp }}/native-storage/*.txt
+            ${{ runner.temp }}/native-storage/*.json
+            ${{ runner.temp }}/native-storage/*.lock
+          retention-days: 3
+          if-no-files-found: error
   sdk-audit:
+    if: ${{ !inputs.product_native_storage_acceptance }}
     runs-on: macos-14
     timeout-minutes: 10
     steps:
