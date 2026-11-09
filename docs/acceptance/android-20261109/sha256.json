@@ -21,7 +21,7 @@
   },
   {
     "file": "observations.json",
-    "sha256": "ac97a283f69ef5f390f753bd9cca37a548eff9bf167a655f113ac229a4432f5f"
+    "sha256": "cbc2e4b8dd959c45aa24527ba7b56f2b4b972e19802a4d6a22086b156f48a212"
   },
   {
     "file": "phone-clock-test.log",
@@ -33,7 +33,15 @@
   },
   {
     "file": "README.md",
-    "sha256": "4b8055431be22b18bb63ba899df55327a956e95ef6ed6273d12ef519eabc8a1d"
+    "sha256": "f6af2e673bc72baa753bf2af2cc2c50fe594496a19dfcd0a70b70db2afca0571"
+  },
+  {
+    "file": "restored-guard-config.ron",
+    "sha256": "f14c51960f1bad9c6b5d4a293d43732f9f18d5cfe429b61449e81839d6e00354"
+  },
+  {
+    "file": "restored-usage-state.ron",
+    "sha256": "f14c51960f1bad9c6b5d4a293d43732f9f18d5cfe429b61449e81839d6e00354"
   },
   {
     "file": "ui-save.png",
