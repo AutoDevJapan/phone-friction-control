@@ -1,0 +1,1 @@
+(target_apps:[(label:"Chrome",package:"com.android.chrome")],daily_limit_minutes:120,break_minutes:30,cooldown_until_ms:Some(1794195025707),limit_triggered_day:Some("2026-11-09"),current_day_key:"2026-11-09",daily_records:[(day_key:"2026-11-09",label:"11月9日",used_ms:556105,playback_only:false)],usage_disclosure_accepted:true,playback_only:false,service_disclosure_accepted:true)

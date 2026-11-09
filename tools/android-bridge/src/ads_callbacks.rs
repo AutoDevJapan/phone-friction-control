@@ -4,8 +4,8 @@
 //! すべて native として Rust ライブラリへ渡す。JVM 側に処理の中身は持たない。
 
 use super::{
-    constructor, native, op, Method, Pool, ACC_PUBLIC, ACC_STATIC, ACC_SUPER, INVOKESTATIC, LDC_W,
-    LIBRARY, PACKAGE, RETURN,
+    ACC_PUBLIC, ACC_STATIC, ACC_SUPER, INVOKESTATIC, LDC_W, LIBRARY, Method, PACKAGE, Pool, RETURN,
+    constructor, native, op,
 };
 use std::{fs, path::Path};
 
@@ -91,6 +91,20 @@ fn generate_class(
             name: pool.utf8("onPause"),
             desc: pool.utf8("()V"),
             code: Some((1, 1, code)),
+        });
+    }
+    if simple == "ControlAdsActivity" {
+        // winit cannot create a second event loop in the same Android process.
+        // Back backgrounds the task instead of destroying its NativeActivity.
+        let move_back = pool.method_ref("android/app/Activity", "moveTaskToBack", "(Z)Z");
+        let mut code = vec![0x2a, 0x04]; // this, true
+        code.extend(op(0xb6, move_back));
+        code.extend([0x57, RETURN]); // discard boolean result
+        methods.push(Method {
+            access: ACC_PUBLIC,
+            name: pool.utf8("onBackPressed"),
+            desc: pool.utf8("()V"),
+            code: Some((2, 1, code)),
         });
     }
     let code_name = pool.utf8("Code");
@@ -313,5 +327,20 @@ mod tests {
             }
             assert_eq!(c.methods, want_methods, "{want}");
         }
+    }
+    #[test]
+    fn back_keeps_the_native_event_loop_activity_alive() {
+        let bytes = generate_class(
+            "ControlAdsActivity",
+            "android/app/NativeActivity",
+            None,
+            &[("onHostPause", "()V".into())],
+        );
+        let c = parse(&bytes);
+        assert!(
+            c.methods
+                .iter()
+                .any(|(_, name, desc, code)| name == "onBackPressed" && desc == "()V" && *code)
+        );
     }
 }

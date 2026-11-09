@@ -56,3 +56,22 @@ mod tests {
         assert!(validate(app, "ca-app-pub-1234567890123456~9876543210", true).is_err());
     }
 }
+
+#[cfg(test)]
+mod consent_debug_tests {
+    #[test]
+    fn consent_debug_geography_matches_the_selected_build() {
+        assert_eq!(
+            super::consent_debug_geography(),
+            cfg!(feature = "ads-test").then_some(1)
+        );
+    }
+}
+#[cfg(any(feature = "ads-test", test))]
+pub(crate) const fn consent_debug_geography() -> Option<i32> {
+    if cfg!(feature = "ads-test") {
+        Some(1)
+    } else {
+        None
+    }
+}
