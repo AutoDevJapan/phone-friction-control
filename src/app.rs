@@ -949,7 +949,15 @@ impl ControlApp {
             })
             .inner_margin(egui::Margin::same(14))
             .show(ui, |ui| {
-                ui.label("使いすぎを防いで、やりたいことに集中できる毎日へ。");
+                ui.label(
+                    RichText::new("使いすぎを防いで、やりたいことに集中できる毎日へ。").color(
+                        if ui.visuals().dark_mode {
+                            Color32::from_gray(180)
+                        } else {
+                            INK
+                        },
+                    ),
+                );
             });
 
         ui.add_space(10.0);
