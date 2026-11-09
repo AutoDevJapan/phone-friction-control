@@ -11,6 +11,7 @@ const SAVE_KEY: &str = "phone-friction-control-v1";
 const ORANGE: Color32 = Color32::from_rgb(239, 96, 34);
 const PAPER: Color32 = Color32::from_rgb(247, 244, 238);
 const INK: Color32 = Color32::from_rgb(37, 36, 34);
+const MUTED: Color32 = Color32::from_rgb(104, 101, 96);
 const DARK: Color32 = Color32::from_rgb(31, 31, 32);
 const DEFAULT_LIMIT_MINUTES: u32 = 120;
 const DEFAULT_BREAK_MINUTES: u32 = 30;
@@ -853,7 +854,11 @@ impl ControlApp {
                     ui.label(
                         RichText::new("上限")
                             .size(14.0)
-                            .color(ui.visuals().weak_text_color()),
+                            .color(if ui.visuals().dark_mode {
+                                Color32::from_gray(180)
+                            } else {
+                                MUTED
+                            }),
                     );
                 });
             });
@@ -865,7 +870,11 @@ impl ControlApp {
                     } else {
                         "今日の利用時間"
                     })
-                    .color(ui.visuals().weak_text_color()),
+                    .color(if ui.visuals().dark_mode {
+                        Color32::from_gray(180)
+                    } else {
+                        MUTED
+                    }),
                 );
                 if self.usage_loading {
                     ui.spinner();
@@ -886,8 +895,13 @@ impl ControlApp {
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
-                        RichText::new(format_limit(self.saved.daily_limit_minutes))
-                            .color(ui.visuals().weak_text_color()),
+                        RichText::new(format_limit(self.saved.daily_limit_minutes)).color(
+                            if ui.visuals().dark_mode {
+                                Color32::from_gray(180)
+                            } else {
+                                MUTED
+                            },
+                        ),
                     );
                 });
             });
@@ -949,14 +963,14 @@ impl ControlApp {
                         ui.scroll_to_rect(slot.expand(16.0), Some(Align::Center));
                         ctx.request_repaint();
                     }
-                    ui.label(RichText::new("広告を閉じても休憩や制限は変わりません。").size(12.0).color(ui.visuals().weak_text_color()));
+                    ui.label(RichText::new("広告を閉じても休憩や制限は変わりません。").size(12.0).color(if ui.visuals().dark_mode { Color32::from_gray(180) } else { MUTED }));
                 }
                 #[cfg(not(all(target_os = "android", any(feature = "ads-test", feature = "ads-production"))))]
                 {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(RichText::new("広告").strong());
-                        ui.label(RichText::new("任意表示の枠（配信準備中）").color(ui.visuals().weak_text_color()));
+                        ui.label(RichText::new("任意表示の枠（配信準備中）").color(if ui.visuals().dark_mode { Color32::from_gray(180) } else { MUTED }));
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(RichText::new("›").size(24.0).color(ORANGE));
@@ -965,7 +979,7 @@ impl ControlApp {
                 ui.label(
                     RichText::new("休憩時間の解除条件には使いません。")
                         .size(12.0)
-                        .color(ui.visuals().weak_text_color()),
+                        .color(if ui.visuals().dark_mode { Color32::from_gray(180) } else { MUTED }),
                 );
                 }
             });
@@ -1057,10 +1071,13 @@ impl ControlApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("広告").strong());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new("任意表示・配信準備中")
-                                .color(ui.visuals().weak_text_color()),
-                        );
+                        ui.label(RichText::new("任意表示・配信準備中").color(
+                            if ui.visuals().dark_mode {
+                                Color32::from_gray(180)
+                            } else {
+                                MUTED
+                            },
+                        ));
                     });
                 });
             });
@@ -1499,7 +1516,11 @@ impl eframe::App for ControlApp {
                                 let color = if selected {
                                     ORANGE
                                 } else {
-                                    ui.visuals().weak_text_color()
+                                    if ui.visuals().dark_mode {
+                                        Color32::from_gray(180)
+                                    } else {
+                                        MUTED
+                                    }
                                 };
                                 let response = ui.add_sized(
                                     [item_width, 48.0],
