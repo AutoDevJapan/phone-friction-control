@@ -2,6 +2,27 @@
 
 PR1のAndroid実装を確認した記録です。製品全体の完成を示すものではありません。
 
+## 正式署名0.4.2の追加受入（2026-11-09）
+
+以下は [PR17](https://github.com/AutoDevJapan/phone-friction-control/pull/17) を統合したコミット `edff2beb21e7ef7924ba0e04a64cd575f6237c95` の広告なし正式署名APK（versionName 0.4.2、versionCode 13）で確認しました。下に残した過去のAPK・OS・iOS記録とは別の受入です。一般配布の成功を示しません。
+
+| 成果物 | APK SHA-256 |
+|---|---|
+| x86_64 | `F9C36BCCAE6C79D673C108A586B4520A6F7F83C214E21BD5B6AE64C02A4D69FD` |
+| arm64-v8a | `D2D6628D64CA15821C4A27C329447F9529B8C3E6D4910C18EF22E5B268A5DF3D` |
+
+両APKでv2/v3署名、既存の製品証明書との一致、デバッグ不可、minSdk26・targetSdk36、各ABIと16KB ZIP配置を独立に確認しました。署名検証は実行時の機能確認とは区別します。
+
+| 環境・操作 | 確認した結果と限界 |
+|---|---|
+| Android 8.0／API26、x86_64仮想端末 | 通常の説明からUsageアクセスを許可し、Chromeを選択。強制停止後も選択を保持。通常のユーザー補助設定でサービスを有効化 |
+| API26の通常上限・休憩 | 画面で30分上限・5分休憩を設定。Chromeの前面利用から休憩画面へ切替。実時計で期限前の再入拒否、期限後のChrome起動を確認。時計変更・短縮値注入は行っていない。動画再生停止の検査ではない |
+| API26の起動・更新・HOME | 旧NativeActivityコンポーネント経由で起動、Back後同一プロセスで復帰。同じAPKの上書きインストール後も選択・設定・当日30分を保持。HOMEの選択画面で本アプリをAlwaysに設定し、ChromeからHOMEで復帰。fontScale変更後のプロセス維持は確認したが、Destroy/Createは未確認 |
+| 物理Galaxy S24（SC-51E）、API36、arm64-v8aのみ、縦画面 | Google Test LabのRobo検査1回、194秒でSUCCESS。初回描画、対象なしから3アプリ選択、休憩30分から25分への変更、Back/Home操作後の再launchと描画を確認。新品の検査状態へAPKのみを送り、利用者の保存データは送っていない |
+| S24の未検証範囲 | Usageアクセスは未許可で取得不能表示。サービスによる制御・実休憩・回転・同一PIDの保持は未検証。Robo全体のSUCCESSをこれらの成功へ一般化しない |
+
+物理端末検査は課金未有効の専用projectから無料枠で行った私的な検査です。公開配布ではありません。[Test Labの結果の読み方](https://firebase.google.com/docs/test-lab/android/analyzing-results)に従い、検査終了と個々の操作の受入を分けています。API27や他機種へは一般化せず、API26にシステム暗モードがないことを欠陥とは扱いません。原API結果・操作履歴・画像・署名検証記録は非公開の検証記録に保持しています。
+
 ## 検査
 
 - 最新ソースの全workspace: nextest 47件成功、失敗・省略0。実行ID `ad12fb80-c5e5-43b4-a911-2aae9544c664`。
