@@ -258,9 +258,11 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                         });
                         let mut storage_error = !guard_store.is_ready() || !config_store.is_ready();
                         let mut wrote = false;
-                        if last_saved.as_ref() != Some(state)
-                            && (critical || last_save.elapsed() >= Duration::from_secs(10))
-                        {
+                        if crate::enforcement::guard_save_due(
+                            last_saved.as_ref() != Some(state),
+                            critical,
+                            last_save.elapsed(),
+                        ) {
                             match guard_store.save(state) {
                                 Ok(()) => {
                                     last_saved = Some(state.clone());

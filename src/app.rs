@@ -134,8 +134,13 @@ impl SavedState {
         if triggered_day.is_some() {
             self.limit_triggered_day = triggered_day;
         }
-        if last_triggered_day.is_some() {
-            self.last_limit_triggered_day = last_triggered_day;
+        if let Some(day) = last_triggered_day
+            && self
+                .last_limit_triggered_day
+                .as_deref()
+                .is_none_or(|current| day.as_str() > current)
+        {
+            self.last_limit_triggered_day = Some(day);
         }
     }
     pub(crate) fn policy(&self) -> crate::enforcement::Policy {
@@ -507,7 +512,14 @@ impl ControlApp {
 
     fn begin_break(&mut self, now_ms: i64, day_key: String) {
         self.saved.limit_triggered_day = Some(day_key.clone());
-        self.saved.last_limit_triggered_day = Some(day_key);
+        if self
+            .saved
+            .last_limit_triggered_day
+            .as_deref()
+            .is_none_or(|day| day_key.as_str() > day)
+        {
+            self.saved.last_limit_triggered_day = Some(day_key);
+        }
         self.saved.cooldown_until_ms =
             Some(now_ms + i64::from(self.saved.break_minutes.max(1)) * 60_000);
         self.screen = Screen::Break;
@@ -1776,6 +1788,28 @@ mod tests {
         assert_eq!(app.screen, Screen::Home);
         app.apply_usage_snapshot(snapshot(3, 120));
         assert!(app.saved.cooldown_until_ms.is_some());
+    }
+    #[test]
+    fn stale_service_marker_cannot_move_ui_marker_backward() {
+        let mut state = SavedState::default();
+        state.accept_service_break(None, None, Some("2026-10-03".into()), 1000);
+        state.accept_service_break(None, None, Some("2026-10-02".into()), 2000);
+        assert_eq!(
+            state.last_limit_triggered_day.as_deref(),
+            Some("2026-10-03")
+        );
+        state.accept_service_break(
+            Some(9000),
+            Some("2026-10-03".into()),
+            Some("2026-10-04".into()),
+            3000,
+        );
+        assert_eq!(state.cooldown_until_ms, Some(9000));
+        assert_eq!(state.limit_triggered_day.as_deref(), Some("2026-10-03"));
+        assert_eq!(
+            state.last_limit_triggered_day.as_deref(),
+            Some("2026-10-04")
+        );
     }
     #[test]
     fn midnight_does_not_cancel_or_extend_an_active_break() {

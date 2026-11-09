@@ -87,6 +87,10 @@ struct DayLedger {
     triggered_day: Option<String>,
 }
 
+pub(crate) fn guard_save_due(changed: bool, critical: bool, elapsed: std::time::Duration) -> bool {
+    changed && (critical || elapsed >= std::time::Duration::from_secs(10))
+}
+
 impl GuardState {
     /// This worker has not saved while reads failed. Its playback observations
     /// are newer than the recovered file; cumulative OS usage still overlaps.
@@ -367,6 +371,14 @@ mod tests {
         assert_eq!(restored.day, "day2");
         assert_eq!(restored.usage_ms, state.usage_ms);
         assert_eq!(restored.cooldown_until_ms, deadline);
+    }
+    #[test]
+    fn periodic_metrics_wait_ten_seconds_but_critical_changes_save_now() {
+        use std::time::Duration;
+        assert!(!guard_save_due(true, false, Duration::from_secs(1)));
+        assert!(guard_save_due(true, false, Duration::from_secs(10)));
+        assert!(guard_save_due(true, true, Duration::from_secs(1)));
+        assert!(!guard_save_due(false, true, Duration::from_secs(60)));
     }
     #[test]
     fn retain_selected_reports_only_real_prune() {
