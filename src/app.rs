@@ -505,7 +505,9 @@ impl ControlApp {
 
     fn persist_changed_state(&mut self, frame: &mut eframe::Frame) {
         #[cfg(target_os = "ios")]
-        if self.state_store.is_none() { return; }
+        if self.state_store.is_none() {
+            return;
+        }
         if self.last_persisted.as_ref() == Some(&self.saved) {
             return;
         }
@@ -848,7 +850,11 @@ impl ControlApp {
                         .strong(),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new("上限").size(14.0).color(ui.visuals().weak_text_color()));
+                    ui.label(
+                        RichText::new("上限")
+                            .size(14.0)
+                            .color(ui.visuals().weak_text_color()),
+                    );
                 });
             });
             ui.add_space(6.0);
@@ -880,7 +886,8 @@ impl ControlApp {
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
-                        RichText::new(format_limit(self.saved.daily_limit_minutes)).color(ui.visuals().weak_text_color()),
+                        RichText::new(format_limit(self.saved.daily_limit_minutes))
+                            .color(ui.visuals().weak_text_color()),
                     );
                 });
             });
@@ -903,7 +910,11 @@ impl ControlApp {
 
         ui.add_space(10.0);
         egui::Frame::new()
-            .fill(if ui.visuals().dark_mode { Color32::from_rgb(48, 48, 50) } else { Color32::from_rgb(235, 232, 227) })
+            .fill(if ui.visuals().dark_mode {
+                Color32::from_rgb(48, 48, 50)
+            } else {
+                Color32::from_rgb(235, 232, 227)
+            })
             .inner_margin(egui::Margin::same(14))
             .show(ui, |ui| {
                 ui.label("使いすぎを防いで、やりたいことに集中できる毎日へ。");
@@ -967,7 +978,11 @@ impl ControlApp {
         ui.add_space(8.0);
 
         egui::Frame::new()
-            .fill(if ui.visuals().dark_mode { Color32::from_rgb(48, 48, 50) } else { Color32::from_rgb(252, 235, 222) })
+            .fill(if ui.visuals().dark_mode {
+                Color32::from_rgb(48, 48, 50)
+            } else {
+                Color32::from_rgb(252, 235, 222)
+            })
             .inner_margin(egui::Margin::same(15))
             .show(ui, |ui| {
                 ui.label(format!(
@@ -1032,13 +1047,20 @@ impl ControlApp {
 
         ui.add_space(10.0);
         egui::Frame::new()
-            .fill(if ui.visuals().dark_mode { Color32::from_rgb(48, 48, 50) } else { Color32::from_rgb(225, 220, 211) })
+            .fill(if ui.visuals().dark_mode {
+                Color32::from_rgb(48, 48, 50)
+            } else {
+                Color32::from_rgb(225, 220, 211)
+            })
             .inner_margin(egui::Margin::same(12))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("広告").strong());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new("任意表示・配信準備中").color(ui.visuals().weak_text_color()));
+                        ui.label(
+                            RichText::new("任意表示・配信準備中")
+                                .color(ui.visuals().weak_text_color()),
+                        );
                     });
                 });
             });
@@ -1395,8 +1417,13 @@ impl eframe::App for ControlApp {
         #[cfg(target_os = "android")]
         if let Some(app) = &self.android_app {
             // Read current Resources: the native configuration can retain its initial value.
-            let dark = crate::platform::system_dark_mode(app).unwrap_or(ctx.theme() == egui::Theme::Dark);
-            ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
+            let dark =
+                crate::platform::system_dark_mode(app).unwrap_or(ctx.theme() == egui::Theme::Dark);
+            ctx.set_theme(if dark {
+                egui::Theme::Dark
+            } else {
+                egui::Theme::Light
+            });
         }
         if self.last_state_reload.elapsed() >= Duration::from_secs(5)
             && let Some(store) = &mut self.state_store
@@ -1425,7 +1452,11 @@ impl eframe::App for ControlApp {
         }
         let ctx = root_ui.ctx().clone();
         let is_break = self.screen == Screen::Break;
-        let background = if is_break || ctx.theme() == egui::Theme::Dark { DARK } else { PAPER };
+        let background = if is_break || ctx.theme() == egui::Theme::Dark {
+            DARK
+        } else {
+            PAPER
+        };
 
         root_ui.scope_builder(
             egui::UiBuilder::new().max_rect(ctx.content_rect()),
@@ -1465,7 +1496,11 @@ impl eframe::App for ControlApp {
                                 (Screen::Settings, "設定", "●"),
                             ] {
                                 let selected = self.screen == screen;
-                                let color = if selected { ORANGE } else { ui.visuals().weak_text_color() };
+                                let color = if selected {
+                                    ORANGE
+                                } else {
+                                    ui.visuals().weak_text_color()
+                                };
                                 let response = ui.add_sized(
                                     [item_width, 48.0],
                                     egui::Button::new(
@@ -1504,7 +1539,9 @@ impl eframe::App for ControlApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         #[cfg(target_os = "ios")]
-        if self.state_store.is_none() { return; }
+        if self.state_store.is_none() {
+            return;
+        }
         if let Some(store) = &self.state_store {
             if store.save(&self.saved).is_ok() {
                 self.last_persisted = Some(self.saved.clone());
