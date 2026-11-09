@@ -237,7 +237,8 @@ impl GuardState {
         }
     }
 
-    pub fn retain_selected(&mut self, policy: &Policy) {
+    pub fn retain_selected(&mut self, policy: &Policy) -> bool {
+        let before = self.clone();
         for record in &mut self.history {
             for map in [
                 &mut record.usage_ms,
@@ -250,6 +251,7 @@ impl GuardState {
         for map in [&mut self.usage_ms, &mut self.playback_ms, &mut self.raw_ms] {
             map.retain(|p, _| policy.packages.contains(p));
         }
+        *self != before
     }
 }
 
@@ -365,6 +367,15 @@ mod tests {
         assert_eq!(restored.day, "day2");
         assert_eq!(restored.usage_ms, state.usage_ms);
         assert_eq!(restored.cooldown_until_ms, deadline);
+    }
+    #[test]
+    fn retain_selected_reports_only_real_prune() {
+        let mut state = GuardState::default();
+        sample(&mut state, "day1", 1, 1_000);
+        assert!(!state.retain_selected(&policy()));
+        state.usage_ms.insert("mail".into(), 99);
+        assert!(state.retain_selected(&policy()));
+        assert!(!state.retain_selected(&policy()));
     }
     #[test]
     fn deselected_apps_are_removed_from_persistent_metrics() {

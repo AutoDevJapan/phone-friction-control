@@ -38,6 +38,7 @@ pub(crate) struct GuardStatus {
     pub snapshot: UsageSnapshot,
     pub cooldown_until_ms: Option<i64>,
     pub triggered_day: Option<String>,
+    pub last_triggered_day: Option<String>,
     pub media_available: bool,
     pub interruption_succeeded: bool,
     pub storage_error: bool,
@@ -147,11 +148,8 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
         {
             let policy = config.policy();
             // Explicit selection changes apply even while measurement permission is absent.
-            state.retain_selected(&policy);
-            if guard_store.is_ready()
-                && last_saved.as_ref() != Some(state)
-                && guard_store.save(state).is_ok()
-            {
+            let pruned = state.retain_selected(&policy);
+            if pruned && guard_store.is_ready() && guard_store.save(state).is_ok() {
                 last_saved = Some(state.clone());
             }
             if policy.enabled {
@@ -298,6 +296,7 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                             snapshot,
                             cooldown_until_ms: state.cooldown_until_ms,
                             triggered_day: state.triggered_day.clone(),
+                            last_triggered_day: state.last_triggered_day.clone(),
                             media_available,
                             interruption_succeeded,
                             storage_error,

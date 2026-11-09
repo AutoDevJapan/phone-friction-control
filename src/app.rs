@@ -66,6 +66,7 @@ pub(crate) struct SavedState {
     pub(crate) break_minutes: u32,
     pub(crate) cooldown_until_ms: Option<i64>,
     pub(crate) limit_triggered_day: Option<String>,
+    pub(crate) last_limit_triggered_day: Option<String>,
     pub(crate) current_day_key: String,
     daily_records: Vec<DailyRecord>,
     pub(crate) usage_disclosure_accepted: bool,
@@ -76,12 +77,13 @@ pub(crate) struct SavedState {
 impl Serialize for SavedState {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut out = serializer.serialize_struct("SavedState", 10)?;
+        let mut out = serializer.serialize_struct("SavedState", 11)?;
         out.serialize_field("target_apps", &self.target_apps)?;
         out.serialize_field("daily_limit_minutes", &self.daily_limit_minutes)?;
         out.serialize_field("break_minutes", &self.break_minutes)?;
         out.serialize_field("cooldown_until_ms", &self.cooldown_until_ms)?;
         out.serialize_field("limit_triggered_day", &self.limit_triggered_day)?;
+        out.serialize_field("last_limit_triggered_day", &self.last_limit_triggered_day)?;
         out.serialize_field("current_day_key", &self.current_day_key)?;
         let records: Vec<_> = self
             .daily_records
@@ -106,6 +108,7 @@ impl Default for SavedState {
             break_minutes: DEFAULT_BREAK_MINUTES,
             cooldown_until_ms: None,
             limit_triggered_day: None,
+            last_limit_triggered_day: None,
             current_day_key: String::new(),
             daily_records: Vec::new(),
             usage_disclosure_accepted: false,
@@ -121,6 +124,7 @@ impl SavedState {
         &mut self,
         deadline: Option<i64>,
         triggered_day: Option<String>,
+        last_triggered_day: Option<String>,
         now: i64,
     ) {
         self.cooldown_until_ms = self
@@ -129,6 +133,9 @@ impl SavedState {
             .max(deadline.filter(|until| *until > now));
         if triggered_day.is_some() {
             self.limit_triggered_day = triggered_day;
+        }
+        if last_triggered_day.is_some() {
+            self.last_limit_triggered_day = last_triggered_day;
         }
     }
     pub(crate) fn policy(&self) -> crate::enforcement::Policy {
@@ -488,13 +495,19 @@ impl ControlApp {
             && used_ms >= limit_ms
             && self.saved.cooldown_until_ms.is_none()
             && self.saved.limit_triggered_day.as_deref() != Some(snapshot.day_key.as_str())
+            && self
+                .saved
+                .last_limit_triggered_day
+                .as_deref()
+                .is_none_or(|day| snapshot.day_key.as_str() > day)
         {
             self.begin_break(snapshot.now_ms, snapshot.day_key);
         }
     }
 
     fn begin_break(&mut self, now_ms: i64, day_key: String) {
-        self.saved.limit_triggered_day = Some(day_key);
+        self.saved.limit_triggered_day = Some(day_key.clone());
+        self.saved.last_limit_triggered_day = Some(day_key);
         self.saved.cooldown_until_ms =
             Some(now_ms + i64::from(self.saved.break_minutes.max(1)) * 60_000);
         self.screen = Screen::Break;
@@ -629,6 +642,7 @@ impl ControlApp {
                 self.saved.accept_service_break(
                     status.cooldown_until_ms,
                     status.triggered_day,
+                    status.last_triggered_day,
                     now_epoch_ms(),
                 );
                 if status.storage_error {
@@ -767,6 +781,11 @@ impl ControlApp {
             && self.today_usage_ms() >= u64::from(self.saved.daily_limit_minutes) * 60_000
             && self.saved.limit_triggered_day.as_deref()
                 != Some(self.saved.current_day_key.as_str())
+            && self
+                .saved
+                .last_limit_triggered_day
+                .as_deref()
+                .is_none_or(|day| self.saved.current_day_key.as_str() > day)
         {
             self.begin_break(now_epoch_ms(), self.saved.current_day_key.clone());
             return;
@@ -1659,9 +1678,9 @@ mod tests {
             cooldown_until_ms: Some(2000),
             ..SavedState::default()
         };
-        state.accept_service_break(None, None, 1000);
+        state.accept_service_break(None, None, None, 1000);
         assert_eq!(state.cooldown_until_ms, Some(2000));
-        state.accept_service_break(None, None, 2000);
+        state.accept_service_break(None, None, None, 2000);
         assert_eq!(state.cooldown_until_ms, None);
     }
 
@@ -1742,6 +1761,22 @@ mod tests {
         assert_eq!(app.saved.daily_records.last().unwrap().used_ms, 22 * 60_000);
     }
 
+    #[test]
+    fn ui_accepts_service_last_trigger_and_does_not_recreate_a_rolled_back_day() {
+        let mut state = SavedState::default();
+        state.accept_service_break(None, None, Some("2026-10-02".into()), 1000);
+        assert_eq!(
+            state.last_limit_triggered_day.as_deref(),
+            Some("2026-10-02")
+        );
+        let mut app = app();
+        app.saved.last_limit_triggered_day = Some("2026-10-02".into());
+        app.apply_usage_snapshot(snapshot(1, 120));
+        assert_eq!(app.saved.cooldown_until_ms, None);
+        assert_eq!(app.screen, Screen::Home);
+        app.apply_usage_snapshot(snapshot(3, 120));
+        assert!(app.saved.cooldown_until_ms.is_some());
+    }
     #[test]
     fn midnight_does_not_cancel_or_extend_an_active_break() {
         let mut app = app();
