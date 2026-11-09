@@ -118,6 +118,24 @@ impl Default for SavedState {
     }
 }
 
+#[cfg(not(target_os = "android"))]
+impl SavedState {
+    fn remove_preview_session(&mut self) {
+        if self.current_day_key != "preview" {
+            return;
+        }
+        self.target_apps
+            .retain(|app| !app.package.starts_with("preview."));
+        self.current_day_key.clear();
+        self.daily_records.clear();
+        self.cooldown_until_ms = None;
+        self.limit_triggered_day = None;
+        self.last_limit_triggered_day = None;
+        self.usage_disclosure_accepted = false;
+        self.service_disclosure_accepted = false;
+    }
+}
+
 #[cfg(any(target_os = "android", test))]
 impl SavedState {
     fn accept_service_break(
@@ -292,6 +310,10 @@ impl ControlApp {
                 Ok(None) => {}
                 Err(_) => storage_error = Some("記録を読み込めないため保存を止めています。元の記録を保持して、もう一度読み込みます。".to_owned()),
             }
+        }
+        #[cfg(not(target_os = "android"))]
+        if mode == AppMode::Runtime {
+            saved.remove_preview_session();
         }
         #[cfg(target_os = "android")]
         let (events_tx, events_rx) = mpsc::channel();
@@ -1751,6 +1773,39 @@ mod tests {
             app.usage_by_package_ms.get("preview.video"),
             Some(&(102 * 60_000))
         );
+    }
+
+    #[test]
+    fn legacy_preview_session_is_not_restored_as_runtime_history() {
+        let mut app = app();
+        app.mode = AppMode::Preview;
+        app.saved.daily_limit_minutes = 300;
+        app.saved.target_apps.clear();
+        app.load_preview_data();
+        let encoded = ron::to_string(&app.saved).unwrap();
+        let mut state: SavedState = ron::from_str(&encoded).unwrap();
+        state.remove_preview_session();
+        assert_eq!(state.daily_limit_minutes, 300);
+        assert!(state.target_apps.is_empty());
+        assert!(state.daily_records.is_empty());
+        assert!(state.current_day_key.is_empty());
+        assert!(!state.usage_disclosure_accepted);
+        assert!(!state.service_disclosure_accepted);
+    }
+
+    #[test]
+    fn runtime_history_is_not_removed_as_preview() {
+        let mut state = app().saved;
+        state.current_day_key = "2026-11-09".into();
+        state.daily_records.push(DailyRecord {
+            day_key: state.current_day_key.clone(),
+            label: "11月9日".into(),
+            used_ms: 1234,
+            playback_only: false,
+        });
+        let before = state.clone();
+        state.remove_preview_session();
+        assert_eq!(state, before);
     }
 
     #[test]
