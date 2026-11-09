@@ -1,4 +1,4 @@
-# iOSの検証状況（2026-11-09更新）
+# iOSの検証状況（2026-11-10更新）
 
 ## 最新の受入範囲
 
@@ -27,9 +27,27 @@ public XCTestで自作アプリの上限設定を120分から300分へ変更し�
 
 このバイナリを生成した[実行42630176629](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/42630176629)では、ビルド後の `simctl launch` が45秒でSIGALRMとなり、PID行を取得できませんでした。その原因は未特定です。同じバイナリのXCTest経由の成功と区別し、環境起因・コード起因のどちらとも断定しません。
 
-実行対象はpreview entry pointと別のSimulator用bundle IDです。画面の「1時間42分」などは架空のプレビューデータで、実利用時間・アプリ選択・Screen Time許可の証拠ではありません。Android専用の説明や操作がiOSのプレビューにも残る不一致は未解消です。[PR21](https://github.com/AutoDevJapan/phone-friction-control/pull/21)のpreview/runtime分離は別候補であり、platform capabilityに合う説明・操作の修正、実制御との接続が引き続き必要です。
+実行対象はpreview entry pointと別のSimulator用bundle IDです。画面の「1時間42分」などは架空のプレビューデータで、実利用時間・アプリ選択・Screen Time許可の証拠ではありません。Android専用の説明や操作がiOSのプレビューにも残る不一致は未解消です。platform capabilityに合う説明・操作の修正と、実制御との接続が引き続き必要です。
 
 今回の受入はiOS18.5 Simulatorのみです。実端末での動作は未検証です。
+
+### PreviewとRuntimeの保存状態の分離
+
+[PR21](https://github.com/AutoDevJapan/phone-friction-control/pull/21)をmainの `0a06976e2ddd402ed69269e0ed8a7fcf77052653` へ統合しました。Runtimeの構築と、保存読取り失敗からの再読込みは、既知のpreviewセッションだけを除去する同じ処理を通ります。通常の日付付き履歴と上限・休憩設定を保持し、Previewモードのセッションは保持します。iOSのPreview用保存先は `Documents/preview-usage-state.ron`、Runtime用は `Documents/usage-state.ron` としてコード上で分離しています。
+
+製品ソース `6dcc3e95880a7d2baac5bee018dd31f266acd16d` の[実行42661582371](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/42661582371)では、追加パッチ・診断loggerなしでビルドし、iOS18.5 Simulator上の構築試験2件と保存読取りエラーからの回復試験3件が成功しました。実行したのは、通常の旧保存値の保持、既知previewだけの除去、Preview再読込みの保持、Runtime再読込みでのpreview除去・通常履歴保持です。保存用fixtureを使うテストであり、Runtimeの実data containerへ保存された状態からの起動復元を示す結果ではありません。
+
+| 対象 | SHA-256 |
+| --- | --- |
+| 実行バイナリ | `3918459bb11ee070418e686b129ba1a4f647ab225b49aa9a80ca6b34b753986d` |
+| 試験バイナリ | `fb4c911303f77f7f8b4173b43e93700420203591c2b3bf52e5bf66cd412c96f3` |
+| 実効Cargo.lock | `ce89b963e268a1dd2b724be1c1a04d54a58864ed1c8db31d05788301c680b661` |
+
+同じ実行でPreviewの起動PID7845が20秒後も生存し、原画像に製品画面を確認しました。表示は上限2時間・架空利用時間1時間42分です。前述のPR19ソースにおける120→300分のUI変更・終了再起動復元とは別の受入で、実利用時間やOS許可を検証した結果ではありません。
+
+### 検査ホストでのカテゴリ操作
+
+iOS18.5の[実行42644663948](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/42644663948)では、公開Picker上のSocialカテゴリを実際に操作し、原画像の未チェックからチェックへの変化と、Selectionのsetter呼出しが0から6へ増えたことを確認しました。公開applications getterの件数は0のままです。カテゴリtoken件数・値の非空性・コピー保存後の所有排出は未確認で、個別アプリの選択・計測・遮蔽の成功には数えません。検査ホストは選択値とcontextを保持しており、画面全体の完全排出も未確認です。
 
 ## 2026-10-11確認時点の未達条件（以下は過去の記録）
 
