@@ -399,10 +399,20 @@ mod tests {
     fn failed_selection_prune_save_retries_until_success_and_keeps_current_data() {
         use crate::persistence::StateStore;
         use std::time::Duration;
-        let dir =
-            std::env::temp_dir().join(format!("phone-selection-retry-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        struct TempDir(std::path::PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "phone-selection-retry-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let _guard = TempDir(dir.clone());
         let path = dir.join("guard-state.ron");
         let mut old = GuardState::default();
         sample(&mut old, "day1", 1, 61_000);
@@ -436,7 +446,6 @@ mod tests {
         assert_eq!(restored.usage_ms["video"], 61_000);
         assert_eq!(restored.cooldown_until_ms, Some(123_456));
         assert!(guard_save_due(true, false, Duration::from_secs(10)));
-        let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
     fn retain_selected_reports_only_real_prune() {
