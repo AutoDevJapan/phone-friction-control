@@ -90,6 +90,25 @@ pub fn run_preview() -> eframe::Result {
         ..Default::default()
     };
 
+    #[cfg(target_os = "ios")]
+    let options = {
+        let mut options = options;
+        if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup
+        {
+            let original = std::sync::Arc::clone(&setup.device_descriptor);
+            setup.device_descriptor = std::sync::Arc::new(move |adapter| {
+                let mut descriptor = original(adapter);
+                // Metal on the iOS Simulator can expose 15 rather than the
+                // WebGPU default of 16. Keep all other device requirements.
+                descriptor.required_limits.max_inter_stage_shader_variables = descriptor
+                    .required_limits
+                    .max_inter_stage_shader_variables
+                    .min(adapter.limits().max_inter_stage_shader_variables);
+                descriptor
+            });
+        }
+        options
+    };
     eframe::run_native(
         "利用制限",
         options,
