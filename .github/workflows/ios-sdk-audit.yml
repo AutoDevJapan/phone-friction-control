@@ -98,6 +98,9 @@ jobs:
           codesign --verify --strict "$OUT/NativeStorageTests.app"
           shasum -a 256 "$OUT/NativeStorageTests.app/native-storage-tests" Cargo.lock src/app.rs .github/workflows/ios-sdk-audit.yml > "$OUT/build-hashes.txt"
           cp Cargo.lock "$OUT/effective-Cargo.lock"
+          tar -czf "$OUT/NativeStorageTests.app.tar.gz" -C "$OUT" NativeStorageTests.app
+          shasum -a 256 "$OUT/NativeStorageTests.app.tar.gz" > "$OUT/archive-hash.txt"
+          xcrun simctl help launch > "$OUT/simctl-launch-help.txt"
           RUNTIME=$(xcrun simctl list runtimes -j | jq -er '[.runtimes[] | select(.isAvailable and .version == "18.5" and (.identifier | contains("iOS"))) | .identifier] | if length == 1 then .[0] else error("iOS18.5 runtime unavailable") end')
           SIM_ID=$(xcrun simctl create native-storage-audit com.apple.CoreSimulator.SimDeviceType.iPhone-15 "$RUNTIME")
           trap 'xcrun simctl shutdown "$SIM_ID" || true; xcrun simctl delete "$SIM_ID" || true' EXIT
@@ -110,10 +113,28 @@ jobs:
           test ! -e "$DATA/Documents/usage-state.pending"
           export SIMCTL_CHILD_PHONE_CONTROL_NATIVE_TEST_HOME="$DATA"
           STATUS=0
-          perl -e 'alarm 90; exec @ARGV; die "exec failed\n"' xcrun simctl launch --console "$SIM_ID" "$BID" runtime_native_documents_ --nocapture --test-threads=1 > "$OUT/test-result.txt" 2>&1 || STATUS=$?
-          printf 'native_test_exit_status=%s\n' "$STATUS" > "$OUT/test-status.txt"
-          PID=$(awk -v b="$BID" 'index($0,b ": ")==1 {p=substr($0,length(b)+3); if(p ~ /^[0-9]+$/) print p}' "$OUT/test-result.txt")
+          # Use the public nonblocking launch mode and separate stdout/stderr.
+          # The previous console-mode timeout had no PID or target output;
+          # its142 status did not establish a failing Rust test or IO defect.
+          printf 'launcher_started_at=%s\n' "$(date -u +%FT%TZ)" > "$OUT/phase.txt"
+          perl -e 'alarm 45; exec @ARGV; die "exec failed\n"' xcrun simctl launch --stdout="$OUT/test-stdout.txt" --stderr="$OUT/test-stderr.txt" "$SIM_ID" "$BID" runtime_native_documents_ --nocapture --test-threads=1 --color never > "$OUT/launch.txt" 2>&1 || STATUS=$?
+          printf 'launcher_exit_status=%s\n' "$STATUS" > "$OUT/test-status.txt"
+          PID=$(awk -v b="$BID" 'index($0,b ": ")==1 {p=substr($0,length(b)+3); if(p ~ /^[0-9]+$/) print p}' "$OUT/launch.txt")
           printf 'test_pid=%s\n' "$PID" > "$OUT/pid.txt"
+          if [ "$STATUS" = 0 ]; then
+            for ATTEMPT in $(seq 1 60); do
+              if grep -Fq 'test result:' "$OUT/test-stdout.txt" "$OUT/test-stderr.txt" 2>/dev/null; then break; fi
+              sleep 1
+            done
+          fi
+          : > "$OUT/test-result.txt"
+          for STREAM in test-stdout test-stderr; do
+            if [ -f "$OUT/$STREAM.txt" ]; then cat "$OUT/$STREAM.txt" >> "$OUT/test-result.txt"; fi
+          done
+          DIAGNOSTIC_STATUS=0
+          perl -e 'alarm 20; exec @ARGV; die "exec failed\n"' xcrun simctl spawn "$SIM_ID" log show --last 3m --style compact --info --debug --predicate 'process == "native-storage-tests" OR eventMessage CONTAINS "com.autodevjapan.phonefrictioncontrol.native-storage-tests"' > "$OUT/launch-system-log.txt" 2>&1 || DIAGNOSTIC_STATUS=$?
+          printf 'diagnostic_status=%s\n' "$DIAGNOSTIC_STATUS" >> "$OUT/test-status.txt"
+          if [[ "$PID" =~ ^[0-9]+$ ]]; then ps -p "$PID" -o pid=,comm= > "$OUT/target-process.txt" || true; fi
           test "$STATUS" = 0
           [[ "$PID" =~ ^[0-9]+$ ]]
           grep -F 'app::tests::runtime_native_documents_roundtrip_preserves_nondefault_state' "$OUT/test-result.txt"
@@ -132,6 +153,7 @@ jobs:
             ${{ runner.temp }}/native-storage/*.txt
             ${{ runner.temp }}/native-storage/*.json
             ${{ runner.temp }}/native-storage/*.lock
+            ${{ runner.temp }}/native-storage/*.tar.gz
           retention-days: 3
           if-no-files-found: error
   sdk-audit:
