@@ -72,6 +72,7 @@ pub(crate) struct GuardState {
     boot: Option<i32>,
     pub cooldown_until_ms: Option<i64>,
     pub triggered_day: Option<String>,
+    #[serde(skip_serializing)]
     history: Vec<DayLedger>,
 }
 
@@ -322,6 +323,20 @@ mod tests {
         assert_eq!(empty.cooldown_until_ms, None);
     }
 
+    #[test]
+    fn serialization_omits_previous_days_but_preserves_active_break() {
+        let mut state = GuardState::default();
+        sample(&mut state, "day1", 1, 60_000);
+        state.enforce(&policy(), 1000);
+        let deadline = state.cooldown_until_ms;
+        sample(&mut state, "day2", 1, 123);
+        assert!(!state.history.is_empty());
+        let restored: GuardState = ron::from_str(&ron::to_string(&state).unwrap()).unwrap();
+        assert!(restored.history.is_empty());
+        assert_eq!(restored.day, "day2");
+        assert_eq!(restored.usage_ms, state.usage_ms);
+        assert_eq!(restored.cooldown_until_ms, deadline);
+    }
     #[test]
     fn deselected_apps_are_removed_from_persistent_metrics() {
         let mut state = GuardState::default();

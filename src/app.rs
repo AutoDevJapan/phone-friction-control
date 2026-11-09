@@ -58,7 +58,7 @@ struct DailyRecord {
     playback_only: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub(crate) struct SavedState {
     pub(crate) target_apps: Vec<TrackedApp>,
@@ -73,6 +73,31 @@ pub(crate) struct SavedState {
     pub(crate) service_disclosure_accepted: bool,
 }
 
+impl Serialize for SavedState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut out = serializer.serialize_struct("SavedState", 10)?;
+        out.serialize_field("target_apps", &self.target_apps)?;
+        out.serialize_field("daily_limit_minutes", &self.daily_limit_minutes)?;
+        out.serialize_field("break_minutes", &self.break_minutes)?;
+        out.serialize_field("cooldown_until_ms", &self.cooldown_until_ms)?;
+        out.serialize_field("limit_triggered_day", &self.limit_triggered_day)?;
+        out.serialize_field("current_day_key", &self.current_day_key)?;
+        let records: Vec<_> = self
+            .daily_records
+            .iter()
+            .filter(|r| r.day_key == self.current_day_key)
+            .collect();
+        out.serialize_field("daily_records", &records)?;
+        out.serialize_field("usage_disclosure_accepted", &self.usage_disclosure_accepted)?;
+        out.serialize_field("playback_only", &self.playback_only)?;
+        out.serialize_field(
+            "service_disclosure_accepted",
+            &self.service_disclosure_accepted,
+        )?;
+        out.end()
+    }
+}
 impl Default for SavedState {
     fn default() -> Self {
         Self {
@@ -448,16 +473,9 @@ impl ControlApp {
                 playback_only: self.saved.playback_only,
             });
         }
-        let mut days = Vec::new();
-        for record in self.saved.daily_records.iter().rev() {
-            if !days.contains(&record.day_key) {
-                days.push(record.day_key.clone());
-            }
-        }
-        days.truncate(14);
         self.saved
             .daily_records
-            .retain(|record| days.contains(&record.day_key));
+            .retain(|record| record.day_key == snapshot.day_key);
 
         let limit_ms = u64::from(self.saved.daily_limit_minutes) * 60_000;
         if snapshot.permission_granted
@@ -1676,22 +1694,37 @@ mod tests {
     }
 
     #[test]
-    fn history_keeps_the_latest_fourteen_days() {
+    fn saving_legacy_history_uses_current_key_not_latest_date() {
+        let mut app = app();
+        app.apply_usage_snapshot(snapshot(1, 44));
+        let mut future = app.saved.daily_records[0].clone();
+        future.day_key = "2099-01-01".into();
+        app.saved.daily_records.push(future);
+        let deadline = app.saved.cooldown_until_ms;
+        let restored: SavedState = ron::from_str(&ron::to_string(&app.saved).unwrap()).unwrap();
+        assert_eq!(restored.daily_records.len(), 1);
+        assert_eq!(restored.daily_records[0].day_key, app.saved.current_day_key);
+        assert_eq!(restored.daily_records[0].used_ms, 44 * 60_000);
+        assert_eq!(restored.cooldown_until_ms, deadline);
+        assert_eq!(restored.limit_triggered_day, app.saved.limit_triggered_day);
+    }
+    #[test]
+    fn history_keeps_only_the_current_day() {
         let mut app = app();
         for day in 1..=16 {
             app.apply_usage_snapshot(snapshot(day, u64::from(day)));
         }
-        assert_eq!(app.saved.daily_records.len(), 14);
+        assert_eq!(app.saved.daily_records.len(), 1);
         assert_eq!(
             app.saved.daily_records.first().unwrap().day_key,
-            "2026-10-03"
+            "2026-10-16"
         );
         assert_eq!(
             app.saved.daily_records.last().unwrap().day_key,
             "2026-10-16"
         );
         app.apply_usage_snapshot(snapshot(16, 22));
-        assert_eq!(app.saved.daily_records.len(), 14);
+        assert_eq!(app.saved.daily_records.len(), 1);
         assert_eq!(app.saved.daily_records.last().unwrap().used_ms, 22 * 60_000);
     }
 
@@ -1742,7 +1775,8 @@ mod tests {
         app.apply_usage_snapshot(snapshot(1, 47));
         assert_eq!(app.saved.daily_records[0].used_ms, 47 * 60_000);
         app.apply_usage_snapshot(snapshot(2, 1));
-        assert_eq!(app.saved.daily_records[1].used_ms, 60_000);
+        assert_eq!(app.saved.daily_records.len(), 1);
+        assert_eq!(app.saved.daily_records[0].used_ms, 60_000);
     }
 
     #[test]
