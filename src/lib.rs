@@ -93,7 +93,8 @@ pub fn run_preview() -> eframe::Result {
     #[cfg(target_os = "ios")]
     let options = {
         let mut options = options;
-        if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
+        if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup
+        {
             let original = std::sync::Arc::clone(&setup.device_descriptor);
             setup.device_descriptor = std::sync::Arc::new(move |adapter| {
                 let mut descriptor = original(adapter);
