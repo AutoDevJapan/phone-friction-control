@@ -244,7 +244,7 @@ impl ControlApp {
         #[cfg(not(target_os = "ios"))]
         let mut storage_error = None;
         if let Some(store) = &mut state_store {
-            match store.load() {
+            match store.load_and_migrate() {
                 Ok(Some(state)) => saved = state,
                 Ok(None) => {}
                 Err(_) => storage_error = Some("記録を読み込めないため保存を止めています。元の記録を保持して、もう一度読み込みます。".to_owned()),
@@ -1479,7 +1479,7 @@ impl eframe::App for ControlApp {
             && !store.is_ready()
         {
             self.last_state_reload = Instant::now();
-            if let Ok(state) = store.load() {
+            if let Ok(state) = store.load_and_migrate() {
                 if let Some(state) = state {
                     self.restore_saved_state(state);
                 }

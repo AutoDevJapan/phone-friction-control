@@ -13,7 +13,14 @@ impl StateStore {
         Self { path, ready: false }
     }
 
-    pub fn load<T: serde::de::DeserializeOwned + serde::Serialize>(
+    pub fn load<T: serde::de::DeserializeOwned>(&mut self) -> io::Result<Option<T>> {
+        self.ready = false;
+        let result = load(&self.path);
+        self.ready = result.is_ok();
+        result
+    }
+
+    pub fn load_and_migrate<T: serde::de::DeserializeOwned + serde::Serialize>(
         &mut self,
     ) -> io::Result<Option<T>> {
         self.ready = false;
@@ -103,6 +110,19 @@ mod tests {
     }
 
     #[test]
+    fn reader_does_not_serialize_or_overwrite_a_newer_owner_value() {
+        #[derive(serde::Deserialize)]
+        struct ReadOnly(u64);
+        let fixture = Fixture::new();
+        fs::create_dir_all(&fixture.0).unwrap();
+        fs::write(fixture.path(), "(44)").unwrap();
+        let mut reader = StateStore::new(fixture.path());
+        assert_eq!(reader.load::<ReadOnly>().unwrap().unwrap().0, 44);
+        fs::write(fixture.path(), "(99)").unwrap();
+        assert_eq!(reader.load::<ReadOnly>().unwrap().unwrap().0, 99);
+        assert_eq!(fs::read_to_string(fixture.path()).unwrap(), "(99)");
+    }
+    #[test]
     fn migration_serialization_failure_keeps_store_unready_and_file_unchanged() {
         #[derive(serde::Deserialize)]
         struct Fails(u64);
@@ -117,7 +137,7 @@ mod tests {
         fs::write(fixture.path(), "(44)").unwrap();
         let original = fs::read(fixture.path()).unwrap();
         let mut store = StateStore::new(fixture.path());
-        assert!(store.load::<Fails>().is_err());
+        assert!(store.load_and_migrate::<Fails>().is_err());
         assert!(!store.is_ready());
         assert!(store.save(&vec![0_u64]).is_err());
         assert_eq!(fs::read(fixture.path()).unwrap(), original);
@@ -139,7 +159,7 @@ mod tests {
         )
         .unwrap();
         let mut store = StateStore::new(fixture.path());
-        let state = store.load::<Legacy>().unwrap().unwrap();
+        let state = store.load_and_migrate::<Legacy>().unwrap().unwrap();
         assert_eq!(state.history, [12, 13]);
         assert_eq!(state.current, 44);
         assert_eq!(state.deadline, Some(123456));

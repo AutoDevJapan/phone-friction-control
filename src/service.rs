@@ -124,7 +124,7 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
     while GENERATION.load(Ordering::SeqCst) == generation {
         if !guard_store.is_ready() && last_load.elapsed() >= Duration::from_secs(5) {
             last_load = Instant::now();
-            match guard_store.load::<GuardState>() {
+            match guard_store.load_and_migrate::<GuardState>() {
                 Ok(restored) => {
                     let mut restored = restored.unwrap_or_default();
                     last_saved = Some(restored.clone());
