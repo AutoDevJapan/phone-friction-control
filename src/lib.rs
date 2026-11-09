@@ -61,6 +61,7 @@ fn android_main(android_app: android_activity::AndroidApp) {
     let app_for_ui = android_app.clone();
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
+        run_and_return: false,
         android_app: Some(android_app),
         persistence_path: Some(data_dir.join("control-state.ron")),
         ..Default::default()

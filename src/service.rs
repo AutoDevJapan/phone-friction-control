@@ -38,6 +38,7 @@ pub(crate) struct GuardStatus {
     pub snapshot: UsageSnapshot,
     pub cooldown_until_ms: Option<i64>,
     pub triggered_day: Option<String>,
+    pub last_triggered_day: Option<String>,
     pub media_available: bool,
     pub interruption_succeeded: bool,
     pub storage_error: bool,
@@ -114,6 +115,7 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
     let mut guard_store = crate::persistence::StateStore::new(dir.join("guard-state.ron"));
     let mut state: Option<GuardState> = None;
     let mut last_saved: Option<GuardState> = None;
+    let mut selection_save_pending = false;
     let mut last_save = Instant::now() - Duration::from_secs(60);
     let mut last_load = Instant::now() - Duration::from_secs(60);
     let mut tracker = crate::usage::UsageTracker::default();
@@ -124,7 +126,7 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
     while GENERATION.load(Ordering::SeqCst) == generation {
         if !guard_store.is_ready() && last_load.elapsed() >= Duration::from_secs(5) {
             last_load = Instant::now();
-            match guard_store.load::<GuardState>() {
+            match guard_store.load_and_migrate::<GuardState>() {
                 Ok(restored) => {
                     let mut restored = restored.unwrap_or_default();
                     last_saved = Some(restored.clone());
@@ -146,6 +148,15 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
             && let Some(config) = &last_config
         {
             let policy = config.policy();
+            // Explicit selection changes apply even while measurement permission is absent.
+            if crate::enforcement::persist_selection_prune(
+                state,
+                &policy,
+                &mut selection_save_pending,
+                &guard_store,
+            ) {
+                last_saved = Some(state.clone());
+            }
             if policy.enabled {
                 let result =
                     env.with_local_frame(64, |env| -> jni::errors::Result<Option<GuardStatus>> {
@@ -252,9 +263,11 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                         });
                         let mut storage_error = !guard_store.is_ready() || !config_store.is_ready();
                         let mut wrote = false;
-                        if last_saved.as_ref() != Some(state)
-                            && (critical || last_save.elapsed() >= Duration::from_secs(10))
-                        {
+                        if crate::enforcement::guard_save_due(
+                            last_saved.as_ref() != Some(state),
+                            critical,
+                            last_save.elapsed(),
+                        ) {
                             match guard_store.save(state) {
                                 Ok(()) => {
                                     last_saved = Some(state.clone());
@@ -290,6 +303,7 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                             snapshot,
                             cooldown_until_ms: state.cooldown_until_ms,
                             triggered_day: state.triggered_day.clone(),
+                            last_triggered_day: state.last_triggered_day.clone(),
                             media_available,
                             interruption_succeeded,
                             storage_error,
@@ -464,7 +478,7 @@ pub(crate) fn interrupt_direct(env: &mut JNIEnv, context: &JObject) -> jni::erro
     #[cfg(any(feature = "ads-test", feature = "ads-production"))]
     let activity_class = "com.autodevjapan.phonefrictioncontrol.ControlAdsActivity";
     #[cfg(not(any(feature = "ads-test", feature = "ads-production")))]
-    let activity_class = "android.app.NativeActivity";
+    let activity_class = "com.autodevjapan.phonefrictioncontrol.ControlActivity";
     let class = JObject::from(env.new_string(activity_class)?);
     env.call_method(
         &intent,

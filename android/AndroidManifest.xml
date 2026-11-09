@@ -37,8 +37,9 @@
             </intent-filter>
         </service>
         <activity
-            android:name="android.app.NativeActivity"
-            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
+            android:name="com.autodevjapan.phonefrictioncontrol.ControlActivity"
+            android:enableOnBackInvokedCallback="false"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode"
             android:exported="true"
             android:label="利用制限"
             android:launchMode="singleTask"
@@ -49,11 +50,18 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+        </activity>
+        <activity-alias android:name="android.app.NativeActivity"
+            android:targetActivity="com.autodevjapan.phonefrictioncontrol.ControlActivity"
+            android:exported="true">
+            <meta-data android:name="android.app.lib_name" android:value="phone_friction_control" />
+
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.HOME" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
-        </activity>
+        </activity-alias>
     </application>
 </manifest>

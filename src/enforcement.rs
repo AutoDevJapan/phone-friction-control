@@ -72,6 +72,8 @@ pub(crate) struct GuardState {
     boot: Option<i32>,
     pub cooldown_until_ms: Option<i64>,
     pub triggered_day: Option<String>,
+    pub last_triggered_day: Option<String>,
+    #[serde(skip_serializing)]
     history: Vec<DayLedger>,
 }
 
@@ -83,6 +85,25 @@ struct DayLedger {
     raw_ms: HashMap<String, u64>,
     boot: Option<i32>,
     triggered_day: Option<String>,
+}
+
+pub(crate) fn persist_selection_prune(
+    state: &mut GuardState,
+    policy: &Policy,
+    pending: &mut bool,
+    store: &crate::persistence::StateStore,
+) -> bool {
+    *pending |= state.retain_selected(policy);
+    if *pending && store.is_ready() && store.save(state).is_ok() {
+        *pending = false;
+        true
+    } else {
+        false
+    }
+}
+
+pub(crate) fn guard_save_due(changed: bool, critical: bool, elapsed: std::time::Duration) -> bool {
+    changed && (critical || elapsed >= std::time::Duration::from_secs(10))
 }
 
 impl GuardState {
@@ -145,6 +166,14 @@ impl GuardState {
         *previous = playing;
     }
     pub fn sample_usage(&mut self, day: &str, boot: i32, totals: &HashMap<String, u64>) {
+        if let Some(triggered) = &self.triggered_day
+            && self
+                .last_triggered_day
+                .as_ref()
+                .is_none_or(|old| old < triggered)
+        {
+            self.last_triggered_day = Some(triggered.clone());
+        }
         if self.day != day {
             if !self.day.is_empty() {
                 self.history.retain(|record| record.day != self.day);
@@ -214,18 +243,34 @@ impl GuardState {
         if policy.enabled
             && self.cooldown_until_ms.is_none()
             && self.triggered_day.as_deref() != Some(self.day.as_str())
+            && self
+                .last_triggered_day
+                .as_deref()
+                .is_none_or(|day| self.day.as_str() > day)
             && total >= u64::from(policy.limit_minutes.max(1)) * 60_000
         {
             self.triggered_day = Some(self.day.clone());
+            self.last_triggered_day = Some(self.day.clone());
             self.cooldown_until_ms =
                 Some(now_ms.saturating_add(i64::from(policy.break_minutes.max(1)) * 60_000));
         }
     }
 
-    pub fn retain_selected(&mut self, policy: &Policy) {
+    pub fn retain_selected(&mut self, policy: &Policy) -> bool {
+        let before = self.clone();
+        for record in &mut self.history {
+            for map in [
+                &mut record.usage_ms,
+                &mut record.playback_ms,
+                &mut record.raw_ms,
+            ] {
+                map.retain(|p, _| policy.packages.contains(p));
+            }
+        }
         for map in [&mut self.usage_ms, &mut self.playback_ms, &mut self.raw_ms] {
             map.retain(|p, _| policy.packages.contains(p));
         }
+        *self != before
     }
 }
 
@@ -275,6 +320,21 @@ mod tests {
     }
 
     #[test]
+    fn completed_day_does_not_retrigger_after_next_day_save_and_restart() {
+        let mut state = GuardState::default();
+        sample(&mut state, "2026-11-08", 1, 60_000);
+        state.enforce(&policy(), 1000);
+        state.enforce(&policy(), 301_000);
+        sample(&mut state, "2026-11-09", 1, 0);
+        let mut restored: GuardState = ron::from_str(&ron::to_string(&state).unwrap()).unwrap();
+        sample(&mut restored, "2026-11-08", 1, 60_000);
+        restored.enforce(&policy(), 400_000);
+        assert_eq!(restored.cooldown_until_ms, None);
+        sample(&mut restored, "2026-11-09", 1, 60_000);
+        restored.enforce(&policy(), 500_000);
+        assert_eq!(restored.cooldown_until_ms, Some(800_000));
+    }
+    #[test]
     fn changing_the_clock_back_restores_the_day_without_another_break() {
         let mut state = GuardState::default();
         sample(&mut state, "day2", 1, 60_000);
@@ -314,12 +374,106 @@ mod tests {
     }
 
     #[test]
+    fn serialization_omits_previous_days_but_preserves_active_break() {
+        let mut state = GuardState::default();
+        sample(&mut state, "day1", 1, 60_000);
+        state.enforce(&policy(), 1000);
+        let deadline = state.cooldown_until_ms;
+        sample(&mut state, "day2", 1, 123);
+        assert!(!state.history.is_empty());
+        let restored: GuardState = ron::from_str(&ron::to_string(&state).unwrap()).unwrap();
+        assert!(restored.history.is_empty());
+        assert_eq!(restored.day, "day2");
+        assert_eq!(restored.usage_ms, state.usage_ms);
+        assert_eq!(restored.cooldown_until_ms, deadline);
+    }
+    #[test]
+    fn periodic_metrics_wait_ten_seconds_but_critical_changes_save_now() {
+        use std::time::Duration;
+        assert!(!guard_save_due(true, false, Duration::from_secs(1)));
+        assert!(guard_save_due(true, false, Duration::from_secs(10)));
+        assert!(guard_save_due(true, true, Duration::from_secs(1)));
+        assert!(!guard_save_due(false, true, Duration::from_secs(60)));
+    }
+    #[test]
+    fn failed_selection_prune_save_retries_until_success_and_keeps_current_data() {
+        use crate::persistence::StateStore;
+        use std::time::Duration;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        struct TempDir(std::path::PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "phone-selection-retry-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let _guard = TempDir(dir.clone());
+        let path = dir.join("guard-state.ron");
+        let mut old = GuardState::default();
+        sample(&mut old, "day1", 1, 61_000);
+        old.usage_ms.insert("mail".into(), 99);
+        old.cooldown_until_ms = Some(123_456);
+        std::fs::write(&path, ron::to_string(&old).unwrap()).unwrap();
+        let mut store = StateStore::new(path.clone());
+        let mut state = store.load::<GuardState>().unwrap().unwrap();
+        std::fs::create_dir(path.with_extension("pending")).unwrap();
+        let mut pending = false;
+        assert!(!persist_selection_prune(
+            &mut state,
+            &policy(),
+            &mut pending,
+            &store
+        ));
+        assert!(pending);
+        assert!(!state.usage_ms.contains_key("mail"));
+        assert_eq!(state.cooldown_until_ms, Some(123_456));
+        assert!(!guard_save_due(true, false, Duration::from_secs(1)));
+        std::fs::remove_dir(path.with_extension("pending")).unwrap();
+        assert!(persist_selection_prune(
+            &mut state,
+            &policy(),
+            &mut pending,
+            &store
+        ));
+        assert!(!pending);
+        let restored: GuardState = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(!restored.usage_ms.contains_key("mail"));
+        assert_eq!(restored.usage_ms["video"], 61_000);
+        assert_eq!(restored.cooldown_until_ms, Some(123_456));
+        assert!(guard_save_due(true, false, Duration::from_secs(10)));
+    }
+    #[test]
+    fn retain_selected_reports_only_real_prune() {
+        let mut state = GuardState::default();
+        sample(&mut state, "day1", 1, 1_000);
+        assert!(!state.retain_selected(&policy()));
+        state.usage_ms.insert("mail".into(), 99);
+        assert!(state.retain_selected(&policy()));
+        assert!(!state.retain_selected(&policy()));
+    }
+    #[test]
     fn deselected_apps_are_removed_from_persistent_metrics() {
         let mut state = GuardState::default();
         state.usage_ms.insert("mail".into(), 99);
         state.playback_ms.insert("mail".into(), 99);
         state.raw_ms.insert("mail".into(), 99);
+        let mut old = DayLedger {
+            day: "yesterday".into(),
+            ..DayLedger::default()
+        };
+        old.usage_ms.insert("mail".into(), 99);
+        old.playback_ms.insert("mail".into(), 99);
+        old.raw_ms.insert("mail".into(), 99);
+        state.history.push(old);
         state.retain_selected(&policy());
+        assert!(state.history.iter().all(|record| record.usage_ms.is_empty()
+            && record.playback_ms.is_empty()
+            && record.raw_ms.is_empty()));
         assert!(
             state.usage_ms.is_empty() && state.playback_ms.is_empty() && state.raw_ms.is_empty()
         );

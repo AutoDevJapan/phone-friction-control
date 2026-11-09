@@ -141,6 +141,7 @@ pub(crate) fn assemble(args: &[std::ffi::OsString], release: bool) -> io::Result
     super::write_classes(&classes)?;
     let service = classes.join(super::PACKAGE).join("ControlService.class");
     let listener = classes.join(super::PACKAGE).join("MediaListener.class");
+    let activity = classes.join(super::PACKAGE).join("ControlActivity.class");
     let java = tool(&jdk, "java");
     let d8 = tools.join("lib/d8.jar");
     run(
@@ -157,6 +158,7 @@ pub(crate) fn assemble(args: &[std::ffi::OsString], release: bool) -> io::Result
             dex.as_os_str(),
             service.as_os_str(),
             listener.as_os_str(),
+            activity.as_os_str(),
         ],
     )?;
     let aapt = tool(&tools, "aapt2");

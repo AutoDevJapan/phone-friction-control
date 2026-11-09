@@ -190,6 +190,28 @@ pub fn launch_package(
     }));
 }
 
+pub fn system_dark_mode(app: &AndroidApp) -> Result<bool, String> {
+    with_activity(app, |env, activity| {
+        let resources = env
+            .call_method(
+                activity,
+                "getResources",
+                "()Landroid/content/res/Resources;",
+                &[],
+            )?
+            .l()?;
+        let configuration = env
+            .call_method(
+                &resources,
+                "getConfiguration",
+                "()Landroid/content/res/Configuration;",
+                &[],
+            )?
+            .l()?;
+        let ui_mode = env.get_field(&configuration, "uiMode", "I")?.i()?;
+        Ok(ui_mode & 0x30 == 0x20)
+    })
+}
 pub(crate) fn with_activity<T>(
     app: &AndroidApp,
     call: impl FnOnce(&mut jni::JNIEnv<'_>, &JObject<'_>) -> jni::errors::Result<T>,

@@ -8,13 +8,30 @@ pub struct StateStore {
 }
 
 impl StateStore {
-    #[cfg(any(target_os = "android", test))]
+    #[cfg(any(target_os = "android", target_os = "ios", test))]
     pub fn new(path: PathBuf) -> Self {
         Self { path, ready: false }
     }
 
+    #[cfg(any(target_os = "android", test))]
     pub fn load<T: serde::de::DeserializeOwned>(&mut self) -> io::Result<Option<T>> {
+        self.ready = false;
         let result = load(&self.path);
+        self.ready = result.is_ok();
+        result
+    }
+
+    pub fn load_and_migrate<T: serde::de::DeserializeOwned + serde::Serialize>(
+        &mut self,
+    ) -> io::Result<Option<T>> {
+        self.ready = false;
+        let result = load(&self.path);
+        if let Ok(Some(value)) = &result {
+            let canonical = ron::to_string(value).map_err(io::Error::other)?;
+            if fs::read_to_string(&self.path)? != canonical {
+                save(&self.path, value)?;
+            }
+        }
         self.ready = result.is_ok();
         result
     }
@@ -46,7 +63,7 @@ fn save<T: serde::Serialize>(path: &Path, state: &T) -> io::Result<()> {
     replace_with(path, |file| file.write_all(text.as_bytes()))
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_os = "ios"))]
 pub(crate) fn write_atomic<T: serde::Serialize>(path: &Path, state: &T) -> io::Result<()> {
     save(path, state)
 }
@@ -63,7 +80,7 @@ fn replace_with(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) ->
     file.sync_all()?;
     drop(file);
     fs::rename(&staging, path)?;
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     File::open(parent)?.sync_all()?;
     Ok(())
 }
@@ -93,6 +110,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reader_does_not_serialize_or_overwrite_a_newer_owner_value() {
+        #[derive(serde::Deserialize)]
+        struct ReadOnly(u64);
+        let fixture = Fixture::new();
+        fs::create_dir_all(&fixture.0).unwrap();
+        fs::write(fixture.path(), "(44)").unwrap();
+        let mut reader = StateStore::new(fixture.path());
+        assert_eq!(reader.load::<ReadOnly>().unwrap().unwrap().0, 44);
+        fs::write(fixture.path(), "(99)").unwrap();
+        assert_eq!(reader.load::<ReadOnly>().unwrap().unwrap().0, 99);
+        assert_eq!(fs::read_to_string(fixture.path()).unwrap(), "(99)");
+    }
+    #[test]
+    fn migration_serialization_failure_keeps_store_unready_and_file_unchanged() {
+        #[derive(serde::Deserialize)]
+        struct Fails(u64);
+        impl serde::Serialize for Fails {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                let _ = self.0;
+                Err(serde::ser::Error::custom("injected serialization failure"))
+            }
+        }
+        let fixture = Fixture::new();
+        fs::create_dir_all(&fixture.0).unwrap();
+        fs::write(fixture.path(), "(44)").unwrap();
+        let original = fs::read(fixture.path()).unwrap();
+        let mut store = StateStore::new(fixture.path());
+        assert!(store.load_and_migrate::<Fails>().is_err());
+        assert!(!store.is_ready());
+        assert!(store.save(&vec![0_u64]).is_err());
+        assert_eq!(fs::read(fixture.path()).unwrap(), original);
+    }
+    #[test]
+    fn loading_legacy_file_rewrites_without_a_metric_change() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Legacy {
+            current: u64,
+            #[serde(default, skip_serializing)]
+            history: Vec<u64>,
+            deadline: Option<i64>,
+        }
+        let fixture = Fixture::new();
+        fs::create_dir_all(&fixture.0).unwrap();
+        fs::write(
+            fixture.path(),
+            "(current:44,history:[12,13],deadline:Some(123456))",
+        )
+        .unwrap();
+        let mut store = StateStore::new(fixture.path());
+        let state = store.load_and_migrate::<Legacy>().unwrap().unwrap();
+        assert_eq!(state.history, [12, 13]);
+        assert_eq!(state.current, 44);
+        assert_eq!(state.deadline, Some(123456));
+        let disk = fs::read_to_string(fixture.path()).unwrap();
+        assert!(!disk.contains("history"));
+        let restored: Legacy = ron::from_str(&disk).unwrap();
+        assert_eq!(restored.current, 44);
+        assert_eq!(restored.deadline, state.deadline);
+    }
     #[test]
     fn successful_save_replaces_existing_state() {
         let fixture = Fixture::new();

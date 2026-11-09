@@ -220,9 +220,28 @@ fn media_listener() -> Vec<u8> {
     )
 }
 
+fn control_activity() -> Vec<u8> {
+    class_file(
+        &format!("{PACKAGE}/ControlActivity"),
+        "android/app/NativeActivity",
+        |pool| {
+            let move_back = pool.method_ref("android/app/Activity", "moveTaskToBack", "(Z)Z");
+            let mut code = vec![ALOAD_0, 0x04];
+            code.extend(op(INVOKEVIRTUAL, move_back));
+            code.extend([0x57, RETURN]);
+            vec![Method {
+                access: ACC_PUBLIC,
+                name: pool.utf8("onBackPressed"),
+                desc: pool.utf8("()V"),
+                code: Some((2, 1, code)),
+            }]
+        },
+    )
+}
 fn write_classes(out_dir: &Path) -> std::io::Result<()> {
     let dir = out_dir.join(PACKAGE);
     fs::create_dir_all(&dir)?;
+    fs::write(dir.join("ControlActivity.class"), control_activity())?;
     fs::write(dir.join("ControlService.class"), control_service())?;
     fs::write(dir.join("MediaListener.class"), media_listener())
 }
@@ -373,6 +392,8 @@ mod tests {
             while !r.0.is_empty() {
                 let ins = match r.u1() {
                     0x2a => "aload_0".to_string(),
+                    0x04 => "iconst_1".to_string(),
+                    0x57 => "pop".to_string(),
                     0xb1 => "return".to_string(),
                     0x13 => format!("ldc_w {:?}", self.string(r.u2())),
                     o @ 0xb6..=0xb8 => {
@@ -462,6 +483,40 @@ mod tests {
         partial
     }
 
+    #[test]
+    fn plain_manifest_dex_and_service_target_agree() {
+        let manifest = include_str!("../../../android/AndroidManifest.xml");
+        assert!(manifest
+            .contains("android:name=\"com.autodevjapan.phonefrictioncontrol.ControlActivity\""));
+        assert!(manifest.contains("android:enableOnBackInvokedCallback=\"false\""));
+        assert!(manifest.contains("keyboardHidden|uiMode"));
+        assert!(include_str!("package.rs").contains("activity.as_os_str()"));
+        assert!(include_str!("../../../src/service.rs").contains(
+            "let activity_class = \"com.autodevjapan.phonefrictioncontrol.ControlActivity\";"
+        ));
+    }
+    #[test]
+    fn generated_plain_activity_handles_back() {
+        let dir = env::temp_dir().join(format!("plain-activity-test-{}", std::process::id()));
+        write_classes(&dir).unwrap();
+        let bytes = fs::read(dir.join(PACKAGE).join("ControlActivity.class")).unwrap();
+        let c = parse(&bytes);
+        assert_eq!(c.super_name, "android/app/NativeActivity");
+        let m = c.method("onBackPressed");
+        let (stack, locals, code) = m.code.as_ref().unwrap();
+        assert_eq!((*stack, *locals), (2, 1));
+        assert_eq!(
+            c.decode(code),
+            [
+                "aload_0",
+                "iconst_1",
+                "invokevirtual android/app/Activity.moveTaskToBack(Z)Z",
+                "pop",
+                "return"
+            ]
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn headers_use_version_49_and_public_super_flags() {
         for (bytes, this, sup) in [

@@ -58,7 +58,7 @@ struct DailyRecord {
     playback_only: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub(crate) struct SavedState {
     pub(crate) target_apps: Vec<TrackedApp>,
@@ -66,6 +66,7 @@ pub(crate) struct SavedState {
     pub(crate) break_minutes: u32,
     pub(crate) cooldown_until_ms: Option<i64>,
     pub(crate) limit_triggered_day: Option<String>,
+    pub(crate) last_limit_triggered_day: Option<String>,
     pub(crate) current_day_key: String,
     daily_records: Vec<DailyRecord>,
     pub(crate) usage_disclosure_accepted: bool,
@@ -73,6 +74,32 @@ pub(crate) struct SavedState {
     pub(crate) service_disclosure_accepted: bool,
 }
 
+impl Serialize for SavedState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut out = serializer.serialize_struct("SavedState", 11)?;
+        out.serialize_field("target_apps", &self.target_apps)?;
+        out.serialize_field("daily_limit_minutes", &self.daily_limit_minutes)?;
+        out.serialize_field("break_minutes", &self.break_minutes)?;
+        out.serialize_field("cooldown_until_ms", &self.cooldown_until_ms)?;
+        out.serialize_field("limit_triggered_day", &self.limit_triggered_day)?;
+        out.serialize_field("last_limit_triggered_day", &self.last_limit_triggered_day)?;
+        out.serialize_field("current_day_key", &self.current_day_key)?;
+        let records: Vec<_> = self
+            .daily_records
+            .iter()
+            .filter(|r| r.day_key == self.current_day_key)
+            .collect();
+        out.serialize_field("daily_records", &records)?;
+        out.serialize_field("usage_disclosure_accepted", &self.usage_disclosure_accepted)?;
+        out.serialize_field("playback_only", &self.playback_only)?;
+        out.serialize_field(
+            "service_disclosure_accepted",
+            &self.service_disclosure_accepted,
+        )?;
+        out.end()
+    }
+}
 impl Default for SavedState {
     fn default() -> Self {
         Self {
@@ -81,6 +108,7 @@ impl Default for SavedState {
             break_minutes: DEFAULT_BREAK_MINUTES,
             cooldown_until_ms: None,
             limit_triggered_day: None,
+            last_limit_triggered_day: None,
             current_day_key: String::new(),
             daily_records: Vec::new(),
             usage_disclosure_accepted: false,
@@ -96,6 +124,7 @@ impl SavedState {
         &mut self,
         deadline: Option<i64>,
         triggered_day: Option<String>,
+        last_triggered_day: Option<String>,
         now: i64,
     ) {
         self.cooldown_until_ms = self
@@ -104,6 +133,14 @@ impl SavedState {
             .max(deadline.filter(|until| *until > now));
         if triggered_day.is_some() {
             self.limit_triggered_day = triggered_day;
+        }
+        if let Some(day) = last_triggered_day
+            && self
+                .last_limit_triggered_day
+                .as_deref()
+                .is_none_or(|current| day.as_str() > current)
+        {
+            self.last_limit_triggered_day = Some(day);
         }
     }
     pub(crate) fn policy(&self) -> crate::enforcement::Policy {
@@ -200,11 +237,26 @@ impl ControlApp {
             .as_ref()
             .and_then(|app| app.internal_data_path())
             .map(|path| crate::persistence::StateStore::new(path.join("usage-state.ron")));
-        #[cfg(not(target_os = "android"))]
+        #[cfg(target_os = "ios")]
+        let mut state_store = std::env::var_os("HOME")
+            .filter(|home| std::path::Path::new(home).is_absolute())
+            .map(|home| {
+                crate::persistence::StateStore::new(
+                    std::path::PathBuf::from(home).join("Documents/usage-state.ron"),
+                )
+            });
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let mut state_store: Option<crate::persistence::StateStore> = None;
+        #[cfg(target_os = "ios")]
+        let mut storage_error = if state_store.is_none() {
+            Some("端末内の保存先を取得できないため保存を止めています。".to_owned())
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "ios"))]
         let mut storage_error = None;
         if let Some(store) = &mut state_store {
-            match store.load() {
+            match store.load_and_migrate() {
                 Ok(Some(state)) => saved = state,
                 Ok(None) => {}
                 Err(_) => storage_error = Some("記録を読み込めないため保存を止めています。元の記録を保持して、もう一度読み込みます。".to_owned()),
@@ -402,6 +454,12 @@ impl ControlApp {
         self.permission_granted = snapshot.permission_granted;
         self.measurement_available = snapshot.permission_granted && snapshot.measurement_available;
         self.today_label = snapshot.day_label.clone();
+        if !snapshot.day_key.is_empty() && self.saved.current_day_key != snapshot.day_key {
+            self.saved.current_day_key = snapshot.day_key.clone();
+            self.saved
+                .daily_records
+                .retain(|r| r.day_key == snapshot.day_key);
+        }
         if !snapshot.permission_granted || !snapshot.measurement_available {
             // Losing access does not turn an already recorded day into zero usage.
             return;
@@ -433,29 +491,35 @@ impl ControlApp {
                 playback_only: self.saved.playback_only,
             });
         }
-        let mut days = Vec::new();
-        for record in self.saved.daily_records.iter().rev() {
-            if !days.contains(&record.day_key) {
-                days.push(record.day_key.clone());
-            }
-        }
-        days.truncate(14);
         self.saved
             .daily_records
-            .retain(|record| days.contains(&record.day_key));
+            .retain(|record| record.day_key == snapshot.day_key);
 
         let limit_ms = u64::from(self.saved.daily_limit_minutes) * 60_000;
         if snapshot.permission_granted
             && used_ms >= limit_ms
             && self.saved.cooldown_until_ms.is_none()
             && self.saved.limit_triggered_day.as_deref() != Some(snapshot.day_key.as_str())
+            && self
+                .saved
+                .last_limit_triggered_day
+                .as_deref()
+                .is_none_or(|day| snapshot.day_key.as_str() > day)
         {
             self.begin_break(snapshot.now_ms, snapshot.day_key);
         }
     }
 
     fn begin_break(&mut self, now_ms: i64, day_key: String) {
-        self.saved.limit_triggered_day = Some(day_key);
+        self.saved.limit_triggered_day = Some(day_key.clone());
+        if self
+            .saved
+            .last_limit_triggered_day
+            .as_deref()
+            .is_none_or(|day| day_key.as_str() > day)
+        {
+            self.saved.last_limit_triggered_day = Some(day_key);
+        }
         self.saved.cooldown_until_ms =
             Some(now_ms + i64::from(self.saved.break_minutes.max(1)) * 60_000);
         self.screen = Screen::Break;
@@ -490,6 +554,10 @@ impl ControlApp {
     }
 
     fn persist_changed_state(&mut self, frame: &mut eframe::Frame) {
+        #[cfg(target_os = "ios")]
+        if self.state_store.is_none() {
+            return;
+        }
         if self.last_persisted.as_ref() == Some(&self.saved) {
             return;
         }
@@ -586,6 +654,7 @@ impl ControlApp {
                 self.saved.accept_service_break(
                     status.cooldown_until_ms,
                     status.triggered_day,
+                    status.last_triggered_day,
                     now_epoch_ms(),
                 );
                 if status.storage_error {
@@ -724,6 +793,11 @@ impl ControlApp {
             && self.today_usage_ms() >= u64::from(self.saved.daily_limit_minutes) * 60_000
             && self.saved.limit_triggered_day.as_deref()
                 != Some(self.saved.current_day_key.as_str())
+            && self
+                .saved
+                .last_limit_triggered_day
+                .as_deref()
+                .is_none_or(|day| self.saved.current_day_key.as_str() > day)
         {
             self.begin_break(now_epoch_ms(), self.saved.current_day_key.clone());
             return;
@@ -832,7 +906,15 @@ impl ControlApp {
                         .strong(),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new("上限").size(14.0).color(MUTED));
+                    ui.label(
+                        RichText::new("上限")
+                            .size(14.0)
+                            .color(if ui.visuals().dark_mode {
+                                Color32::from_gray(180)
+                            } else {
+                                MUTED
+                            }),
+                    );
                 });
             });
             ui.add_space(6.0);
@@ -843,7 +925,11 @@ impl ControlApp {
                     } else {
                         "今日の利用時間"
                     })
-                    .color(MUTED),
+                    .color(if ui.visuals().dark_mode {
+                        Color32::from_gray(180)
+                    } else {
+                        MUTED
+                    }),
                 );
                 if self.usage_loading {
                     ui.spinner();
@@ -864,7 +950,13 @@ impl ControlApp {
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
-                        RichText::new(format_limit(self.saved.daily_limit_minutes)).color(MUTED),
+                        RichText::new(format_limit(self.saved.daily_limit_minutes)).color(
+                            if ui.visuals().dark_mode {
+                                Color32::from_gray(180)
+                            } else {
+                                MUTED
+                            },
+                        ),
                     );
                 });
             });
@@ -887,15 +979,27 @@ impl ControlApp {
 
         ui.add_space(10.0);
         egui::Frame::new()
-            .fill(Color32::from_rgb(235, 232, 227))
+            .fill(if ui.visuals().dark_mode {
+                Color32::from_rgb(48, 48, 50)
+            } else {
+                Color32::from_rgb(235, 232, 227)
+            })
             .inner_margin(egui::Margin::same(14))
             .show(ui, |ui| {
-                ui.label("使いすぎを防いで、やりたいことに集中できる毎日へ。");
+                ui.label(
+                    RichText::new("使いすぎを防いで、やりたいことに集中できる毎日へ。").color(
+                        if ui.visuals().dark_mode {
+                            Color32::from_gray(180)
+                        } else {
+                            INK
+                        },
+                    ),
+                );
             });
 
         ui.add_space(10.0);
         egui::Frame::new()
-            .fill(Color32::from_rgb(225, 220, 211))
+            .fill(if ui.visuals().dark_mode { Color32::from_rgb(48, 48, 50) } else { Color32::from_rgb(225, 220, 211) })
             .inner_margin(egui::Margin::same(12))
             .show(ui, |ui| {
                 #[cfg(all(target_os = "android", any(feature = "ads-test", feature = "ads-production")))]
@@ -922,14 +1026,14 @@ impl ControlApp {
                         ui.scroll_to_rect(slot.expand(16.0), Some(Align::Center));
                         ctx.request_repaint();
                     }
-                    ui.label(RichText::new("広告を閉じても休憩や制限は変わりません。").size(12.0).color(MUTED));
+                    ui.label(RichText::new("広告を閉じても休憩や制限は変わりません。").size(12.0).color(if ui.visuals().dark_mode { Color32::from_gray(180) } else { MUTED }));
                 }
                 #[cfg(not(all(target_os = "android", any(feature = "ads-test", feature = "ads-production"))))]
                 {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(RichText::new("広告").strong());
-                        ui.label(RichText::new("任意表示の枠（配信準備中）").color(MUTED));
+                        ui.label(RichText::new("任意表示の枠（配信準備中）").color(if ui.visuals().dark_mode { Color32::from_gray(180) } else { MUTED }));
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(RichText::new("›").size(24.0).color(ORANGE));
@@ -938,7 +1042,7 @@ impl ControlApp {
                 ui.label(
                     RichText::new("休憩時間の解除条件には使いません。")
                         .size(12.0)
-                        .color(MUTED),
+                        .color(if ui.visuals().dark_mode { Color32::from_gray(180) } else { MUTED }),
                 );
                 }
             });
@@ -951,7 +1055,11 @@ impl ControlApp {
         ui.add_space(8.0);
 
         egui::Frame::new()
-            .fill(Color32::from_rgb(252, 235, 222))
+            .fill(if ui.visuals().dark_mode {
+                Color32::from_rgb(48, 48, 50)
+            } else {
+                Color32::from_rgb(252, 235, 222)
+            })
             .inner_margin(egui::Margin::same(15))
             .show(ui, |ui| {
                 ui.label(format!(
@@ -1016,13 +1124,23 @@ impl ControlApp {
 
         ui.add_space(10.0);
         egui::Frame::new()
-            .fill(Color32::from_rgb(225, 220, 211))
+            .fill(if ui.visuals().dark_mode {
+                Color32::from_rgb(48, 48, 50)
+            } else {
+                Color32::from_rgb(225, 220, 211)
+            })
             .inner_margin(egui::Margin::same(12))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("広告").strong());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new("任意表示・配信準備中").color(MUTED));
+                        ui.label(RichText::new("任意表示・配信準備中").color(
+                            if ui.visuals().dark_mode {
+                                Color32::from_gray(180)
+                            } else {
+                                MUTED
+                            },
+                        ));
                     });
                 });
             });
@@ -1111,9 +1229,9 @@ impl ControlApp {
             ui.label(RichText::new("広告").strong());
             ui.label("広告はこのアプリ内だけに表示する想定です。休憩画面には出さず、広告を断っても制限機能は変わりません。");
             #[cfg(all(target_os = "android", feature = "ads-test"))]
-            ui.label("この試験版はGoogleの試験広告に接続します。ホームで表示を選んだときだけ同意を確認し、広告を読み込みます。");
+            ui.label("この試験版はGoogleの試験広告に接続します。ホームで広告表示を選ぶと同意を確認して広告を読み込みます。「広告の同意設定」を選んだ場合もGoogleへ接続して同意情報を確認します。");
             #[cfg(all(target_os = "android", feature = "ads-production"))]
-            ui.label("ホームで表示を選んだときだけ同意を確認し、広告を読み込みます。");
+            ui.label("ホームで広告表示を選ぶと同意を確認して広告を読み込みます。「広告の同意設定」を選んだ場合もGoogleへ接続して同意情報を確認します。");
             #[cfg(not(all(target_os = "android", any(feature = "ads-test", feature = "ads-production"))))]
             ui.label("この版は広告枠だけで、広告配信には接続しません。");
         });
@@ -1376,12 +1494,23 @@ impl eframe::App for ControlApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "android")]
+        if let Some(app) = &self.android_app {
+            // Read current Resources: the native configuration can retain its initial value.
+            let dark =
+                crate::platform::system_dark_mode(app).unwrap_or(ctx.theme() == egui::Theme::Dark);
+            ctx.set_theme(if dark {
+                egui::Theme::Dark
+            } else {
+                egui::Theme::Light
+            });
+        }
         if self.last_state_reload.elapsed() >= Duration::from_secs(5)
             && let Some(store) = &mut self.state_store
             && !store.is_ready()
         {
             self.last_state_reload = Instant::now();
-            if let Ok(state) = store.load() {
+            if let Ok(state) = store.load_and_migrate() {
                 if let Some(state) = state {
                     self.restore_saved_state(state);
                 }
@@ -1402,8 +1531,13 @@ impl eframe::App for ControlApp {
             self.ad_bounds = None;
         }
         let ctx = root_ui.ctx().clone();
+        root_ui.set_style(ctx.style_of(ctx.theme()));
         let is_break = self.screen == Screen::Break;
-        let background = if is_break { DARK } else { PAPER };
+        let background = if is_break || root_ui.visuals().dark_mode {
+            DARK
+        } else {
+            PAPER
+        };
 
         root_ui.scope_builder(
             egui::UiBuilder::new().max_rect(ctx.content_rect()),
@@ -1443,7 +1577,15 @@ impl eframe::App for ControlApp {
                                 (Screen::Settings, "設定", "●"),
                             ] {
                                 let selected = self.screen == screen;
-                                let color = if selected { ORANGE } else { MUTED };
+                                let color = if selected {
+                                    ORANGE
+                                } else {
+                                    if ui.visuals().dark_mode {
+                                        Color32::from_gray(180)
+                                    } else {
+                                        MUTED
+                                    }
+                                };
                                 let response = ui.add_sized(
                                     [item_width, 48.0],
                                     egui::Button::new(
@@ -1481,6 +1623,10 @@ impl eframe::App for ControlApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        #[cfg(target_os = "ios")]
+        if self.state_store.is_none() {
+            return;
+        }
         if let Some(store) = &self.state_store {
             if store.save(&self.saved).is_ok() {
                 self.last_persisted = Some(self.saved.clone());
@@ -1544,9 +1690,9 @@ mod tests {
             cooldown_until_ms: Some(2000),
             ..SavedState::default()
         };
-        state.accept_service_break(None, None, 1000);
+        state.accept_service_break(None, None, None, 1000);
         assert_eq!(state.cooldown_until_ms, Some(2000));
-        state.accept_service_break(None, None, 2000);
+        state.accept_service_break(None, None, None, 2000);
         assert_eq!(state.cooldown_until_ms, None);
     }
 
@@ -1593,25 +1739,78 @@ mod tests {
     }
 
     #[test]
-    fn history_keeps_the_latest_fourteen_days() {
+    fn saving_legacy_history_uses_current_key_not_latest_date() {
+        let mut app = app();
+        app.apply_usage_snapshot(snapshot(1, 44));
+        let mut future = app.saved.daily_records[0].clone();
+        future.day_key = "2099-01-01".into();
+        app.saved.daily_records.push(future);
+        let deadline = app.saved.cooldown_until_ms;
+        let restored: SavedState = ron::from_str(&ron::to_string(&app.saved).unwrap()).unwrap();
+        assert_eq!(restored.daily_records.len(), 1);
+        assert_eq!(restored.daily_records[0].day_key, app.saved.current_day_key);
+        assert_eq!(restored.daily_records[0].used_ms, 44 * 60_000);
+        assert_eq!(restored.cooldown_until_ms, deadline);
+        assert_eq!(restored.limit_triggered_day, app.saved.limit_triggered_day);
+    }
+    #[test]
+    fn history_keeps_only_the_current_day() {
         let mut app = app();
         for day in 1..=16 {
             app.apply_usage_snapshot(snapshot(day, u64::from(day)));
         }
-        assert_eq!(app.saved.daily_records.len(), 14);
+        assert_eq!(app.saved.daily_records.len(), 1);
         assert_eq!(
             app.saved.daily_records.first().unwrap().day_key,
-            "2026-10-03"
+            "2026-10-16"
         );
         assert_eq!(
             app.saved.daily_records.last().unwrap().day_key,
             "2026-10-16"
         );
         app.apply_usage_snapshot(snapshot(16, 22));
-        assert_eq!(app.saved.daily_records.len(), 14);
+        assert_eq!(app.saved.daily_records.len(), 1);
         assert_eq!(app.saved.daily_records.last().unwrap().used_ms, 22 * 60_000);
     }
 
+    #[test]
+    fn ui_accepts_service_last_trigger_and_does_not_recreate_a_rolled_back_day() {
+        let mut state = SavedState::default();
+        state.accept_service_break(None, None, Some("2026-10-02".into()), 1000);
+        assert_eq!(
+            state.last_limit_triggered_day.as_deref(),
+            Some("2026-10-02")
+        );
+        let mut app = app();
+        app.saved.last_limit_triggered_day = Some("2026-10-02".into());
+        app.apply_usage_snapshot(snapshot(1, 120));
+        assert_eq!(app.saved.cooldown_until_ms, None);
+        assert_eq!(app.screen, Screen::Home);
+        app.apply_usage_snapshot(snapshot(3, 120));
+        assert!(app.saved.cooldown_until_ms.is_some());
+    }
+    #[test]
+    fn stale_service_marker_cannot_move_ui_marker_backward() {
+        let mut state = SavedState::default();
+        state.accept_service_break(None, None, Some("2026-10-03".into()), 1000);
+        state.accept_service_break(None, None, Some("2026-10-02".into()), 2000);
+        assert_eq!(
+            state.last_limit_triggered_day.as_deref(),
+            Some("2026-10-03")
+        );
+        state.accept_service_break(
+            Some(9000),
+            Some("2026-10-03".into()),
+            Some("2026-10-04".into()),
+            3000,
+        );
+        assert_eq!(state.cooldown_until_ms, Some(9000));
+        assert_eq!(state.limit_triggered_day.as_deref(), Some("2026-10-03"));
+        assert_eq!(
+            state.last_limit_triggered_day.as_deref(),
+            Some("2026-10-04")
+        );
+    }
     #[test]
     fn midnight_does_not_cancel_or_extend_an_active_break() {
         let mut app = app();
@@ -1642,7 +1841,7 @@ mod tests {
         let mut app = app();
         app.apply_usage_snapshot(snapshot(1, 44));
         let saved = app.saved.clone();
-        let mut unavailable = snapshot(2, 0);
+        let mut unavailable = snapshot(1, 0);
         unavailable.measurement_available = false;
         app.apply_usage_snapshot(unavailable);
         assert_eq!(app.saved, saved);
@@ -1650,6 +1849,19 @@ mod tests {
         assert_eq!(app.today_usage_ms(), 44 * 60_000);
     }
 
+    #[test]
+    fn known_new_day_without_measurement_drops_previous_day_not_break() {
+        let mut app = app();
+        app.apply_usage_snapshot(snapshot(1, 120));
+        let deadline = app.saved.cooldown_until_ms;
+        let mut unavailable = snapshot(2, 0);
+        unavailable.measurement_available = false;
+        app.apply_usage_snapshot(unavailable);
+        assert_eq!(app.saved.current_day_key, "2026-10-02");
+        assert!(app.saved.daily_records.is_empty());
+        assert_eq!(app.saved.cooldown_until_ms, deadline);
+        assert_eq!(app.display_usage(), "取得できません");
+    }
     #[test]
     fn an_os_history_reset_cannot_erase_a_recorded_day() {
         let mut app = app();
@@ -1659,7 +1871,8 @@ mod tests {
         app.apply_usage_snapshot(snapshot(1, 47));
         assert_eq!(app.saved.daily_records[0].used_ms, 47 * 60_000);
         app.apply_usage_snapshot(snapshot(2, 1));
-        assert_eq!(app.saved.daily_records[1].used_ms, 60_000);
+        assert_eq!(app.saved.daily_records.len(), 1);
+        assert_eq!(app.saved.daily_records[0].used_ms, 60_000);
     }
 
     #[test]
