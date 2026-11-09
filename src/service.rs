@@ -115,6 +115,7 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
     let mut guard_store = crate::persistence::StateStore::new(dir.join("guard-state.ron"));
     let mut state: Option<GuardState> = None;
     let mut last_saved: Option<GuardState> = None;
+    let mut selection_save_pending = false;
     let mut last_save = Instant::now() - Duration::from_secs(60);
     let mut last_load = Instant::now() - Duration::from_secs(60);
     let mut tracker = crate::usage::UsageTracker::default();
@@ -148,8 +149,12 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
         {
             let policy = config.policy();
             // Explicit selection changes apply even while measurement permission is absent.
-            let pruned = state.retain_selected(&policy);
-            if pruned && guard_store.is_ready() && guard_store.save(state).is_ok() {
+            if crate::enforcement::persist_selection_prune(
+                state,
+                &policy,
+                &mut selection_save_pending,
+                &guard_store,
+            ) {
                 last_saved = Some(state.clone());
             }
             if policy.enabled {

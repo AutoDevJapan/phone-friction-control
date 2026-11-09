@@ -87,6 +87,21 @@ struct DayLedger {
     triggered_day: Option<String>,
 }
 
+pub(crate) fn persist_selection_prune(
+    state: &mut GuardState,
+    policy: &Policy,
+    pending: &mut bool,
+    store: &crate::persistence::StateStore,
+) -> bool {
+    *pending |= state.retain_selected(policy);
+    if *pending && store.is_ready() && store.save(state).is_ok() {
+        *pending = false;
+        true
+    } else {
+        false
+    }
+}
+
 pub(crate) fn guard_save_due(changed: bool, critical: bool, elapsed: std::time::Duration) -> bool {
     changed && (critical || elapsed >= std::time::Duration::from_secs(10))
 }
@@ -379,6 +394,49 @@ mod tests {
         assert!(guard_save_due(true, false, Duration::from_secs(10)));
         assert!(guard_save_due(true, true, Duration::from_secs(1)));
         assert!(!guard_save_due(false, true, Duration::from_secs(60)));
+    }
+    #[test]
+    fn failed_selection_prune_save_retries_until_success_and_keeps_current_data() {
+        use crate::persistence::StateStore;
+        use std::time::Duration;
+        let dir =
+            std::env::temp_dir().join(format!("phone-selection-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("guard-state.ron");
+        let mut old = GuardState::default();
+        sample(&mut old, "day1", 1, 61_000);
+        old.usage_ms.insert("mail".into(), 99);
+        old.cooldown_until_ms = Some(123_456);
+        std::fs::write(&path, ron::to_string(&old).unwrap()).unwrap();
+        let mut store = StateStore::new(path.clone());
+        let mut state = store.load::<GuardState>().unwrap().unwrap();
+        std::fs::create_dir(path.with_extension("pending")).unwrap();
+        let mut pending = false;
+        assert!(!persist_selection_prune(
+            &mut state,
+            &policy(),
+            &mut pending,
+            &store
+        ));
+        assert!(pending);
+        assert!(!state.usage_ms.contains_key("mail"));
+        assert_eq!(state.cooldown_until_ms, Some(123_456));
+        assert!(!guard_save_due(true, false, Duration::from_secs(1)));
+        std::fs::remove_dir(path.with_extension("pending")).unwrap();
+        assert!(persist_selection_prune(
+            &mut state,
+            &policy(),
+            &mut pending,
+            &store
+        ));
+        assert!(!pending);
+        let restored: GuardState = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(!restored.usage_ms.contains_key("mail"));
+        assert_eq!(restored.usage_ms["video"], 61_000);
+        assert_eq!(restored.cooldown_until_ms, Some(123_456));
+        assert!(guard_save_due(true, false, Duration::from_secs(10)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
     fn retain_selected_reports_only_real_prune() {
