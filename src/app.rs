@@ -273,10 +273,6 @@ impl ControlApp {
             .storage
             .and_then(|storage| eframe::get_value(storage, SAVE_KEY))
             .unwrap_or_default();
-        #[cfg(not(target_os = "android"))]
-        if mode == AppMode::Runtime {
-            saved = SavedState::default();
-        }
         #[cfg(target_os = "android")]
         let mut state_store = android_app
             .as_ref()
@@ -1704,6 +1700,66 @@ impl eframe::App for ControlApp {
 #[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use super::*;
+
+    struct LegacyStorage(String);
+    impl eframe::Storage for LegacyStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            (key == SAVE_KEY).then(|| self.0.clone())
+        }
+        fn set_string(&mut self, _: &str, _: String) {}
+        fn remove_string(&mut self, _: &str) {}
+        fn flush(&mut self) {}
+    }
+
+    fn construct_from_legacy(state: &SavedState) -> ControlApp {
+        let storage = LegacyStorage(ron::to_string(state).unwrap());
+        let mut context = eframe::CreationContext::_new_kittest(egui::Context::default());
+        context.storage = Some(&storage);
+        ControlApp::new(&context, None)
+    }
+
+    #[test]
+    fn runtime_constructor_preserves_ordinary_legacy_storage() {
+        let mut state = app().saved;
+        state.current_day_key = "2026-11-09".into();
+        state.daily_limit_minutes = 300;
+        state.break_minutes = 45;
+        state.daily_records.push(DailyRecord {
+            day_key: state.current_day_key.clone(),
+            label: "11月9日".into(),
+            used_ms: 1234,
+            playback_only: false,
+        });
+        let actual = construct_from_legacy(&state);
+        assert_eq!(actual.saved, state);
+        assert!(!actual.permission_granted);
+        assert!(!actual.measurement_available);
+    }
+
+    #[test]
+    fn runtime_constructor_removes_only_known_preview_session() {
+        let mut state = SavedState {
+            current_day_key: "preview".into(),
+            daily_limit_minutes: 300,
+            target_apps: vec![TrackedApp {
+                label: "動画アプリ（プレビュー）".into(),
+                package: "preview.video".into(),
+            }],
+            ..SavedState::default()
+        };
+        state.daily_records.push(DailyRecord {
+            day_key: "preview".into(),
+            label: "サンプル".into(),
+            used_ms: 102 * 60_000,
+            playback_only: false,
+        });
+        let actual = construct_from_legacy(&state);
+        assert_eq!(actual.saved.daily_limit_minutes, 300);
+        assert!(actual.saved.target_apps.is_empty());
+        assert!(actual.saved.daily_records.is_empty());
+        assert!(!actual.permission_granted);
+        assert!(!actual.measurement_available);
+    }
 
     fn app() -> ControlApp {
         ControlApp {
