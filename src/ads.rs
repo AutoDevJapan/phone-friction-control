@@ -399,6 +399,8 @@ fn update(env: &mut JNIEnv, activity: &JObject, epoch: u64) -> jni::errors::Resu
         "com.google.android.ump.ConsentRequestParameters$Builder",
     )?;
     let builder = env.new_object(&builder_class, "()V", &[])?;
+    #[cfg(feature = "ads-test")]
+    configure_consent_test_geography(env, activity, &builder)?;
     let app_id = JObject::from(env.new_string(&ids.app)?);
     env.call_method(
         &builder,
@@ -871,4 +873,50 @@ pub extern "system" fn Java_com_autodevjapan_phonefrictioncontrol_ControlAdsActi
         }
     }));
     let _ = env.exception_clear();
+}
+
+#[cfg(feature = "ads-test")]
+fn configure_consent_test_geography(
+    env: &mut JNIEnv,
+    activity: &JObject,
+    parameters: &JObject,
+) -> jni::errors::Result<()> {
+    let builder_class = class(
+        env,
+        activity,
+        "com.google.android.ump.ConsentDebugSettings$Builder",
+    )?;
+    let context = env
+        .call_method(
+            activity,
+            "getApplicationContext",
+            "()Landroid/content/Context;",
+            &[],
+        )?
+        .l()?;
+    let debug = env.new_object(
+        &builder_class,
+        "(Landroid/content/Context;)V",
+        &[JValue::Object(&context)],
+    )?;
+    let Some(geography) = crate::consent_debug_geography() else {
+        return Ok(());
+    };
+    // UMP DebugGeography.DEBUG_GEOGRAPHY_EEA = 1; emulators are test devices.
+    env.call_method(
+        &debug,
+        "setDebugGeography",
+        "(I)Lcom/google/android/ump/ConsentDebugSettings$Builder;",
+        &[JValue::Int(geography)],
+    )?;
+    let settings = env
+        .call_method(
+            &debug,
+            "build",
+            "()Lcom/google/android/ump/ConsentDebugSettings;",
+            &[],
+        )?
+        .l()?;
+    env.call_method(parameters, "setConsentDebugSettings", "(Lcom/google/android/ump/ConsentDebugSettings;)Lcom/google/android/ump/ConsentRequestParameters$Builder;", &[JValue::Object(&settings)])?;
+    Ok(())
 }
