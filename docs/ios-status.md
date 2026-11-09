@@ -29,7 +29,7 @@ public XCTestで自作アプリの上限設定を120分から300分へ変更し�
 
 実行対象はpreview entry pointと別のSimulator用bundle IDです。画面の「1時間42分」などは架空のプレビューデータで、実利用時間・アプリ選択・Screen Time許可の証拠ではありません。Android専用の説明や操作がiOSのプレビューにも残る不一致は未解消です。[PR21](https://github.com/AutoDevJapan/phone-friction-control/pull/21)のpreview/runtime分離は別候補であり、platform capabilityに合う説明・操作の修正、実制御との接続が引き続き必要です。
 
-今回の受入範囲は仮想端末までで、USB実機の用意や本人のPC操作を必須条件にしていません。これを実機確認済みという意味や、将来の無料Cloud実機を含む一切の利用禁止へ一般化しません。
+今回の受入はiOS18.5 Simulatorのみです。実端末での動作は未検証です。
 
 ## 2026-10-11確認時点の未達条件（以下は過去の記録）
 
