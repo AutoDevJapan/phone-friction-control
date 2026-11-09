@@ -111,6 +111,7 @@ mod tests {
             deadline: Option<i64>,
         }
         let fixture = Fixture::new();
+        fs::create_dir_all(&fixture.0).unwrap();
         fs::write(
             fixture.path(),
             "(current:44,history:[12,13],deadline:Some(123456))",
