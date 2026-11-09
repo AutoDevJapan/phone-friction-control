@@ -148,10 +148,11 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
             let policy = config.policy();
             // Explicit selection changes apply even while measurement permission is absent.
             state.retain_selected(&policy);
-            if guard_store.is_ready() && last_saved.as_ref() != Some(state) {
-                if guard_store.save(state).is_ok() {
-                    last_saved = Some(state.clone());
-                }
+            if guard_store.is_ready()
+                && last_saved.as_ref() != Some(state)
+                && guard_store.save(state).is_ok()
+            {
+                last_saved = Some(state.clone());
             }
             if policy.enabled {
                 let result =
