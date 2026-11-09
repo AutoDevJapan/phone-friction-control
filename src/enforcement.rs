@@ -72,6 +72,7 @@ pub(crate) struct GuardState {
     boot: Option<i32>,
     pub cooldown_until_ms: Option<i64>,
     pub triggered_day: Option<String>,
+    pub last_triggered_day: Option<String>,
     #[serde(skip_serializing)]
     history: Vec<DayLedger>,
 }
@@ -146,6 +147,14 @@ impl GuardState {
         *previous = playing;
     }
     pub fn sample_usage(&mut self, day: &str, boot: i32, totals: &HashMap<String, u64>) {
+        if let Some(triggered) = &self.triggered_day
+            && self
+                .last_triggered_day
+                .as_ref()
+                .is_none_or(|old| old < triggered)
+        {
+            self.last_triggered_day = Some(triggered.clone());
+        }
         if self.day != day {
             if !self.day.is_empty() {
                 self.history.retain(|record| record.day != self.day);
@@ -215,9 +224,14 @@ impl GuardState {
         if policy.enabled
             && self.cooldown_until_ms.is_none()
             && self.triggered_day.as_deref() != Some(self.day.as_str())
+            && self
+                .last_triggered_day
+                .as_deref()
+                .is_none_or(|day| self.day.as_str() > day)
             && total >= u64::from(policy.limit_minutes.max(1)) * 60_000
         {
             self.triggered_day = Some(self.day.clone());
+            self.last_triggered_day = Some(self.day.clone());
             self.cooldown_until_ms =
                 Some(now_ms.saturating_add(i64::from(policy.break_minutes.max(1)) * 60_000));
         }
@@ -284,6 +298,21 @@ mod tests {
         assert_eq!(recovered.usage_ms["video"], 6_000);
     }
 
+    #[test]
+    fn completed_day_does_not_retrigger_after_next_day_save_and_restart() {
+        let mut state = GuardState::default();
+        sample(&mut state, "2026-11-08", 1, 60_000);
+        state.enforce(&policy(), 1000);
+        state.enforce(&policy(), 301_000);
+        sample(&mut state, "2026-11-09", 1, 0);
+        let mut restored: GuardState = ron::from_str(&ron::to_string(&state).unwrap()).unwrap();
+        sample(&mut restored, "2026-11-08", 1, 60_000);
+        restored.enforce(&policy(), 400_000);
+        assert_eq!(restored.cooldown_until_ms, None);
+        sample(&mut restored, "2026-11-09", 1, 60_000);
+        restored.enforce(&policy(), 500_000);
+        assert_eq!(restored.cooldown_until_ms, Some(800_000));
+    }
     #[test]
     fn changing_the_clock_back_restores_the_day_without_another_break() {
         let mut state = GuardState::default();

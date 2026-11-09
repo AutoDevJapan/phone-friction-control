@@ -13,6 +13,7 @@ impl StateStore {
         Self { path, ready: false }
     }
 
+    #[cfg(any(target_os = "android", test))]
     pub fn load<T: serde::de::DeserializeOwned>(&mut self) -> io::Result<Option<T>> {
         self.ready = false;
         let result = load(&self.path);
