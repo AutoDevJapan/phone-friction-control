@@ -1,0 +1,75 @@
+{
+  "sourceCommit": "32734d68a08e6920bfa5aaecc2eb01f82bb8597a",
+  "apkSha256": "531f26c74f764b9dcf01e9e54de8acff95ee5a61716029f7278103e69636e98b",
+  "abi": "x86_64",
+  "pageSize": 16384,
+  "artifactKind": "debug, no ads, not a distribution release",
+  "observations": [
+    {
+      "id": "unavailable",
+      "injectedPlaybackMs": 42000,
+      "savedPlaybackMs": 42000,
+      "measuredPlayback": false
+    },
+    {
+      "id": "short-trigger",
+      "injectedLimitMinutes": 1,
+      "injectedBreakMinutes": 2,
+      "foregroundMs": 60375,
+      "deadlineMs": 1794190426674
+    },
+    {
+      "id": "short-reentry",
+      "foregroundMs": 70606,
+      "deadlineMs": 1794190426674,
+      "resumedActivity": "android.app.NativeActivity",
+      "breakScreenPassed": false
+    },
+    {
+      "id": "aligned-screen",
+      "normalLimitMinutes": 120,
+      "normalBreakMinutes": 30,
+      "injectedDeadlineMs": 1794190493758,
+      "serviceConnected": false
+    },
+    {
+      "id": "expiry",
+      "deviceTime": "2026-11-09T11:14:57+09:00",
+      "savedCooldown": null,
+      "savedUsageMs": 70606
+    },
+    {
+      "id": "ui-save-restart",
+      "uiLimitMinutes": 240,
+      "breakMinutes": 30,
+      "savedUsageMs": 76430
+    },
+    {
+      "id": "ui-restore",
+      "uiLimitMinutes": 120,
+      "breakMinutes": 30,
+      "savedUsageMs": 85629
+    }
+  ],
+  "evidenceSources": [
+    {
+      "file": "normal-config.ron",
+      "deviceFile": "files/guard-config.ron",
+      "stage": "before fixture injection, after normal Chrome selection and consent",
+      "capturedAt": "not recorded; before 2026-11-09T11:01:00+09:00",
+      "meaning": "baseline120/30, usage0, no triggered day; not UI restore evidence"
+    },
+    {
+      "file": "restored-guard-config.ron",
+      "deviceFile": "files/guard-config.ron",
+      "capturedAt": "2026-11-09T11:24:36.5579055+09:00",
+      "meaning": "new readback after UI restore, usage86389, triggered day retained"
+    },
+    {
+      "file": "restored-usage-state.ron",
+      "deviceFile": "files/usage-state.ron",
+      "capturedAt": "2026-11-09T11:24:36.5579055+09:00",
+      "meaning": "new readback after UI restore, usage86389, triggered day retained"
+    }
+  ]
+}
