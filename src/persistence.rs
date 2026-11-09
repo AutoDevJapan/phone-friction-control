@@ -16,14 +16,15 @@ impl StateStore {
     pub fn load<T: serde::de::DeserializeOwned + serde::Serialize>(
         &mut self,
     ) -> io::Result<Option<T>> {
+        self.ready = false;
         let result = load(&self.path);
-        self.ready = result.is_ok();
         if let Ok(Some(value)) = &result {
             let canonical = ron::to_string(value).map_err(io::Error::other)?;
             if fs::read_to_string(&self.path)? != canonical {
                 save(&self.path, value)?;
             }
         }
+        self.ready = result.is_ok();
         result
     }
 
@@ -101,6 +102,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn migration_serialization_failure_keeps_store_unready_and_file_unchanged() {
+        #[derive(serde::Deserialize)]
+        struct Fails(u64);
+        impl serde::Serialize for Fails {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                let _ = self.0;
+                Err(serde::ser::Error::custom("injected serialization failure"))
+            }
+        }
+        let fixture = Fixture::new();
+        fs::create_dir_all(&fixture.0).unwrap();
+        fs::write(fixture.path(), "(44)").unwrap();
+        let original = fs::read(fixture.path()).unwrap();
+        let mut store = StateStore::new(fixture.path());
+        assert!(store.load::<Fails>().is_err());
+        assert!(!store.is_ready());
+        assert!(store.save(&vec![0_u64]).is_err());
+        assert_eq!(fs::read(fixture.path()).unwrap(), original);
+    }
     #[test]
     fn loading_legacy_file_rewrites_without_a_metric_change() {
         #[derive(serde::Serialize, serde::Deserialize)]
