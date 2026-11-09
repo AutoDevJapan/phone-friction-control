@@ -4,8 +4,8 @@
 //! すべて native として Rust ライブラリへ渡す。JVM 側に処理の中身は持たない。
 
 use super::{
-    ACC_PUBLIC, ACC_STATIC, ACC_SUPER, INVOKESTATIC, LDC_W, LIBRARY, Method, PACKAGE, Pool, RETURN,
-    constructor, native, op,
+    constructor, native, op, Method, Pool, ACC_PUBLIC, ACC_STATIC, ACC_SUPER, INVOKESTATIC, LDC_W,
+    LIBRARY, PACKAGE, RETURN,
 };
 use std::{fs, path::Path};
 
@@ -337,10 +337,9 @@ mod tests {
             &[("onHostPause", "()V".into())],
         );
         let c = parse(&bytes);
-        assert!(
-            c.methods
-                .iter()
-                .any(|(_, name, desc, code)| name == "onBackPressed" && desc == "()V" && *code)
-        );
+        assert!(c
+            .methods
+            .iter()
+            .any(|(_, name, desc, code)| name == "onBackPressed" && desc == "()V" && *code));
     }
 }

@@ -430,9 +430,7 @@ mod tests {
         let manifest = ads_manifest(DEFAULT_MANIFEST, app, banner, true).unwrap();
         for (key, value) in [(APP_KEY, app), (BANNER_KEY, banner)] {
             assert_eq!(manifest.matches(key).count(), 1);
-            assert!(
-                manifest.contains(&format!("android:name=\"{key}\" android:value=\"{value}\""))
-            );
+            assert!(manifest.contains(&format!("android:name=\"{key}\" android:value=\"{value}\"")));
             let at = manifest.find(value).unwrap();
             assert!(
                 at > manifest.find("<application").unwrap()
@@ -487,19 +485,15 @@ mod tests {
             ]
             .map(OsString::from),
         );
-        assert!(
-            assemble(&args, true)
-                .unwrap_err()
-                .to_string()
-                .contains("sample publisher")
-        );
+        assert!(assemble(&args, true)
+            .unwrap_err()
+            .to_string()
+            .contains("sample publisher"));
         args[10] = "ca-app-pub-1234567890123456~1234567890".into();
-        assert!(
-            assemble(&args, true)
-                .unwrap_err()
-                .to_string()
-                .contains("same publisher")
-        );
+        assert!(assemble(&args, true)
+            .unwrap_err()
+            .to_string()
+            .contains("same publisher"));
         assert!(!output.exists());
     }
 
