@@ -200,8 +200,23 @@ impl ControlApp {
             .as_ref()
             .and_then(|app| app.internal_data_path())
             .map(|path| crate::persistence::StateStore::new(path.join("usage-state.ron")));
-        #[cfg(not(target_os = "android"))]
+        #[cfg(target_os = "ios")]
+        let mut state_store = std::env::var_os("HOME")
+            .filter(|home| std::path::Path::new(home).is_absolute())
+            .map(|home| {
+                crate::persistence::StateStore::new(
+                    std::path::PathBuf::from(home).join("Documents/usage-state.ron"),
+                )
+            });
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let mut state_store: Option<crate::persistence::StateStore> = None;
+        #[cfg(target_os = "ios")]
+        let mut storage_error = if state_store.is_none() {
+            Some("端末内の保存先を取得できないため保存を止めています。".to_owned())
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "ios"))]
         let mut storage_error = None;
         if let Some(store) = &mut state_store {
             match store.load() {
@@ -490,6 +505,8 @@ impl ControlApp {
     }
 
     fn persist_changed_state(&mut self, frame: &mut eframe::Frame) {
+        #[cfg(target_os = "ios")]
+        if self.state_store.is_none() { return; }
         if self.last_persisted.as_ref() == Some(&self.saved) {
             return;
         }
@@ -1481,6 +1498,8 @@ impl eframe::App for ControlApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        #[cfg(target_os = "ios")]
+        if self.state_store.is_none() { return; }
         if let Some(store) = &self.state_store {
             if store.save(&self.saved).is_ok() {
                 self.last_persisted = Some(self.saved.clone());

@@ -8,7 +8,7 @@ pub struct StateStore {
 }
 
 impl StateStore {
-    #[cfg(any(target_os = "android", test))]
+    #[cfg(any(target_os = "android", target_os = "ios", test))]
     pub fn new(path: PathBuf) -> Self {
         Self { path, ready: false }
     }
@@ -46,7 +46,7 @@ fn save<T: serde::Serialize>(path: &Path, state: &T) -> io::Result<()> {
     replace_with(path, |file| file.write_all(text.as_bytes()))
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_os = "ios"))]
 pub(crate) fn write_atomic<T: serde::Serialize>(path: &Path, state: &T) -> io::Result<()> {
     save(path, state)
 }
@@ -63,7 +63,7 @@ fn replace_with(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) ->
     file.sync_all()?;
     drop(file);
     fs::rename(&staging, path)?;
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     File::open(parent)?.sync_all()?;
     Ok(())
 }
