@@ -95,6 +95,15 @@ pub fn run_preview() -> eframe::Result {
         Box::new(|creation_context| Ok(Box::new(ControlApp::new(creation_context, None)))),
     )
 }
+#[cfg(any(all(target_os = "android", feature = "ads-test"), test))]
+pub(crate) const fn consent_debug_geography() -> Option<i32> {
+    if cfg!(feature = "ads-test") {
+        Some(1)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod consent_debug_tests {
     #[test]
@@ -103,13 +112,5 @@ mod consent_debug_tests {
             crate::consent_debug_geography(),
             cfg!(feature = "ads-test").then_some(1)
         );
-    }
-}
-#[cfg(any(feature = "ads-test", test))]
-pub(crate) const fn consent_debug_geography() -> Option<i32> {
-    if cfg!(feature = "ads-test") {
-        Some(1)
-    } else {
-        None
     }
 }
