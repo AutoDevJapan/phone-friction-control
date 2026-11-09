@@ -2,6 +2,10 @@ name: Manual iOS SDK audit
 on:
   workflow_dispatch:
     inputs:
+      product_native_storage_acceptance:
+        description: Test the product Runtime Documents store with synthetic settings in its own fresh Simulator container
+        type: boolean
+        default: false
       authorization_status_entry_probe:
         description: Inspect public authorization status metadata and getter entry without requesting access or calling the getter
         type: boolean
@@ -54,7 +58,141 @@ on:
 permissions:
   contents: read
 jobs:
+  product-native-storage:
+    if: inputs.product_native_storage_acceptance
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          targets: aarch64-apple-ios-sim
+      - name: Run the product native Documents acceptance tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer
+          SDK=$(xcrun --sdk iphonesimulator --show-sdk-path)
+          export SDKROOT="$SDK"
+          export IPHONEOS_DEPLOYMENT_TARGET=18.5
+          OUT="$RUNNER_TEMP/native-storage"
+          mkdir -p "$OUT/NativeStorageTests.app"
+          {
+            xcodebuild -version
+            xcrun --sdk iphonesimulator --show-sdk-version
+            rustc --version --verbose
+            uname -m
+          } > "$OUT/versions.txt"
+          test "$(xcrun --sdk iphonesimulator --show-sdk-version)" = 18.5
+          test "$(uname -m)" = arm64
+          test '${{ inputs.selection_inspection_mode }}' = none
+          for OPTION in '${{ inputs.authorization_probe }}' '${{ inputs.native_uikit_host }}' '${{ inputs.xcode_signed_host }}' '${{ inputs.ui_consent_test }}' '${{ inputs.ui_continue }}' '${{ inputs.authorization_status_entry_probe }}' '${{ inputs.authorization_status_value_probe }}' '${{ inputs.authorization_status_consent_probe }}' '${{ inputs.collect_xctest_headers }}'; do test "$OPTION" = false; done
+          git rev-parse HEAD > "$OUT/product-source.txt"
+          printf 'mode=product_native_storage_acceptance\nsynthetic_scalar_settings_only=true\nproduction_ui_exercised=false\nscreen_time_control_exercised=false\n' > "$OUT/scope.txt"
+          rustc --edition 2024 tools/ios-native-storage-output-gate.rs -o "$OUT/native-output-gate"
+          cargo test --locked --release --no-run --lib --features desktop-preview --target aarch64-apple-ios-sim --message-format=json > "$OUT/build-full.json" 2> "$OUT/build-full.txt"
+          TEST_EXE=$(jq -ser '[.[] | select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "phone_friction_control") | .executable | select(. != null)] | unique | if length == 1 then .[0] else error("native test executable unavailable") end' "$OUT/build-full.json")
+          cp "$TEST_EXE" "$OUT/NativeStorageTests.app/native-storage-tests"
+          printf '<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.autodevjapan.phonefrictioncontrol.native-storage-tests</string><key>CFBundleName</key><string>NativeStorageTests</string><key>CFBundleExecutable</key><string>native-storage-tests</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>1</string><key>CFBundleShortVersionString</key><string>0.1.0</string><key>MinimumOSVersion</key><string>18.5</string><key>UIDeviceFamily</key><array><integer>1</integer></array><key>UILaunchScreen</key><dict/><key>CFBundleSupportedPlatforms</key><array><string>iPhoneSimulator</string></array></dict></plist>\n' > "$OUT/NativeStorageTests.app/Info.plist"
+          codesign --sign - "$OUT/NativeStorageTests.app"
+          codesign --verify --strict "$OUT/NativeStorageTests.app"
+          shasum -a 256 "$OUT/NativeStorageTests.app/native-storage-tests" Cargo.lock src/app.rs .github/workflows/ios-sdk-audit.yml > "$OUT/build-hashes.txt"
+          cp Cargo.lock "$OUT/effective-Cargo.lock"
+          tar -czf "$OUT/NativeStorageTests.app.tar.gz" -C "$OUT" NativeStorageTests.app
+          shasum -a 256 "$OUT/NativeStorageTests.app.tar.gz" > "$OUT/archive-hash.txt"
+          xcrun simctl help launch > "$OUT/simctl-launch-help.txt"
+          RUNTIME=$(xcrun simctl list runtimes -j | jq -er '[.runtimes[] | select(.isAvailable and .version == "18.5" and (.identifier | contains("iOS"))) | .identifier] | if length == 1 then .[0] else error("iOS18.5 runtime unavailable") end')
+          SIM_ID=$(xcrun simctl create native-storage-audit com.apple.CoreSimulator.SimDeviceType.iPhone-15 "$RUNTIME")
+          trap 'xcrun simctl shutdown "$SIM_ID" || true; xcrun simctl delete "$SIM_ID" || true' EXIT
+          xcrun simctl boot "$SIM_ID"
+          perl -e 'alarm 120; exec @ARGV; die "exec failed\n"' xcrun simctl bootstatus "$SIM_ID" -b
+          xcrun simctl install "$SIM_ID" "$OUT/NativeStorageTests.app"
+          BID=com.autodevjapan.phonefrictioncontrol.native-storage-tests
+          DATA=$(xcrun simctl get_app_container "$SIM_ID" "$BID" data)
+          APP_EXEC="$(xcrun simctl get_app_container "$SIM_ID" "$BID" app)/native-storage-tests"
+          test ! -e "$DATA/Documents/usage-state.ron"
+          test ! -e "$DATA/Documents/usage-state.pending"
+          export SIMCTL_CHILD_PHONE_CONTROL_NATIVE_TEST_HOME="$DATA"
+          STATUS=0
+          # Use the public nonblocking launch mode and separate stdout/stderr.
+          # The previous console-mode timeout had no PID or target output;
+          # its142 status did not establish a failing Rust test or IO defect.
+          printf 'launcher_started_at=%s\n' "$(date -u +%FT%TZ)" > "$OUT/phase.txt"
+          perl -e 'alarm 45; exec @ARGV; die "exec failed\n"' xcrun simctl launch --stdout="$OUT/test-stdout.txt" --stderr="$OUT/test-stderr.txt" "$SIM_ID" "$BID" runtime_native_documents_ --nocapture --test-threads=1 --color never > "$OUT/launch.txt" 2>&1 || STATUS=$?
+          printf 'launcher_exit_status=%s\n' "$STATUS" > "$OUT/test-status.txt"
+          PID=$(awk -v b="$BID" 'index($0,b ": ")==1 {p=substr($0,length(b)+3); if(p ~ /^[0-9]+$/) print p}' "$OUT/launch.txt")
+          printf 'test_pid=%s\n' "$PID" > "$OUT/pid.txt"
+          # Observe all target instances, including subsequent launch attempts. A first
+          # successful summary is not a collection boundary. Require no target
+          # process and stable stream sizes across four quiet observations.
+          QUIESCENT=false
+          QUIET=0
+          LAST_BYTES=-1
+          ATTEMPT=0
+          COLLECT_STARTED=$SECONDS
+          COLLECT_DEADLINE=$((SECONDS+60))
+          PS_SNAPSHOT="$RUNNER_TEMP/native-storage-ps-current.txt"
+          : > "$OUT/process-observations.txt"
+          : > "$OUT/target-pids-seen.txt"
+          if [ "$STATUS" = 0 ]; then
+            while [ "$SECONDS" -lt "$COLLECT_DEADLINE" ]; do
+              ATTEMPT=$((ATTEMPT+1))
+              REMAINING=$((COLLECT_DEADLINE-SECONDS))
+              if [ "$REMAINING" -le 0 ]; then break; fi
+              PS_LIMIT=5
+              if [ "$REMAINING" -lt "$PS_LIMIT" ]; then PS_LIMIT=$REMAINING; fi
+              PS_STATUS=0
+              perl -e 'alarm shift; exec @ARGV; die "exec failed\n"' "$PS_LIMIT" ps -ww -A -o pid=,comm= > "$PS_SNAPSHOT" 2> "$OUT/process-query-error.txt" || PS_STATUS=$?
+              if [ "$PS_STATUS" != 0 ]; then
+                printf 'process_query_status=%s\n' "$PS_STATUS" >> "$OUT/process-observations.txt"
+                break
+              fi
+              "$OUT/native-output-gate" target-pids "$PS_SNAPSHOT" "$APP_EXEC" > "$OUT/current-target-pids.txt"
+              cat "$OUT/current-target-pids.txt" >> "$OUT/target-pids-seen.txt"
+              printf 'sample=%s; elapsed=%s; target_pids=' "$ATTEMPT" "$((SECONDS-COLLECT_STARTED))" >> "$OUT/process-observations.txt"
+              tr '\n' ',' < "$OUT/current-target-pids.txt" >> "$OUT/process-observations.txt"
+              printf '\n' >> "$OUT/process-observations.txt"
+              BYTES=0
+              for STREAM in test-stdout test-stderr; do
+                if [ -f "$OUT/$STREAM.txt" ]; then BYTES=$((BYTES+$(wc -c < "$OUT/$STREAM.txt"))); fi
+              done
+              if [ ! -s "$OUT/current-target-pids.txt" ] && [ "$BYTES" -eq "$LAST_BYTES" ]; then QUIET=$((QUIET+1)); else QUIET=0; fi
+              LAST_BYTES=$BYTES
+              if [ "$QUIET" -ge 4 ]; then QUIESCENT=true; break; fi
+              if [ "$SECONDS" -lt "$COLLECT_DEADLINE" ]; then sleep 1; fi
+            done
+          fi
+          printf 'target_processes_quiescent=%s\nquiet_observations=%s\ncollection_attempts=%s\ncollection_elapsed_seconds=%s\n' "$QUIESCENT" "$QUIET" "$ATTEMPT" "$((SECONDS-COLLECT_STARTED))" > "$OUT/collection-status.txt"
+          rm -f "$PS_SNAPSHOT"
+          : > "$OUT/test-result.txt"
+          for STREAM in test-stdout test-stderr; do
+            if [ -f "$OUT/$STREAM.txt" ]; then cat "$OUT/$STREAM.txt" >> "$OUT/test-result.txt"; fi
+          done
+          DIAGNOSTIC_STATUS=0
+          perl -e 'alarm 20; exec @ARGV; die "exec failed\n"' xcrun simctl spawn "$SIM_ID" log show --last 3m --style compact --info --debug --predicate 'process == "native-storage-tests" OR eventMessage CONTAINS "com.autodevjapan.phonefrictioncontrol.native-storage-tests"' > "$OUT/launch-system-log.txt" 2>&1 || DIAGNOSTIC_STATUS=$?
+          printf 'diagnostic_status=%s\n' "$DIAGNOSTIC_STATUS" >> "$OUT/test-status.txt"
+          if [[ "$PID" =~ ^[0-9]+$ ]]; then ps -p "$PID" -o pid=,comm= > "$OUT/target-process.txt" || true; fi
+          test "$STATUS" = 0
+          [[ "$PID" =~ ^[0-9]+$ ]]
+          "$OUT/native-output-gate" check "$OUT/test-stdout.txt" "$OUT/test-stderr.txt" "$OUT/collection-status.txt" > "$OUT/output-gate-result.txt"
+          test ! -e "$DATA/Documents/usage-state.ron"
+          test ! -e "$DATA/Documents/usage-state.pending"
+          printf 'native_model_store_roundtrip_verified=true\nfailed_load_overwrite_rejected=true\nowned_fixture_files_absent=true\nproduct_ui_verified=false\nprocess_restart_verified=false\nscreen_time_control_verified=false\n' > "$OUT/result.txt"
+          cat "$OUT/output-gate-result.txt" >> "$OUT/result.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: product-native-storage-acceptance
+          path: |
+            ${{ runner.temp }}/native-storage/*.txt
+            ${{ runner.temp }}/native-storage/*.json
+            ${{ runner.temp }}/native-storage/*.lock
+            ${{ runner.temp }}/native-storage/*.tar.gz
+          retention-days: 3
+          if-no-files-found: error
   sdk-audit:
+    if: ${{ !inputs.product_native_storage_acceptance }}
     runs-on: macos-14
     timeout-minutes: 10
     steps:

@@ -1711,6 +1711,9 @@ impl eframe::App for ControlApp {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "ios")]
+    static IOS_DOCUMENTS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     struct LegacyStorage(String);
     impl eframe::Storage for LegacyStorage {
         fn get_string(&self, key: &str) -> Option<String> {
@@ -1722,10 +1725,176 @@ mod tests {
     }
 
     fn construct_from_legacy(state: &SavedState) -> ControlApp {
+        #[cfg(target_os = "ios")]
+        let _documents_guard = IOS_DOCUMENTS_TEST_LOCK.lock().unwrap();
         let storage = LegacyStorage(ron::to_string(state).unwrap());
         let mut context = eframe::CreationContext::_new_kittest(egui::Context::default());
         context.storage = Some(&storage);
         ControlApp::new(&context, None)
+    }
+
+    #[cfg(target_os = "ios")]
+    struct NativeDocumentsFixture {
+        path: std::path::PathBuf,
+        cleaned: bool,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(target_os = "ios")]
+    impl NativeDocumentsFixture {
+        fn new(contents: &[u8]) -> Self {
+            use std::io::Write as _;
+            let guard = IOS_DOCUMENTS_TEST_LOCK.lock().unwrap();
+            let home = std::env::var_os("HOME").expect("native test container HOME missing");
+            let home = std::path::PathBuf::from(home);
+            assert!(home.is_absolute());
+            let expected_home = std::env::var_os("PHONE_CONTROL_NATIVE_TEST_HOME")
+                .map(std::path::PathBuf::from)
+                .expect("native acceptance driver must identify its own app container");
+            assert!(expected_home.is_absolute());
+            assert!(
+                home.canonicalize().unwrap() == expected_home.canonicalize().unwrap(),
+                "native fixture HOME differs from the driver's own app container"
+            );
+            let path = home.join("Documents/usage-state.ron");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            assert!(
+                !path.with_extension("pending").exists(),
+                "native fixture refuses an existing staging file"
+            );
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .expect("native fixture requires a fresh owned test container");
+            let fixture = Self {
+                path,
+                cleaned: false,
+                _guard: guard,
+            };
+            file.write_all(contents).unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+            fixture
+        }
+
+        fn remove_owned_files(&self) -> std::io::Result<()> {
+            // Both names were absent before this fixture's create_new. Its
+            // single guarded writer is the production StateStore being tested.
+            let pending = self.path.with_extension("pending");
+            for path in [&self.path, &pending] {
+                match std::fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        }
+
+        fn finish(mut self) {
+            self.remove_owned_files().unwrap();
+            assert!(!self.path.exists());
+            assert!(!self.path.with_extension("pending").exists());
+            self.cleaned = true;
+        }
+    }
+
+    #[cfg(target_os = "ios")]
+    impl Drop for NativeDocumentsFixture {
+        fn drop(&mut self) {
+            if !self.cleaned && self.remove_owned_files().is_err() {
+                eprintln!("native Documents test cleanup incomplete");
+            }
+        }
+    }
+
+    #[cfg(target_os = "ios")]
+    #[test]
+    fn runtime_native_documents_roundtrip_preserves_nondefault_state() {
+        let expected = SavedState {
+            daily_limit_minutes: 300,
+            break_minutes: 45,
+            playback_only: true,
+            current_day_key: "2026-11-09".into(),
+            daily_records: vec![DailyRecord {
+                day_key: "2026-11-09".into(),
+                label: "11月9日".into(),
+                used_ms: 1234,
+                playback_only: false,
+            }],
+            ..SavedState::default()
+        };
+        let fixture = NativeDocumentsFixture::new(ron::to_string(&expected).unwrap().as_bytes());
+        let legacy = LegacyStorage(ron::to_string(&SavedState::default()).unwrap());
+        let mut context = eframe::CreationContext::_new_kittest(egui::Context::default());
+        context.storage = Some(&legacy);
+        let mut model = ControlApp::new(&context, None);
+        assert_eq!(model.saved, expected);
+        assert!(model.state_store.as_ref().unwrap().is_ready());
+        assert!(!model.permission_granted && !model.measurement_available);
+
+        model.saved.daily_limit_minutes = 360;
+        let mut frame = eframe::Frame::_new_kittest();
+        model.persist_changed_state(&mut frame);
+        assert!(model.storage_error.is_none());
+        assert_eq!(model.last_persisted.as_ref(), Some(&model.saved));
+        let from_disk: SavedState =
+            ron::from_str(&std::fs::read_to_string(&fixture.path).unwrap()).unwrap();
+        assert_eq!(from_disk, model.saved);
+        drop(model);
+
+        let restored = ControlApp::new(&context, None);
+        assert_eq!(restored.saved, from_disk);
+        assert_eq!(restored.saved.daily_limit_minutes, 360);
+        assert!(!restored.permission_granted && !restored.measurement_available);
+        let reconstructed_limit = restored.saved.daily_limit_minutes;
+        drop(restored);
+        fixture.finish();
+        println!(
+            "runtime_native_documents_roundtrip_verified=true; initial_fixture_limit={}; file_readback_limit={}; reconstructed_limit={reconstructed_limit}; os_permission_verified=false; process_restart_verified=false; owned_fixture_cleanup=true",
+            expected.daily_limit_minutes, from_disk.daily_limit_minutes
+        );
+    }
+
+    #[cfg(target_os = "ios")]
+    #[test]
+    fn runtime_native_documents_failed_load_blocks_overwrite() {
+        let original = b"invalid native Documents fixture";
+        let fixture = NativeDocumentsFixture::new(original);
+        let context = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let mut model = ControlApp::new(&context, None);
+        assert!(!model.state_store.as_ref().unwrap().is_ready());
+        assert!(model.storage_error.is_some());
+        model.saved.daily_limit_minutes = 360;
+        let mut frame = eframe::Frame::_new_kittest();
+        model.persist_changed_state(&mut frame);
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), original);
+        assert!(model.last_persisted.is_none());
+        struct RecordingStorage(usize);
+        impl eframe::Storage for RecordingStorage {
+            fn get_string(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn set_string(&mut self, _: &str, _: String) {
+                self.0 += 1;
+            }
+            fn remove_string(&mut self, _: &str) {
+                self.0 += 1;
+            }
+            fn flush(&mut self) {
+                self.0 += 1;
+            }
+        }
+        let mut fallback = RecordingStorage(0);
+        eframe::App::save(&mut model, &mut fallback);
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), original);
+        assert_eq!(fallback.0, 0);
+        drop(model);
+        fixture.finish();
+        println!(
+            "runtime_native_documents_failed_load_preserved=true; overwrite_blocked=true; owned_fixture_cleanup=true"
+        );
     }
 
     fn legacy_preview_state() -> SavedState {

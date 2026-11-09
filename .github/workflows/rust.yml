@@ -28,6 +28,16 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev
       - run: cargo fmt --all -- --check
+      - name: Check native storage capture protocol
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/standalone-checks
+          EXE=
+          if [ "$RUNNER_OS" = Windows ]; then EXE=.exe; fi
+          rustfmt --edition 2024 --check tools/ios-native-storage-output-gate.rs
+          rustc --edition 2024 --test tools/ios-native-storage-output-gate.rs -o "target/standalone-checks/native-storage-output-tests$EXE"
+          "target/standalone-checks/native-storage-output-tests$EXE"
       - run: cargo nextest run --locked --workspace --features desktop-preview --test-threads 10
       - run: cargo test --locked --workspace --features desktop-preview --doc
       - run: cargo clippy --locked --workspace --all-targets --features desktop-preview -- -D warnings
