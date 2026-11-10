@@ -400,6 +400,7 @@ mod tests {
             assert!(m.contains(want), "{want}");
         }
         assert!(!m.contains("package=") && !m.contains("<uses-sdk"));
+        assert!(m.contains("android:launchMode=\"singleInstance\""));
         // 権限は application の前、アプリ ID は application の中に置く。
         let app = m.find("<application").unwrap();
         assert!(m.find("permission.INTERNET").unwrap() < app);

@@ -489,6 +489,7 @@ mod tests {
         assert!(manifest
             .contains("android:name=\"com.autodevjapan.phonefrictioncontrol.ControlActivity\""));
         assert!(manifest.contains("android:enableOnBackInvokedCallback=\"false\""));
+        assert!(manifest.contains("android:launchMode=\"singleInstance\""));
         assert!(manifest.contains("keyboardHidden|uiMode"));
         assert!(include_str!("package.rs").contains("activity.as_os_str()"));
         assert!(include_str!("../../../src/service.rs").contains(
