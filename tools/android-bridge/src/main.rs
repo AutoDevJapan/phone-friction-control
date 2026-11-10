@@ -1,9 +1,9 @@
 //! Android のサービス入口となる JVM クラスを、Java/Kotlin のソースなしで生成する。
 //!
 //! 使い方: `android-bridge <出力ディレクトリ>`
-//! 出力: `<出力ディレクトリ>/com/autodevjapan/phonefrictioncontrol/{ControlService,MediaListener}.class`
+//! 出力: `<出力ディレクトリ>/com/autodevjapan/phonefrictioncontrol/*.class`
 //!
-//! クラスファイルは版 49 (Java 5) で書くため StackMapTable は不要。処理の中身は持たず、
+//! クラスファイルは版 49 (Java 5) で書くため StackMapTable は不要。
 //! ControlService のコールバックは親の Rust ライブラリが JNI で公開する native 関数へ渡す。
 
 use std::{env, fs, path::Path, process::ExitCode};
@@ -238,10 +238,81 @@ fn control_activity() -> Vec<u8> {
         },
     )
 }
+
+/// HOME task lookup differs across Android versions and aliases. Keep HOME's
+/// Activity non-native and always start the UI using its canonical component.
+fn home_activity(native_target: &str) -> Vec<u8> {
+    class_file(
+        &format!("{PACKAGE}/ControlHomeActivity"),
+        "android/app/Activity",
+        |pool| {
+            let resume = pool.method_ref("android/app/Activity", "onResume", "()V");
+            let intent = pool.class("android/content/Intent");
+            let target = pool.class(native_target);
+            let init = pool.method_ref(
+                "android/content/Intent",
+                "<init>",
+                "(Landroid/content/Context;Ljava/lang/Class;)V",
+            );
+            let flags = pool.method_ref(
+                "android/content/Intent",
+                "addFlags",
+                "(I)Landroid/content/Intent;",
+            );
+            let start = pool.method_ref(
+                "android/app/Activity",
+                "startActivity",
+                "(Landroid/content/Intent;)V",
+            );
+            let get_intent = pool.method_ref(
+                "android/app/Activity",
+                "getIntent",
+                "()Landroid/content/Intent;",
+            );
+            let home = pool.string("android.intent.category.HOME");
+            let is_home = pool.method_ref(
+                "android/content/Intent",
+                "hasCategory",
+                "(Ljava/lang/String;)Z",
+            );
+            let finish = pool.method_ref("android/app/Activity", "finish", "()V");
+            let mut code = vec![ALOAD_0];
+            code.extend(op(INVOKESPECIAL, resume));
+            code.push(ALOAD_0); // startActivity receiver
+            code.extend(op(0xbb, intent)); // new Intent
+            code.extend([0x59, ALOAD_0]); // dup, context
+            code.extend(op(LDC_W, target));
+            code.extend(op(INVOKESPECIAL, init));
+            code.extend([0x10, 0x14, 0x10, 0x18, 0x78]); // 0x14 << 24: NEW_TASK | CLEAR_TOP
+            code.extend(op(INVOKEVIRTUAL, flags));
+            code.extend(op(INVOKEVIRTUAL, start));
+            code.push(ALOAD_0);
+            code.extend(op(INVOKEVIRTUAL, get_intent));
+            code.extend(op(LDC_W, home));
+            code.extend(op(INVOKEVIRTUAL, is_home));
+            // Keep HOME underneath the UI so Home/Back can resume it. A legacy
+            // explicit intent without HOME is a trampoline and must finish.
+            code.extend([0x9a, 0x00, 0x07, ALOAD_0]); // ifne return
+            code.extend(op(INVOKEVIRTUAL, finish));
+            code.push(RETURN);
+            vec![Method {
+                access: ACC_PROTECTED,
+                name: pool.utf8("onResume"),
+                desc: pool.utf8("()V"),
+                code: Some((5, 1, code)),
+            }]
+        },
+    )
+}
+
 fn write_classes(out_dir: &Path) -> std::io::Result<()> {
     let dir = out_dir.join(PACKAGE);
     fs::create_dir_all(&dir)?;
     fs::write(dir.join("ControlActivity.class"), control_activity())?;
+    fs::write(
+        dir.join("ControlHomeActivity.class"),
+        home_activity(&format!("{PACKAGE}/ControlActivity")),
+    )?;
     fs::write(dir.join("ControlService.class"), control_service())?;
     fs::write(dir.join("MediaListener.class"), media_listener())
 }
@@ -394,8 +465,19 @@ mod tests {
                     0x2a => "aload_0".to_string(),
                     0x04 => "iconst_1".to_string(),
                     0x57 => "pop".to_string(),
+                    0x59 => "dup".to_string(),
+                    0x10 => format!("bipush {}", r.u1()),
+                    0x78 => "ishl".to_string(),
+                    0x9a => format!("ifne +{}", r.u2()),
+                    0xbb => format!("new {}", self.class_name(r.u2())),
                     0xb1 => "return".to_string(),
-                    0x13 => format!("ldc_w {:?}", self.string(r.u2())),
+                    0x13 => {
+                        let index = r.u2();
+                        match &self.cp[index as usize] {
+                            Some(Cp::Class(_)) => format!("ldc_class {}", self.class_name(index)),
+                            _ => format!("ldc_w {:?}", self.string(index)),
+                        }
+                    }
                     o @ 0xb6..=0xb8 => {
                         let name = match o {
                             0xb6 => "invokevirtual",
@@ -490,11 +572,81 @@ mod tests {
             .contains("android:name=\"com.autodevjapan.phonefrictioncontrol.ControlActivity\""));
         assert!(manifest.contains("android:enableOnBackInvokedCallback=\"false\""));
         assert!(manifest.contains("android:launchMode=\"singleInstance\""));
+        assert!(manifest.contains(
+            "android:targetActivity=\"com.autodevjapan.phonefrictioncontrol.ControlHomeActivity\""
+        ));
         assert!(manifest.contains("keyboardHidden|uiMode"));
         assert!(include_str!("package.rs").contains("activity.as_os_str()"));
+        assert!(include_str!("package.rs").contains("home_activity.as_os_str()"));
+        let native_entry = manifest
+            .split("android:name=\"com.autodevjapan.phonefrictioncontrol.ControlActivity\"")
+            .nth(1)
+            .unwrap()
+            .split("</activity>")
+            .next()
+            .unwrap();
+        assert!(!native_entry.contains("android.intent.category.HOME"));
         assert!(include_str!("../../../src/service.rs").contains(
             "let activity_class = \"com.autodevjapan.phonefrictioncontrol.ControlActivity\";"
         ));
+    }
+    #[test]
+    fn generated_home_entry_is_non_native_and_uses_the_variant_target() {
+        let dir = env::temp_dir().join(format!(
+            "home-entry-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&dir).unwrap();
+        write_classes(&dir).unwrap();
+        let path = dir.join(PACKAGE).join("ControlHomeActivity.class");
+        assert!(
+            path.is_file(),
+            "HOME must have a non-native entry in the DEX"
+        );
+        let plain = parse(&fs::read(&path).unwrap());
+        assert_eq!(plain.super_name, "android/app/Activity");
+        assert!(plain.methods.iter().all(|m| m.name != "<clinit>"));
+        assert!(plain.cp.iter().any(
+            |e| matches!(e, Some(Cp::Utf8(name)) if name == &format!("{PACKAGE}/ControlActivity"))
+        ));
+        assert_eq!(plain.method("onResume").desc, "()V");
+        let (_, _, code) = plain.method("onResume").code.as_ref().unwrap();
+        let instructions = plain.decode(code);
+        assert!(instructions.contains(&format!("ldc_class {PACKAGE}/ControlActivity")));
+        assert!(instructions.contains(&"bipush 20".into()));
+        assert!(instructions.contains(&"bipush 24".into()));
+        assert!(instructions.contains(&"ishl".into()));
+        assert!(instructions.contains(
+            &"invokevirtual android/app/Activity.startActivity(Landroid/content/Intent;)V".into()
+        ));
+        assert!(instructions.contains(
+            &"invokevirtual android/content/Intent.hasCategory(Ljava/lang/String;)Z".into()
+        ));
+        assert_eq!(
+            &instructions[instructions.len() - 4..],
+            [
+                "ifne +7",
+                "aload_0",
+                "invokevirtual android/app/Activity.finish()V",
+                "return"
+            ]
+        );
+        ads_callbacks::write_classes(&dir).unwrap();
+        let ads = parse(&fs::read(&path).unwrap());
+        assert_eq!(ads.super_name, "android/app/Activity");
+        assert!(ads.cp.iter().any(|e| matches!(e, Some(Cp::Utf8(name)) if name == &format!("{PACKAGE}/ControlAdsActivity"))));
+        assert!(!ads.cp.iter().any(
+            |e| matches!(e, Some(Cp::Utf8(name)) if name == &format!("{PACKAGE}/ControlActivity"))
+        ));
+        let (_, _, code) = ads.method("onResume").code.as_ref().unwrap();
+        assert!(ads
+            .decode(code)
+            .contains(&format!("ldc_class {PACKAGE}/ControlAdsActivity")));
+        fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn generated_plain_activity_handles_back() {
