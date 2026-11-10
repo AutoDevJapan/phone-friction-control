@@ -52,8 +52,13 @@
             </intent-filter>
 
         </activity>
+        <activity
+            android:name="com.autodevjapan.phonefrictioncontrol.ControlHomeActivity"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
         <activity-alias android:name="android.app.NativeActivity"
-            android:targetActivity="com.autodevjapan.phonefrictioncontrol.ControlActivity"
+            android:targetActivity="com.autodevjapan.phonefrictioncontrol.ControlHomeActivity"
             android:exported="true">
             <meta-data android:name="android.app.lib_name" android:value="phone_friction_control" />
 

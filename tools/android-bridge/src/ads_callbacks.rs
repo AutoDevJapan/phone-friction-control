@@ -166,6 +166,10 @@ pub(super) fn write_classes(out_dir: &Path) -> std::io::Result<()> {
         fs::write(dir.join(format!("{simple}.class")), bytes)?;
     }
     fs::write(
+        dir.join("ControlHomeActivity.class"),
+        super::home_activity(&format!("{PACKAGE}/ControlAdsActivity")),
+    )?;
+    fs::write(
         dir.join("ControlAdsActivity.class"),
         generate_class(
             "ControlAdsActivity",
