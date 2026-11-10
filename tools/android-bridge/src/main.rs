@@ -264,17 +264,6 @@ fn home_activity(native_target: &str) -> Vec<u8> {
                 "startActivity",
                 "(Landroid/content/Intent;)V",
             );
-            let get_intent = pool.method_ref(
-                "android/app/Activity",
-                "getIntent",
-                "()Landroid/content/Intent;",
-            );
-            let home = pool.string("android.intent.category.HOME");
-            let is_home = pool.method_ref(
-                "android/content/Intent",
-                "hasCategory",
-                "(Ljava/lang/String;)Z",
-            );
             let finish = pool.method_ref("android/app/Activity", "finish", "()V");
             let mut code = vec![ALOAD_0];
             code.extend(op(INVOKESPECIAL, resume));
@@ -286,13 +275,9 @@ fn home_activity(native_target: &str) -> Vec<u8> {
             code.extend([0x10, 0x14, 0x10, 0x18, 0x78]); // 0x14 << 24: NEW_TASK | CLEAR_TOP
             code.extend(op(INVOKEVIRTUAL, flags));
             code.extend(op(INVOKEVIRTUAL, start));
+            // Finish even for HOME: retaining the gateway could reopen the UI
+            // after the user changes their default launcher.
             code.push(ALOAD_0);
-            code.extend(op(INVOKEVIRTUAL, get_intent));
-            code.extend(op(LDC_W, home));
-            code.extend(op(INVOKEVIRTUAL, is_home));
-            // Keep HOME underneath the UI so Home/Back can resume it. A legacy
-            // explicit intent without HOME is a trampoline and must finish.
-            code.extend([0x9a, 0x00, 0x07, ALOAD_0]); // ifne return
             code.extend(op(INVOKEVIRTUAL, finish));
             code.push(RETURN);
             vec![Method {
@@ -468,7 +453,6 @@ mod tests {
                     0x59 => "dup".to_string(),
                     0x10 => format!("bipush {}", r.u1()),
                     0x78 => "ishl".to_string(),
-                    0x9a => format!("ifne +{}", r.u2()),
                     0xbb => format!("new {}", self.class_name(r.u2())),
                     0xb1 => "return".to_string(),
                     0x13 => {
@@ -623,13 +607,10 @@ mod tests {
         assert!(instructions.contains(
             &"invokevirtual android/app/Activity.startActivity(Landroid/content/Intent;)V".into()
         ));
-        assert!(instructions.contains(
-            &"invokevirtual android/content/Intent.hasCategory(Ljava/lang/String;)Z".into()
-        ));
         assert_eq!(
             &instructions[instructions.len() - 4..],
             [
-                "ifne +7",
+                "invokevirtual android/app/Activity.startActivity(Landroid/content/Intent;)V",
                 "aload_0",
                 "invokevirtual android/app/Activity.finish()V",
                 "return"
