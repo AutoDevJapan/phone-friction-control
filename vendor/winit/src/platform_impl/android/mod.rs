@@ -426,6 +426,11 @@ impl<T: 'static> EventLoop<T> {
             },
             InputEvent::KeyEvent(key) => {
                 match key.key_code() {
+                    // NativeActivity's Java Back handler backgrounds this app's task.
+                    // Mark both key actions unhandled so the framework can dispatch it.
+                    Keycode::Back if cfg!(feature = "android-native-activity") => {
+                        input_status = InputStatus::Unhandled
+                    },
                     // Flag keys related to volume as unhandled. While winit does not have a way for
                     // applications to configure what keys to flag as handled,
                     // this appears to be a good default until winit

@@ -4,6 +4,8 @@ Sources: crates.io winit 0.30.13 and eframe 0.36.2, copied without changing regi
 
 winit: Android Destroy exits the event loop. After run returns, drop the old loop before allowing another Android event loop. Other platforms retain their creation restrictions.
 
+winit's NativeActivity input path leaves the system Back key unhandled so Android can invoke the application's Java Back handler. That handler moves the task to the background. Other keys and GameActivity retain their existing routing.
+
 eframe: save_and_destroy accepts a missing root window, matching the existing save-on-suspend behavior. This avoids a panic after Android has removed its surface.
 
 The application's Android entry uses run_and_return=false so the old loop is not retained in eframe's thread-local cache. Destroy causes LoopExiting to save and destroy the UI, then returns from android_main; it does not explicitly kill the process.
