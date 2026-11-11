@@ -45,7 +45,7 @@ Apple SDKとRustの `aarch64-apple-ios-sim` ターゲットがある環境での
 cargo build --locked --release --target aarch64-apple-ios-sim --features ios-runtime --bin phone-friction-control-ios-runtime
 ```
 
-これはSimulator用の実行ファイルを作る指定です。起動には別途Simulator用 `.app` の構成・署名・インストールが必要です。今回確認したのは入口の型検査とホスト上の構築試験までで、このRuntime入口のAppleリンク・実起動・実containerからの再起動復元は未確認です。
+これはSimulator用の実行ファイルを作る指定です。起動には別途Simulator用 `.app` の構成・署名・インストールが必要です。製品ソース `e594c97` の[実行42964706681](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/42964706681)では、iOS18.5 Simulatorでリンク・起動し、画面で上限を120分から300分へ変更して、実containerの保存値と新しいプロセスでの300分復元を確認しました。物理iOS端末と正式配布は未検証です。
 
 RuntimeもScreen Timeの許可・アプリ選択・計測・監視・遮蔽にはまだ接続していません。Android専用の説明や操作が残るため、iOSの利用手順としては使えません。Previewの架空利用時間を実計測と扱いません。[iOSの検証状況と残作業](docs/ios-status.md)を参照してください。
 
