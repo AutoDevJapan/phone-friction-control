@@ -106,7 +106,9 @@ Gradleが未署名release APKを作り、通常版と共有する署名処理が
 
 CIの非sample IDは構文検査・APK作成専用のfixtureです。AdMobに登録された実物IDではなく、そのAPKを起動・インストール・実配信に使用しません。2026年11月10日には、登録済みAppIDとホーム用バナーIDを組み込んだ両ABIの `0.4.3-ads-candidate`（versionCode 14）を既存製品鍵で署名し、ID・証明書・デバッグ不可・16KB配置を確認しました。広告なし0.4.2/code13とは別の未公開候補です。
 
-実ID候補は、Googleが[自動的にtest deviceへ設定する](https://developers.google.com/admob/android/next-gen/test-ads)と説明するAPI37 Android emulatorで起動・保存設定・Back復帰・サービス接続まで確認しました。広告表示を選ぶとUMPが対象AppIDの同意フォーム未設定を返したため、広告を表示せずアプリの利用を継続しました。実ID経路のTest Ad表示、物理端末、対応ストアとの紐付け、アプリ審査・実配信・一般配布は未完了です。GoogleのサンプルIDで確認済みのTest Adを、実IDの成功へ置き換えません。広告は製品版でも任意で、休憩解除の条件にはしません。
+旧code14の実ID候補は、Googleが[自動的にtest deviceへ設定する](https://developers.google.com/admob/android/next-gen/test-ads)と説明するAPI37 Android emulatorで起動・保存設定・Back復帰・サービス接続まで確認しました。広告表示を選ぶとUMPが対象AppIDの同意フォーム未設定を返したため、広告を表示せずアプリの利用を継続しました。実ID経路のTest Ad表示、物理端末、対応ストアとの紐付け、アプリ審査・実配信・一般配布は未完了です。GoogleのサンプルIDで確認済みのTest Adを、実IDの成功へ置き換えません。広告は製品版でも任意で、休憩解除の条件にはしません。
+
+2026年11月12日には、保存・更新修復を含む固定ソース `b1b3911` から、登録済み製品IDを使う未公開の `0.4.3-ads-recovery-candidate` / code21を両ABIで作成しました。[code21の静的確認](docs/android-verification.md#広告候補code21の静的確認2026-11-12)で署名・manifest・期待ABIと実APK内のSDK呼出しシグネチャを照合しています。この候補の起動やTest Ad表示は未実施であり、上記の旧code14や広告なしcode20の実行結果とは区別します。同意メッセージの公開・審査・実配信・配布も未完了です。
 
 端末内の記録、権限、広告SDKの取扱いは[Android版のプライバシーについて](docs/privacy-policy-ja.md)を参照してください。
 

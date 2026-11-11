@@ -2,6 +2,19 @@
 
 PR1のAndroid実装を確認した記録です。製品全体の完成を示すものではありません。
 
+## 広告候補code21の静的確認（2026-11-12）
+
+生成元は固定コミット [`b1b3911403e61bd5dee2b45562b8cdc773dab0a0`](https://github.com/AutoDevJapan/phone-friction-control/commit/b1b3911403e61bd5dee2b45562b8cdc773dab0a0)です。`ads-production` の未公開候補 `0.4.3-ads-recovery-candidate` / code21を、登録済みの製品AppIDとホーム用バナーID、既存の製品鍵で作成しました。広告なしcode20や旧広告候補code14とは別の成果物です。
+
+| ABI | APK全体のSHA-256 |
+| --- | --- |
+| x86_64 | `E5DB3AC13838653EF0F338E94B657177E7E08719C551AA7A381BA1B63E26E774` |
+| arm64-v8a | `0EFA4878F5D9C68F7426844F2D96DE99B0F61A683433D38539E570738CBAF9BB` |
+
+両APKの全体ハッシュ・サイズを作成時の記録と照合し、manifestのcode21・登録ID・min26/target36・非debug・期待ABI、v2/v3署名と固定証明書、16KiB ZIP整列を確認しました。GMA Next-Gen 1.5.0とUMP 4.0.0の依存記録、実APK内19クラスの必要な照合項目53件、生成元SOの広告・サービスJNI export10件とAndroid起動export2件を、ABIごとに確認しました。HOME入口からControlAdsActivityへの参照、BackとpauseのJava処理、SDK・コールバックの呼出しシグネチャを含みます。APK内部のSO内容を抽出して比較した結果ではありません。
+
+この候補のインストール・起動・Test Ad表示・同意フォーム・保存復元・サービス制御は未実施です。クラスやシグネチャの包含は実行成功を証明せず、code20の通常30分/5分や旧code14のUMPエラー時の動作をcode21の受入へ置き換えません。同意メッセージは未公開のままで、候補画像の確認、実ID経路のTest Ad、ストア紐付け・審査・実配信・配布は別の残条件です。
+
 ## code20の通常再生・休憩の追加受入（2026-11-12）
 
 下記の広告なし `0.4.3-recovery-candidate` / code20のx86_64署名APKを変更せず、API37の専用仮想端末で確認しました。端末に導入したAPK全体のSHA-256は `C57A71745B74B82C231B925771506E60D0EDE5BDD001A2D66A15F7D895A7703C` と一致しています。生成元は固定コミット `c966e4b` です。後続mainのiOS入口とCI専用変更を、このAPKの再生成や全ソースtree一致の証拠にはしません。
