@@ -112,7 +112,7 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
     let mut config_store = crate::persistence::StateStore::new(dir.join("guard-config.ron"));
     let mut last_config: Option<SavedState> = None;
     RUNNING.store(true, Ordering::SeqCst);
-    let mut guard_store = crate::persistence::StateStore::new(dir.join("guard-state.ron"));
+    let mut guard_store = crate::guard_storage::GuardStore::new(dir.clone());
     let mut state: Option<GuardState> = None;
     let mut last_saved: Option<GuardState> = None;
     let mut selection_save_pending = false;
@@ -124,14 +124,24 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
     let mut last_interruption = Instant::now() - Duration::from_secs(10);
     let mut last_pause = Instant::now() - Duration::from_secs(10);
     while GENERATION.load(Ordering::SeqCst) == generation {
+        let calendar = crate::guard_storage::sync_calendar_transaction(&dir, || {
+            crate::platform::storage_calendar_env(&mut env)
+        });
+        let current_day = calendar.as_ref().ok().map(|(day, _)| day.clone());
+        let calendar_storage_error = calendar.is_err();
         if !guard_store.is_ready() && last_load.elapsed() >= Duration::from_secs(5) {
             last_load = Instant::now();
-            match guard_store.load_and_migrate::<GuardState>() {
+            let mut loaded_now = 0;
+            match guard_store.load_transaction(|| {
+                let calendar = crate::platform::storage_calendar_env(&mut env)?;
+                loaded_now = calendar.1;
+                Ok(calendar)
+            }) {
                 Ok(restored) => {
                     let mut restored = restored.unwrap_or_default();
                     last_saved = Some(restored.clone());
                     if let Some(memory) = state.take() {
-                        restored.merge_unpersisted(memory);
+                        restored.merge_unpersisted(memory, loaded_now);
                     }
                     state = Some(restored);
                 }
@@ -148,12 +158,18 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
             && let Some(config) = &last_config
         {
             let policy = config.policy();
+            if current_day.as_deref().is_some_and(|day| state.day != day) {
+                last_playing = None;
+                last_sample = Instant::now();
+            }
+            selection_save_pending |= state.prepare_persistence(&policy, current_day.as_deref());
             // Explicit selection changes apply even while measurement permission is absent.
             if crate::enforcement::persist_selection_prune(
                 state,
                 &policy,
                 &mut selection_save_pending,
                 &guard_store,
+                || crate::platform::storage_calendar_env(&mut env),
             ) {
                 last_saved = Some(state.clone());
             }
@@ -173,6 +189,7 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                         state.import_break(
                             config.cooldown_until_ms,
                             &config.limit_triggered_day,
+                            &config.last_limit_triggered_day,
                             now,
                         );
                         // A break also stops selected background/PiP sessions. This runs before
@@ -201,6 +218,18 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                             true,
                             Some(&mut tracker),
                         )?;
+                        let snapshot_storage_error =
+                            crate::guard_storage::sync_calendar_transaction(&dir, || {
+                                crate::platform::storage_calendar_env(env)
+                            })
+                            .is_err();
+                        // The query owns a fresh calendar observation; it may cross midnight
+                        // or a manual clock change after the loop's earlier read.
+                        let changed_day = state.day != snapshot.day_key;
+                        if changed_day {
+                            last_playing = None;
+                        }
+                        state.prepare_persistence(&policy, Some(&snapshot.day_key));
                         let elapsed = last_sample.elapsed().as_millis() as u64;
                         last_sample = Instant::now();
                         if state
@@ -212,7 +241,6 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                         let mut media_available = false;
                         let mut should_interrupt = false;
                         if snapshot.permission_granted {
-                            let changed_day = state.day != snapshot.day_key;
                             state.sample_usage(
                                 &snapshot.day_key,
                                 snapshot.boot_count,
@@ -240,6 +268,7 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                             state.import_break(
                                 config.cooldown_until_ms,
                                 &config.limit_triggered_day,
+                                &config.last_limit_triggered_day,
                                 snapshot.now_ms,
                             );
                             state.enforce(&policy, snapshot.now_ms);
@@ -261,18 +290,22 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                                 || old.triggered_day != state.triggered_day
                                 || old.day != state.day
                         });
-                        let mut storage_error = !guard_store.is_ready() || !config_store.is_ready();
-                        let mut wrote = false;
+                        let mut storage_error = calendar_storage_error
+                            || snapshot_storage_error
+                            || !guard_store.is_ready()
+                            || !config_store.is_ready();
                         if crate::enforcement::guard_save_due(
                             last_saved.as_ref() != Some(state),
                             critical,
                             last_save.elapsed(),
                         ) {
-                            match guard_store.save(state) {
-                                Ok(()) => {
+                            match guard_store.save_transaction(state, || {
+                                crate::platform::storage_calendar_env(env)
+                            }) {
+                                Ok(saved) => {
+                                    *state = saved;
                                     last_saved = Some(state.clone());
                                     last_save = Instant::now();
-                                    wrote = true;
                                 }
                                 Err(_) => {
                                     storage_error = true;
@@ -311,13 +344,6 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                         if GENERATION.load(Ordering::SeqCst) == generation {
                             *LIVE_STATUS.lock().unwrap_or_else(|p| p.into_inner()) =
                                 Some(status.clone());
-                            // This is a diagnostic/recovery snapshot, not the per-second UI transport.
-                            if wrote {
-                                let _ = crate::persistence::write_atomic(
-                                    &dir.join("guard-status.ron"),
-                                    &status,
-                                );
-                            }
                         }
                         Ok(Some(status))
                     });

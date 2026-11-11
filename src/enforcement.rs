@@ -91,10 +91,15 @@ pub(crate) fn persist_selection_prune(
     state: &mut GuardState,
     policy: &Policy,
     pending: &mut bool,
-    store: &crate::persistence::StateStore,
+    store: &crate::guard_storage::GuardStore,
+    calendar: impl FnOnce() -> std::io::Result<crate::guard_storage::Calendar>,
 ) -> bool {
     *pending |= state.retain_selected(policy);
-    if *pending && store.is_ready() && store.save(state).is_ok() {
+    if *pending
+        && store.is_ready()
+        && let Ok(saved) = store.save_transaction(state, calendar)
+    {
+        *state = saved;
         *pending = false;
         true
     } else {
@@ -106,11 +111,136 @@ pub(crate) fn guard_save_due(changed: bool, critical: bool, elapsed: std::time::
     changed && (critical || elapsed >= std::time::Duration::from_secs(10))
 }
 
+/// A triggered day with no deadline records completion, not a missing measurement.
+/// Keep that evidence when merging stale copies, including after a clock rollback.
+pub(crate) struct BreakState {
+    pub deadline: Option<i64>,
+    pub triggered_day: Option<String>,
+    pub last_triggered_day: Option<String>,
+}
+
+impl BreakState {
+    pub fn merge(&mut self, mut other: Self, now: i64) {
+        self.deadline = self.deadline.filter(|until| *until > now);
+        other.deadline = other.deadline.filter(|until| *until > now);
+        let marker = |value: &Self| {
+            value
+                .last_triggered_day
+                .clone()
+                .max(value.triggered_day.clone())
+        };
+        let completed = [self as &Self, &other]
+            .into_iter()
+            .filter(|value| value.deadline.is_none())
+            .filter_map(marker)
+            .max();
+        let latest = marker(self).max(marker(&other));
+        let active = |value: &Self| {
+            let day = marker(value);
+            value.deadline.filter(|_| {
+                (day.is_none() || day == latest)
+                    && day
+                        .as_ref()
+                        .zip(completed.as_ref())
+                        .is_none_or(|(day, done)| day > done)
+            })
+        };
+        let deadline = active(self).max(active(&other));
+        self.last_triggered_day = marker(self).max(marker(&other));
+        self.triggered_day = self.triggered_day.clone().max(other.triggered_day);
+        self.deadline = deadline;
+    }
+}
+
 impl GuardState {
+    pub(crate) fn stored_matches(&self, current: &Self) -> bool {
+        if !self.history.is_empty() {
+            return false;
+        }
+        let mut projection = current.clone();
+        projection.history.clear();
+        *self == projection
+    }
+
+    pub(crate) fn merge_checkpoint(&mut self, other: &Self, now: i64) {
+        if self.day == other.day {
+            for (to, from) in [
+                (&mut self.usage_ms, &other.usage_ms),
+                (&mut self.playback_ms, &other.playback_ms),
+            ] {
+                for (package, value) in from {
+                    let total = to.entry(package.clone()).or_default();
+                    *total = (*total).max(*value);
+                }
+            }
+            if self.boot == other.boot {
+                for (package, value) in &other.raw_ms {
+                    let total = self.raw_ms.entry(package.clone()).or_default();
+                    *total = (*total).max(*value);
+                }
+            } else if self.boot.is_none() {
+                self.boot = other.boot;
+                self.raw_ms = other.raw_ms.clone();
+            }
+        }
+        self.merge_break(
+            other.cooldown_until_ms,
+            other.triggered_day.clone(),
+            other.last_triggered_day.clone(),
+            now,
+        );
+    }
+
+    fn merge_break(
+        &mut self,
+        deadline: Option<i64>,
+        triggered_day: Option<String>,
+        last_triggered_day: Option<String>,
+        now: i64,
+    ) {
+        let mut current = BreakState {
+            deadline: self.cooldown_until_ms,
+            triggered_day: self.triggered_day.clone(),
+            last_triggered_day: self.last_triggered_day.clone(),
+        };
+        current.merge(
+            BreakState {
+                deadline,
+                triggered_day,
+                last_triggered_day,
+            },
+            now,
+        );
+        self.cooldown_until_ms = current.deadline;
+        self.triggered_day = current.triggered_day;
+        self.last_triggered_day = current.last_triggered_day;
+    }
+
+    pub fn prepare_persistence(&mut self, policy: &Policy, current_day: Option<&str>) -> bool {
+        let before = self.clone();
+        if let Some(day) = current_day.filter(|day| !day.is_empty())
+            && self.day != day
+        {
+            self.sample_usage(day, self.boot.unwrap_or(-1), &HashMap::new());
+        }
+        self.retain_selected(policy);
+        *self != before
+    }
+
     /// This worker has not saved while reads failed. Its playback observations
     /// are newer than the recovered file; cumulative OS usage still overlaps.
-    pub fn merge_unpersisted(&mut self, mut memory: Self) {
-        let until = self.cooldown_until_ms.max(memory.cooldown_until_ms);
+    pub fn merge_unpersisted(&mut self, mut memory: Self, now: i64) {
+        self.merge_break(
+            memory.cooldown_until_ms,
+            memory.triggered_day.clone(),
+            memory.last_triggered_day.clone(),
+            now,
+        );
+        let merged_break = BreakState {
+            deadline: self.cooldown_until_ms,
+            triggered_day: self.triggered_day.clone(),
+            last_triggered_day: self.last_triggered_day.clone(),
+        };
         memory.history.push(DayLedger {
             day: memory.day,
             usage_ms: memory.usage_ms,
@@ -136,17 +266,28 @@ impl GuardState {
                 self.triggered_day = record.triggered_day;
             }
         }
-        self.cooldown_until_ms = until;
+        self.cooldown_until_ms = merged_break.deadline;
+        self.triggered_day = merged_break.triggered_day;
+        self.last_triggered_day = merged_break.last_triggered_day;
     }
 
-    pub fn import_break(&mut self, until: Option<i64>, day: &Option<String>, now: i64) {
-        if self.triggered_day.is_none() && day.as_deref() == Some(self.day.as_str()) {
-            self.triggered_day = day.clone();
-        }
-        if self.cooldown_until_ms.is_none() && until.is_some_and(|until| until > now) {
-            self.cooldown_until_ms = until;
-            self.triggered_day = day.clone();
-        }
+    pub fn import_break(
+        &mut self,
+        until: Option<i64>,
+        day: &Option<String>,
+        last_day: &Option<String>,
+        now: i64,
+    ) {
+        // An imported duplicate of the current live break must not extend its deadline.
+        let until = if self.triggered_day == *day
+            && self.cooldown_until_ms.is_some_and(|until| until > now)
+            && until.is_some_and(|until| until > now)
+        {
+            self.cooldown_until_ms
+        } else {
+            until
+        };
+        self.merge_break(until, day.clone(), last_day.clone(), now);
     }
 
     pub fn observe_playback(
@@ -293,10 +434,49 @@ mod tests {
     fn a_completed_break_in_config_survives_missing_service_history() {
         let mut memory = GuardState::default();
         sample(&mut memory, "day1", 1, 65_000);
-        memory.import_break(None, &Some("day1".into()), 100);
+        memory.import_break(None, &Some("day1".into()), &None, 100);
         memory.enforce(&policy(), 100);
         assert_eq!(memory.cooldown_until_ms, None);
         assert_eq!(memory.triggered_day.as_deref(), Some("day1"));
+    }
+
+    #[test]
+    fn completed_break_dominates_stale_deadlines_but_not_a_later_days_active_break() {
+        let record = |deadline, day: &str| BreakState {
+            deadline,
+            triggered_day: Some(day.into()),
+            last_triggered_day: Some(day.into()),
+        };
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let mut result = record(Some(5000), "day1");
+            for index in order {
+                let next = match index {
+                    0 => record(Some(5000), "day1"),
+                    1 => record(None, "day1"),
+                    _ => record(Some(3000), "day2"),
+                };
+                result.merge(next, 1000);
+            }
+            assert_eq!(result.deadline, Some(3000));
+            assert_eq!(result.last_triggered_day.as_deref(), Some("day2"));
+        }
+        let mut live = record(Some(5000), "day1");
+        live.merge(record(None, "day0"), 1000);
+        assert_eq!(
+            live.deadline,
+            Some(5000),
+            "midnight must not shorten an active break"
+        );
+        live.merge(record(None, "day1"), 1000);
+        live.merge(record(Some(5000), "day1"), 500);
+        assert_eq!(live.deadline, None);
     }
 
     #[test]
@@ -310,7 +490,7 @@ mod tests {
         memory.playback_ms.insert("video".into(), 3_000);
         memory.cooldown_until_ms = Some(100_000);
         memory.triggered_day = Some("day1".into());
-        recovered.merge_unpersisted(memory);
+        recovered.merge_unpersisted(memory, 1000);
         assert_eq!(recovered.usage_ms["video"], 5_000);
         assert_eq!(recovered.playback_ms["video"], 5_000);
         assert_eq!(recovered.cooldown_until_ms, Some(200_000));
@@ -365,11 +545,11 @@ mod tests {
     #[test]
     fn importing_launcher_break_never_replaces_an_existing_deadline() {
         let mut state = GuardState::default();
-        state.import_break(Some(1000), &Some("day1".into()), 100);
-        state.import_break(Some(5000), &Some("day1".into()), 100);
+        state.import_break(Some(1000), &Some("day1".into()), &None, 100);
+        state.import_break(Some(5000), &Some("day1".into()), &None, 100);
         assert_eq!(state.cooldown_until_ms, Some(1000));
         let mut empty = GuardState::default();
-        empty.import_break(Some(1000), &None, 1000);
+        empty.import_break(Some(1000), &None, &None, 1000);
         assert_eq!(empty.cooldown_until_ms, None);
     }
 
@@ -397,7 +577,7 @@ mod tests {
     }
     #[test]
     fn failed_selection_prune_save_retries_until_success_and_keeps_current_data() {
-        use crate::persistence::StateStore;
+        use crate::guard_storage::GuardStore;
         use std::time::Duration;
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         struct TempDir(std::path::PathBuf);
@@ -419,15 +599,23 @@ mod tests {
         old.usage_ms.insert("mail".into(), 99);
         old.cooldown_until_ms = Some(123_456);
         std::fs::write(&path, ron::to_string(&old).unwrap()).unwrap();
-        let mut store = StateStore::new(path.clone());
-        let mut state = store.load::<GuardState>().unwrap().unwrap();
+        let mut config = crate::app::SavedState::default();
+        config.target_apps.push(crate::app::TrackedApp {
+            package: "video".into(),
+            label: "Video".into(),
+        });
+        crate::persistence::write_atomic(&dir.join("guard-config.ron"), &config).unwrap();
+        let mut store = GuardStore::new(dir.clone());
+        let mut state = store.load().unwrap().unwrap();
+        state.usage_ms.insert("mail".into(), 99);
         std::fs::create_dir(path.with_extension("pending")).unwrap();
         let mut pending = false;
         assert!(!persist_selection_prune(
             &mut state,
             &policy(),
             &mut pending,
-            &store
+            &store,
+            || Ok(("day1".into(), 1000)),
         ));
         assert!(pending);
         assert!(!state.usage_ms.contains_key("mail"));
@@ -438,7 +626,8 @@ mod tests {
             &mut state,
             &policy(),
             &mut pending,
-            &store
+            &store,
+            || Ok(("day1".into(), 1000)),
         ));
         assert!(!pending);
         let restored: GuardState = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -477,6 +666,24 @@ mod tests {
         assert!(
             state.usage_ms.is_empty() && state.playback_ms.is_empty() && state.raw_ms.is_empty()
         );
+    }
+
+    #[test]
+    fn a_known_new_day_without_measurements_does_not_persist_yesterdays_metrics() {
+        let mut state = GuardState::default();
+        sample(&mut state, "2026-11-10", 1, 61_000);
+        state.enforce(&policy(), 1000);
+        let deadline = state.cooldown_until_ms;
+        // The calendar is available even when Usage access is denied or the screen is locked.
+        state.prepare_persistence(&policy(), Some("2026-11-11"));
+        let disk = ron::to_string(&state).unwrap();
+        let restored: GuardState = ron::from_str(&disk).unwrap();
+        assert!(
+            restored.usage_ms.is_empty(),
+            "old-day usage still persisted without a measurement"
+        );
+        assert_eq!(restored.cooldown_until_ms, deadline);
+        assert_eq!(restored.last_triggered_day.as_deref(), Some("2026-11-10"));
     }
 
     #[test]
