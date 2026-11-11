@@ -764,6 +764,9 @@ impl ControlApp {
         } else {
             Screen::Home
         };
+        // A reloaded record is not a fresh measurement, even for the same day.
+        self.usage_by_package_ms.clear();
+        self.measurement_available = false;
         self.saved = state;
         self.last_persisted = None;
         self.last_refresh = Instant::now() - Duration::from_secs(120);
@@ -2167,6 +2170,26 @@ mod tests {
         });
         recover_store_after_failed_read(&mut model, &original, &fixture);
         assert_eq!(model.saved, original);
+    }
+
+    #[test]
+    fn recovered_new_day_state_cannot_reuse_old_measurement_to_begin_a_break() {
+        let fixture = ReloadFixture::new();
+        let mut model = app();
+        model.saved.daily_limit_minutes = 30;
+        model.apply_usage_snapshot(snapshot(1, 44));
+        model.saved.cooldown_until_ms = None;
+        let mut recovered = model.saved.clone();
+        recovered.retain_current_day("2026-10-02");
+        recover_store_after_failed_read(&mut model, &recovered, &fixture);
+        model.accept_calendar_day("2026-10-02");
+        model.open_target_app(model.saved.target_apps[0].clone(), egui::Context::default());
+        assert_eq!(
+            model.saved.cooldown_until_ms, None,
+            "recovered state reused yesterday's UI cache"
+        );
+        assert!(!model.measurement_available);
+        assert_eq!(model.today_usage_ms(), 0);
     }
 
     #[test]
