@@ -255,6 +255,7 @@ pub struct ControlApp {
     last_fallback_refresh: Instant,
     state_store: Option<crate::persistence::StateStore>,
     storage_error: Option<String>,
+    unread_settings_baseline: Option<SavedState>,
     last_state_reload: Instant,
     screen: Screen,
     permission_granted: bool,
@@ -402,6 +403,10 @@ impl ControlApp {
             last_persist_at: Instant::now(),
             #[cfg(target_os = "android")]
             last_fallback_refresh: Instant::now() - Duration::from_secs(120),
+            unread_settings_baseline: state_store
+                .as_ref()
+                .filter(|store| !store.is_ready())
+                .map(|_| saved.clone()),
             state_store,
             storage_error,
             last_state_reload: Instant::now(),
@@ -443,6 +448,11 @@ impl ControlApp {
         #[cfg(not(target_os = "android"))]
         if mode == AppMode::Preview {
             app.load_preview_data();
+        }
+        if app.unread_settings_baseline.is_some() {
+            // Preview initialization is fixture data, not a user edit made
+            // while the storage warning is visible.
+            app.unread_settings_baseline = Some(app.saved.clone());
         }
 
         app
@@ -691,6 +701,7 @@ impl ControlApp {
     }
 
     fn persist_changed_state(&mut self, frame: &mut eframe::Frame) {
+        self.remember_unread_settings();
         #[cfg(target_os = "android")]
         let calendar_day = self
             .android_app
@@ -762,12 +773,69 @@ impl ControlApp {
 
     fn restore_saved_state(&mut self, state: SavedState) {
         #[cfg(not(target_os = "android"))]
-        let state = self.mode.prepare_saved_state(state);
+        let mut state = self.mode.prepare_saved_state(state);
+        #[cfg(target_os = "android")]
+        let mut state = state;
+        let pending_edits = self.unread_settings_baseline.take();
+        if let Some(before) = &pending_edits {
+            // Disk owns usage/day/break authority. Reapply only settings edited
+            // while the store was unreadable, never the stale in-memory record.
+            if self.saved.daily_limit_minutes != before.daily_limit_minutes {
+                state.daily_limit_minutes = self.saved.daily_limit_minutes;
+            }
+            if self.saved.break_minutes != before.break_minutes {
+                state.break_minutes = self.saved.break_minutes;
+            }
+            if self.saved.usage_disclosure_accepted != before.usage_disclosure_accepted {
+                state.usage_disclosure_accepted = self.saved.usage_disclosure_accepted;
+            }
+            if self.saved.service_disclosure_accepted != before.service_disclosure_accepted {
+                state.service_disclosure_accepted = self.saved.service_disclosure_accepted;
+            }
+            let old_targets = state.target_apps.clone();
+            let old_playback = state.playback_only;
+            if self.saved.playback_only != before.playback_only {
+                state.playback_only = self.saved.playback_only;
+            }
+            for removed in &before.target_apps {
+                if !self
+                    .saved
+                    .target_apps
+                    .iter()
+                    .any(|app| app.package == removed.package)
+                {
+                    state
+                        .target_apps
+                        .retain(|app| app.package != removed.package);
+                }
+            }
+            for added in &self.saved.target_apps {
+                if !before
+                    .target_apps
+                    .iter()
+                    .any(|app| app.package == added.package)
+                    && !state
+                        .target_apps
+                        .iter()
+                        .any(|app| app.package == added.package)
+                {
+                    state.target_apps.push(added.clone());
+                }
+            }
+            if state.target_apps != old_targets || state.playback_only != old_playback {
+                state
+                    .target_apps
+                    .sort_by_key(|app| app.label.to_lowercase());
+                state.daily_records.clear();
+            }
+        }
         self.screen = if state
             .cooldown_until_ms
             .is_some_and(|until| until > now_epoch_ms())
         {
             Screen::Break
+        } else if pending_edits.is_some() && self.screen != Screen::Break {
+            self.screen
         } else {
             Screen::Home
         };
@@ -777,6 +845,17 @@ impl ControlApp {
         self.saved = state;
         self.last_persisted = None;
         self.last_refresh = Instant::now() - Duration::from_secs(120);
+    }
+
+    fn remember_unread_settings(&mut self) {
+        if self.unread_settings_baseline.is_none()
+            && self
+                .state_store
+                .as_ref()
+                .is_some_and(|store| !store.is_ready())
+        {
+            self.unread_settings_baseline = Some(self.saved.clone());
+        }
     }
 
     fn accept_persisted_state(&mut self, state: SavedState) {
@@ -1674,6 +1753,7 @@ impl eframe::App for ControlApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.remember_unread_settings();
         #[cfg(target_os = "android")]
         if let Some(app) = &self.android_app {
             // Read current Resources: the native configuration can retain its initial value.
@@ -1704,6 +1784,8 @@ impl eframe::App for ControlApp {
             if let Ok(state) = restored {
                 if let Some(state) = state {
                     self.restore_saved_state(state);
+                } else {
+                    self.unread_settings_baseline = None;
                 }
                 self.storage_error = None;
                 self.last_persisted = None;
@@ -2181,6 +2263,220 @@ mod tests {
     }
 
     #[test]
+    fn unread_recovery_preserves_edited_settings_and_disk_authority() {
+        let fixture = ReloadFixture::new();
+        let mut model = app();
+        let path = fixture.path();
+        std::fs::write(&path, b"(corrupt").unwrap();
+        let mut store = crate::persistence::StateStore::new(path.clone());
+        assert!(store.load_and_migrate::<SavedState>().is_err());
+        model.state_store = Some(store);
+        let context = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        eframe::App::logic(&mut model, &context, &mut frame);
+
+        let mut disk = model.saved.clone();
+        disk.daily_limit_minutes = 120;
+        disk.break_minutes = 45;
+        disk.current_day_key = "2026-11-11".into();
+        disk.cooldown_until_ms = Some(now_epoch_ms() + 600_000);
+        disk.limit_triggered_day = Some(disk.current_day_key.clone());
+        disk.last_limit_triggered_day = Some(disk.current_day_key.clone());
+        disk.daily_records = vec![DailyRecord {
+            day_key: disk.current_day_key.clone(),
+            label: "11月11日".into(),
+            used_ms: 1234,
+            playback_only: false,
+        }];
+        model.saved.daily_limit_minutes = 300;
+        model.screen = Screen::Settings;
+        model.persist_changed_state(&mut frame);
+        assert_eq!(std::fs::read(&path).unwrap(), b"(corrupt");
+        std::fs::write(&path, ron::to_string(&disk).unwrap()).unwrap();
+        model.last_state_reload = Instant::now() - Duration::from_secs(6);
+        eframe::App::logic(&mut model, &context, &mut frame);
+        assert_eq!(
+            model.saved.daily_limit_minutes, 300,
+            "reload discarded edited limit"
+        );
+        assert_eq!(model.saved.break_minutes, 45);
+        assert_eq!(model.saved.daily_records, disk.daily_records);
+        assert_eq!(model.saved.cooldown_until_ms, disk.cooldown_until_ms);
+        assert_eq!(
+            model.saved.last_limit_triggered_day,
+            disk.last_limit_triggered_day
+        );
+        assert_eq!(model.screen, Screen::Break);
+        // A failed publication after recovery must keep both the old disk
+        // record and the edited in-memory value available for retry.
+        std::fs::create_dir(path.with_extension("pending")).unwrap();
+        model.persist_changed_state(&mut frame);
+        assert!(model.storage_error.is_some());
+        assert_eq!(model.saved.daily_limit_minutes, 300);
+        let unchanged: SavedState =
+            ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(unchanged.daily_limit_minutes, 120);
+        std::fs::remove_dir(path.with_extension("pending")).unwrap();
+        model.persist_changed_state(&mut frame);
+        drop(model);
+        let mut restarted = app();
+        let mut store = crate::persistence::StateStore::new(path.clone());
+        restarted.restore_saved_state(store.load_and_migrate::<SavedState>().unwrap().unwrap());
+        restarted.state_store = Some(store);
+        assert_eq!(restarted.saved.daily_limit_minutes, 300);
+        assert_eq!(restarted.saved.break_minutes, 45);
+        assert_eq!(restarted.saved.daily_records, disk.daily_records);
+    }
+
+    fn unread_model(fixture: &ReloadFixture) -> ControlApp {
+        let mut model = app();
+        std::fs::write(fixture.path(), b"(corrupt").unwrap();
+        let mut store = crate::persistence::StateStore::new(fixture.path());
+        assert!(store.load_and_migrate::<SavedState>().is_err());
+        model.state_store = Some(store);
+        model.remember_unread_settings();
+        model
+    }
+
+    fn recover_edited_model(model: &mut ControlApp, disk: &SavedState, fixture: &ReloadFixture) {
+        std::fs::write(fixture.path(), ron::to_string(disk).unwrap()).unwrap();
+        model.last_state_reload = Instant::now() - Duration::from_secs(6);
+        eframe::App::logic(
+            model,
+            &egui::Context::default(),
+            &mut eframe::Frame::_new_kittest(),
+        );
+        assert!(model.state_store.as_ref().unwrap().is_ready());
+        assert!(model.unread_settings_baseline.is_none());
+    }
+
+    #[test]
+    fn unread_recovery_merges_explicit_selection_without_old_usage_or_break_loss() {
+        let fixture = ReloadFixture::new();
+        let mut model = unread_model(&fixture);
+        let mut disk = model.saved.clone();
+        let other = TrackedApp {
+            label: "other".into(),
+            package: "test.other".into(),
+        };
+        let added = TrackedApp {
+            label: "added".into(),
+            package: "test.added".into(),
+        };
+        disk.target_apps.push(other.clone());
+        disk.current_day_key = "2026-11-12".into();
+        disk.cooldown_until_ms = Some(now_epoch_ms() + 600_000);
+        disk.last_limit_triggered_day = Some(disk.current_day_key.clone());
+        disk.daily_records.push(DailyRecord {
+            day_key: disk.current_day_key.clone(),
+            label: "day".into(),
+            used_ms: 5_000,
+            playback_only: false,
+        });
+        let removed = model.saved.target_apps[0].clone();
+        model.toggle_app(&removed, &egui::Context::default());
+        model.toggle_app(&added, &egui::Context::default());
+        recover_edited_model(&mut model, &disk, &fixture);
+        assert_eq!(model.saved.target_apps, vec![added, other]);
+        assert!(model.saved.daily_records.is_empty());
+        assert_eq!(model.saved.cooldown_until_ms, disk.cooldown_until_ms);
+        assert_eq!(
+            model.saved.last_limit_triggered_day,
+            disk.last_limit_triggered_day
+        );
+        assert_eq!(model.screen, Screen::Break);
+        model.persist_changed_state(&mut eframe::Frame::_new_kittest());
+        let restored: SavedState =
+            ron::from_str(&std::fs::read_to_string(fixture.path()).unwrap()).unwrap();
+        assert_eq!(restored, model.saved);
+    }
+
+    #[test]
+    fn unread_recovery_cancelled_edits_preserve_new_disk_day_and_invalidate_cache() {
+        for day in ["2026-11-11", "2026-11-12"] {
+            let fixture = ReloadFixture::new();
+            let mut model = unread_model(&fixture);
+            let mut disk = model.saved.clone();
+            disk.daily_limit_minutes = 240;
+            disk.break_minutes = 45;
+            disk.current_day_key = day.into();
+            disk.daily_records.push(DailyRecord {
+                day_key: day.into(),
+                label: "day".into(),
+                used_ms: 9_000,
+                playback_only: false,
+            });
+            model.saved.daily_limit_minutes = 300;
+            model.saved.daily_limit_minutes = 120; // User returns to the original value.
+            let selected = model.saved.target_apps[0].clone();
+            model.toggle_app(&selected, &egui::Context::default());
+            model.toggle_app(&selected, &egui::Context::default());
+            model.measurement_available = true;
+            model.usage_by_package_ms.insert(selected.package, 999_999);
+            model.screen = Screen::Settings;
+            recover_edited_model(&mut model, &disk, &fixture);
+            assert_eq!(model.saved, disk);
+            assert_eq!(model.screen, Screen::Settings);
+            assert!(!model.measurement_available);
+            assert!(model.usage_by_package_ms.is_empty());
+        }
+    }
+
+    #[test]
+    fn unread_recovery_repeated_failure_and_missing_file_keep_pending_edit() {
+        let fixture = ReloadFixture::new();
+        let mut model = unread_model(&fixture);
+        model.saved.break_minutes = 65;
+        model.last_state_reload = Instant::now() - Duration::from_secs(6);
+        let mut frame = eframe::Frame::_new_kittest();
+        eframe::App::logic(&mut model, &egui::Context::default(), &mut frame);
+        model.persist_changed_state(&mut frame);
+        assert!(!model.state_store.as_ref().unwrap().is_ready());
+        assert_eq!(std::fs::read(fixture.path()).unwrap(), b"(corrupt");
+        assert!(model.unread_settings_baseline.is_some());
+        std::fs::remove_file(fixture.path()).unwrap();
+        model.last_state_reload = Instant::now() - Duration::from_secs(6);
+        eframe::App::logic(&mut model, &egui::Context::default(), &mut frame);
+        assert!(model.state_store.as_ref().unwrap().is_ready());
+        assert!(model.unread_settings_baseline.is_none());
+        assert_eq!(model.saved.break_minutes, 65);
+        model.persist_changed_state(&mut frame);
+        let disk: SavedState =
+            ron::from_str(&std::fs::read_to_string(fixture.path()).unwrap()).unwrap();
+        assert_eq!(disk.break_minutes, 65);
+    }
+
+    #[test]
+    fn unread_recovery_restores_unedited_policy_and_never_replays_stale_break() {
+        let fixture = ReloadFixture::new();
+        let mut model = unread_model(&fixture);
+        model.saved.cooldown_until_ms = Some(now_epoch_ms() + 900_000);
+        model.saved.limit_triggered_day = Some("2026-11-10".into());
+        model.saved.last_limit_triggered_day = Some("2026-11-10".into());
+        model.saved.current_day_key = "2026-11-10".into();
+        model.screen = Screen::Break;
+        model.saved.break_minutes = 65;
+        let disk = SavedState {
+            daily_limit_minutes: 240,
+            break_minutes: 45,
+            current_day_key: "2026-11-12".into(),
+            last_limit_triggered_day: Some("2026-11-11".into()),
+            ..SavedState::default()
+        };
+        recover_edited_model(&mut model, &disk, &fixture);
+        assert_eq!(model.saved.daily_limit_minutes, 240);
+        assert_eq!(model.saved.break_minutes, 65);
+        assert_eq!(model.saved.current_day_key, disk.current_day_key);
+        assert_eq!(model.saved.cooldown_until_ms, None);
+        assert_eq!(model.saved.limit_triggered_day, None);
+        assert_eq!(
+            model.saved.last_limit_triggered_day,
+            disk.last_limit_triggered_day
+        );
+        assert_eq!(model.screen, Screen::Home);
+    }
+
+    #[test]
     fn recovered_new_day_state_cannot_reuse_old_measurement_to_begin_a_break() {
         let fixture = ReloadFixture::new();
         let mut model = app();
@@ -2265,6 +2561,7 @@ mod tests {
             last_persist_at: Instant::now(),
             state_store: None,
             storage_error: None,
+            unread_settings_baseline: None,
             last_state_reload: Instant::now(),
             screen: Screen::Home,
             permission_granted: false,
