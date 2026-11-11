@@ -18,9 +18,15 @@ name = "phone-friction-control-preview"
 path = "src/main.rs"
 required-features = ["desktop-preview"]
 
+[[bin]]
+name = "phone-friction-control-ios-runtime"
+path = "src/bin/ios_runtime.rs"
+required-features = ["ios-runtime"]
+
 [features]
 default = []
 desktop-preview = ["winit/default"]
+ios-runtime = []
 ads-test = []
 ads-production = []
 
