@@ -560,8 +560,6 @@ impl ControlApp {
             self.saved.cooldown_until_ms = None;
             self.screen = Screen::Home;
             self.notice = Some("休憩時間が終わりました。アプリをもう一度開けます。".to_owned());
-        } else if self.saved.cooldown_until_ms.is_some() {
-            self.screen = Screen::Break;
         }
 
         let refresh_seconds = if self.saved.service_disclosure_accepted {
@@ -572,6 +570,7 @@ impl ControlApp {
         if self.last_refresh.elapsed() >= Duration::from_secs(refresh_seconds) {
             self.refresh_usage(ctx.clone());
         }
+        self.sync_break_screen();
     }
 
     #[cfg(any(target_os = "android", test))]
@@ -654,6 +653,14 @@ impl ControlApp {
             Some(now_ms + i64::from(self.saved.break_minutes.max(1)) * 60_000);
         self.screen = Screen::Break;
         self.notice = None;
+    }
+
+    fn sync_break_screen(&mut self) {
+        if self.saved.cooldown_until_ms.is_some() {
+            self.screen = Screen::Break;
+        } else if self.screen == Screen::Break {
+            self.screen = Screen::Home;
+        }
     }
 
     fn today_usage_ms(&self) -> u64 {
@@ -776,6 +783,7 @@ impl ControlApp {
         #[cfg(any(target_os = "android", test))]
         self.accept_calendar_day(&state.current_day_key);
         self.saved = state;
+        self.sync_break_screen();
         self.last_persisted = Some(self.saved.clone());
         self.last_persist_at = Instant::now();
         self.storage_error = None;
@@ -2352,6 +2360,60 @@ mod tests {
         assert_eq!(state.cooldown_until_ms, Some(2000));
         state.accept_service_break(None, None, None, 2000);
         assert_eq!(state.cooldown_until_ms, None);
+    }
+
+    #[test]
+    fn completed_break_received_from_service_or_save_exits_break_screen() {
+        for from_save in [false, true] {
+            let mut model = app();
+            model.begin_break(now_epoch_ms(), "2026-11-11".into());
+            assert_eq!(model.screen, Screen::Break);
+            if from_save {
+                let mut completed = model.saved.clone();
+                completed.cooldown_until_ms = None;
+                model.accept_persistence_result(Ok(completed));
+            } else {
+                model.saved.accept_service_break(
+                    None,
+                    Some("2026-11-11".into()),
+                    Some("2026-11-11".into()),
+                    now_epoch_ms(),
+                );
+            }
+            assert_eq!(model.saved.cooldown_until_ms, None);
+            eframe::App::logic(
+                &mut model,
+                &egui::Context::default(),
+                &mut eframe::Frame::_new_kittest(),
+            );
+            assert_eq!(
+                model.screen,
+                Screen::Home,
+                "completed break left its screen active, saved={from_save}"
+            );
+        }
+    }
+
+    #[test]
+    fn reconciling_break_screen_keeps_live_break_and_unrelated_settings_screen() {
+        let mut model = app();
+        model.begin_break(now_epoch_ms(), "2026-11-11".into());
+        let deadline = model.saved.cooldown_until_ms;
+        eframe::App::logic(
+            &mut model,
+            &egui::Context::default(),
+            &mut eframe::Frame::_new_kittest(),
+        );
+        assert_eq!(model.screen, Screen::Break);
+        assert_eq!(model.saved.cooldown_until_ms, deadline);
+        model.saved.cooldown_until_ms = None;
+        model.screen = Screen::Settings;
+        eframe::App::logic(
+            &mut model,
+            &egui::Context::default(),
+            &mut eframe::Frame::_new_kittest(),
+        );
+        assert_eq!(model.screen, Screen::Settings);
     }
 
     #[test]
