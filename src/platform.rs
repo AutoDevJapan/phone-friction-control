@@ -11,6 +11,62 @@ use crate::app::{PlatformEvent, UsageSnapshot};
 
 const OWN_PACKAGE: &str = "com.autodevjapan.phonefrictioncontrol";
 
+pub(crate) fn activity_task_id(app: &AndroidApp) -> Result<i32, String> {
+    with_activity(app, |env, activity| {
+        env.call_method(activity, "getTaskId", "()I", &[])?.i()
+    })
+}
+
+pub(crate) fn reuse_ui_task_and_retire_duplicate(app: &AndroidApp, owner: i32) {
+    let callback_app = app.clone();
+    app.run_on_java_main_thread(Box::new(move || {
+        let result = with_activity(&callback_app, |env, activity| {
+            let manager = get_system_service(env, activity, "activity")?;
+            // RecentTasks can temporarily hide the live UI after an update.
+            // Use only the task id held by our live native-owner lease.
+            env.call_method(
+                &manager,
+                "moveTaskToFront",
+                "(II)V",
+                &[JValue::Int(owner), JValue::Int(0)],
+            )?;
+            let duplicate = env.call_method(activity, "getTaskId", "()I", &[])?.i()?;
+            env.call_method(
+                activity,
+                if duplicate == owner {
+                    "finish"
+                } else {
+                    "finishAndRemoveTask"
+                },
+                "()V",
+                &[],
+            )?;
+            eprintln!("Reused native UI task={owner}; retiring duplicate task={duplicate}");
+            Ok(())
+        });
+        if let Err(error) = result {
+            eprintln!("既存の画面へ戻せません: {error}");
+            let _ = with_activity(&callback_app, |env, activity| {
+                env.call_method(activity, "finish", "()V", &[])?;
+                Ok(())
+            });
+        }
+    }));
+    // NativeActivity callbacks wait for this thread. Drain their lifecycle until
+    // Destroy so retiring the duplicate cannot block Android's main thread.
+    let mut destroyed = false;
+    while !destroyed {
+        app.poll_events(None, |event| {
+            if matches!(
+                event,
+                android_activity::PollEvent::Main(android_activity::MainEvent::Destroy)
+            ) {
+                destroyed = true;
+            }
+        });
+    }
+}
+
 pub fn request_insets(app: AndroidApp, events: Sender<PlatformEvent>, repaint: Context) {
     let callback_app = app.clone();
     app.run_on_java_main_thread(Box::new(move || {

@@ -177,19 +177,43 @@ pub(crate) fn load_usage_transaction(
 ) -> io::Result<Option<SavedState>> {
     store.invalidate();
     transaction(calendar, |day, now| {
-        let dir = store.directory()?;
+        let dir = store.directory()?.to_owned();
         let config = read::<SavedState>(dir.join("guard-config.ron"))?;
         let guard = read::<GuardState>(dir.join("guard-state.ron"))?;
-        store.load_and_migrate_with(|state: &mut SavedState| {
+        if read::<SavedState>(dir.join("usage-state.ron"))?.is_none()
+            && config.is_none()
+            && guard.is_some()
+        {
+            return Err(io::Error::other("Guard state has no surviving policy"));
+        }
+        let restored = store.load_and_migrate_with(|state: &mut SavedState| {
             state.retain_current_day(day);
             state.cooldown_until_ms = state.cooldown_until_ms.filter(|until| *until > now);
-            if let Some(config) = config {
-                state.merge_persisted(&config, day, now);
+            if let Some(config) = &config {
+                state.merge_persisted(config, day, now);
             }
-            if let Some(guard) = guard {
-                state.merge_guard(&guard, now);
+            if let Some(guard) = &guard {
+                state.merge_guard(guard, now);
             }
-        })
+        })?;
+        if restored.is_some() || (config.is_none() && guard.is_none()) {
+            return Ok(restored);
+        }
+        // A missing UI file is not an empty policy when the service's canonical
+        // files survive. Reconstruct under this same lock and calendar sample.
+        let mut state = config.unwrap_or_default();
+        state.retain_current_day(day);
+        state.cooldown_until_ms = state.cooldown_until_ms.filter(|until| *until > now);
+        if let Some(mut guard) = guard {
+            normalize_guard(&mut guard, &state, day, now);
+            state.merge_guard(&guard, now);
+            state.restore_guard_usage(&guard);
+        }
+        if let Err(error) = store.save(&state) {
+            store.invalidate();
+            return Err(error);
+        }
+        Ok(Some(state))
     })
 }
 
@@ -304,6 +328,11 @@ fn sync_calendar(dir: &Path, day: Option<&str>) -> io::Result<()> {
 }
 #[cfg(test)]
 fn save_policy(dir: &Path, config: &SavedState, day: Option<&str>) -> io::Result<()> {
+    // These tests explicitly supply an initial policy. A real orphan checkpoint
+    // without either policy file must remain unreadable rather than infer one.
+    if !dir.join("usage-state.ron").exists() && !dir.join("guard-config.ron").exists() {
+        crate::persistence::write_atomic(&dir.join("guard-config.ron"), config)?;
+    }
     let mut store = StateStore::new(dir.join("usage-state.ron"));
     load_usage(&mut store, day)?;
     save_usage(&store, dir, config, day)
@@ -358,6 +387,98 @@ mod tests {
         state.cooldown_until_ms = Some(123_456);
         state.last_triggered_day = Some("2026-11-11".into());
         state
+    }
+
+    #[test]
+    fn missing_usage_restores_policy_and_current_selected_guard_totals() {
+        let fixture = Fixture::new();
+        let mut policy = config(&["video"]);
+        policy.daily_limit_minutes = 240;
+        policy.break_minutes = 45;
+        let guard = old_state();
+        crate::persistence::write_atomic(&fixture.0.join("guard-config.ron"), &policy).unwrap();
+        crate::persistence::write_atomic(&fixture.0.join("guard-state.ron"), &guard).unwrap();
+        let mut store = StateStore::new(fixture.0.join("usage-state.ron"));
+        let recovered = load_usage(&mut store, Some("2026-11-11")).unwrap();
+        assert!(
+            recovered.is_some(),
+            "missing usage discarded surviving policy/guard"
+        );
+        let recovered = recovered.unwrap();
+        assert_eq!(recovered.daily_limit_minutes, 240);
+        assert_eq!(recovered.break_minutes, 45);
+        assert_eq!(recovered.target_apps, policy.target_apps);
+        assert_eq!(recovered.cooldown_until_ms, Some(123_456));
+        assert_eq!(recovered.last_limit_triggered_day, guard.last_triggered_day);
+        let text = ron::to_string(&recovered).unwrap();
+        assert!(
+            text.contains("used_ms:61000"),
+            "lost selected current-day aggregate: {text}"
+        );
+        assert!(
+            !text.contains("700"),
+            "unselected usage leaked into aggregate"
+        );
+        save_usage(&store, &fixture.0, &recovered, Some("2026-11-11")).unwrap();
+        let disk: SavedState = read(fixture.0.join("usage-state.ron")).unwrap().unwrap();
+        assert_eq!(disk, recovered);
+        assert_eq!(fixture.state().usage_ms.len(), 1);
+        assert_eq!(fixture.state().usage_ms["video"], 61_000);
+    }
+
+    #[test]
+    fn missing_usage_recovery_preserves_files_on_failure_and_keeps_new_day_break() {
+        let fixture = Fixture::new();
+        let mut policy = config(&["video"]);
+        policy.daily_limit_minutes = 240;
+        policy.break_minutes = 45;
+        crate::persistence::write_atomic(&fixture.0.join("guard-config.ron"), &policy).unwrap();
+        crate::persistence::write_atomic(&fixture.0.join("guard-state.ron"), &old_state()).unwrap();
+        let old_config = std::fs::read(fixture.0.join("guard-config.ron")).unwrap();
+        let old_guard = std::fs::read(fixture.0.join("guard-state.ron")).unwrap();
+        let mut store = StateStore::new(fixture.0.join("usage-state.ron"));
+        assert!(
+            load_usage_transaction(&mut store, || Err(io::Error::other("clock failed"))).is_err()
+        );
+        assert!(!store.is_ready());
+        assert!(!fixture.0.join("usage-state.ron").exists());
+        std::fs::create_dir(fixture.0.join("usage-state.pending")).unwrap();
+        assert!(load_usage(&mut store, Some("2026-11-12")).is_err());
+        assert!(!store.is_ready());
+        assert_eq!(
+            std::fs::read(fixture.0.join("guard-config.ron")).unwrap(),
+            old_config
+        );
+        assert_eq!(
+            std::fs::read(fixture.0.join("guard-state.ron")).unwrap(),
+            old_guard
+        );
+        std::fs::remove_dir(fixture.0.join("usage-state.pending")).unwrap();
+        let recovered = load_usage(&mut store, Some("2026-11-12")).unwrap().unwrap();
+        assert!(store.is_ready());
+        assert_eq!(recovered.daily_limit_minutes, 240);
+        assert_eq!(recovered.cooldown_until_ms, Some(123_456));
+        assert!(
+            !ron::to_string(&recovered)
+                .unwrap()
+                .contains("used_ms:61000")
+        );
+        assert_eq!(recovered.current_day_key, "2026-11-12");
+    }
+
+    #[test]
+    fn orphan_guard_without_policy_cannot_be_replaced_by_an_empty_default() {
+        let fixture = Fixture::new();
+        crate::persistence::write_atomic(&fixture.0.join("guard-state.ron"), &old_state()).unwrap();
+        let original = std::fs::read(fixture.0.join("guard-state.ron")).unwrap();
+        let mut store = StateStore::new(fixture.0.join("usage-state.ron"));
+        assert!(load_usage(&mut store, Some("2026-11-11")).is_err());
+        assert!(!store.is_ready());
+        assert!(!fixture.0.join("usage-state.ron").exists());
+        assert_eq!(
+            std::fs::read(fixture.0.join("guard-state.ron")).unwrap(),
+            original
+        );
     }
     fn seed(fixture: &Fixture) {
         crate::persistence::write_atomic(&fixture.0.join("guard-state.ron"), &old_state()).unwrap();
