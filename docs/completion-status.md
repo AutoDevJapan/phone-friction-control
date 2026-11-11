@@ -16,6 +16,8 @@
 | iOSの制御 | iOS 17.5 Simulatorで、Rustから公開クラスの取得と、個人向け許可APIの非同期呼出し・エラーの戻りを確認。Xcodeの検査ホストで許可操作後のエラーなし・実getterのapprovedを確認。拒否操作後はエラーとnotDeterminedを実測。実Bindingの生成・コピー・getter/setterとfalse→true→falseの値変更を実測。実BindingからPicker値を生成し、コピー・破棄と全13領域の解放を確認。実UIHostingControllerを構築し、選択画面の表示と実画像の撮影を確認 | 製品への統合、許可取得後のアプリ選択、Device Activity、Managed Settings、拡張の接続・署名・起動。各段階の成功を別々に確認 |
 | iOSの再生時間 | Device Activityの公開説明は最前面の活動時間 | 他社アプリの再生時間を読む公開経路は未確認。活動時間を再生時間と表示しない |
 
+code20の[通常再生の追加受入](android-verification.md#code20の通常再生休憩の追加受入2026-11-12)では、API37の分離ユーザーで通常の許可・設定を使い、自己所有の端末内音声による当日30分到達・5分休憩・期限前の再入拒否と再停止・自然満了後の再生継続を確認しました。日付境界では前日分を足さず0分へ戻り、同日31分でも直ちに再発動しませんでした。Musicの自動更新とプロセス変更は区分しています。生カウンター・正確な保存期限・試聴・物理ARMのメディア停止・TikTok・通常インストーラーは未検証のままです。検証用ユーザー・一時媒体・仮想端末・観測処理を回収し、元profile3点のサイズ・SHA-256一致を確認しました。
+
 各実測のソース・環境・限界は [Androidの検証記録](android-verification.md) と [iOSの状態](ios-status.md) を参照してください。既存の仮想端末受入に加え、明示された無料の物理端末検査を上記範囲で実施しました。
 
 iOS製品にはPreviewとは別のRuntime入口を追加しました。[ビルド指定](../README.md#iosの検査用入口)と[入口の検査範囲](ios-status.md#製品のios入口)を参照してください。先行ソース `e594c97` の[実行42964706681](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/42964706681)に加え、共有保存修復を取り込んだ製品ソース `3d6e7a9` の[実行43022656179](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/43022656179)でも、iOS18.5 Simulatorでリンク・通常起動・画面の設定変更120→300分・実containerへの保存・新PIDでの300分復元を確認しました。同じバイナリを使い、変更後と再起動後の保存bytesも一致しました。読取りエラー中の編集をiOS画面へ注入した試験ではありません。Screen Timeの許可・個別アプリ選択・token保存・監視・遮蔽と拡張への製品接続、Android専用UI説明の修正、SwiftUI所有者の完全排出、物理iOS端末・正式な署名配布は引き続き未達です。
