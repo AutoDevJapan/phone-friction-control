@@ -39,7 +39,11 @@ impl StateStore {
             let canonical = ron::to_string(value).map_err(io::Error::other)?;
             if fs::read_to_string(&self.path)? != canonical {
                 save(&self.path, value)?;
+            } else {
+                remove_staging(&self.path)?;
             }
+        } else if matches!(&result, Ok(None)) {
+            remove_staging(&self.path)?;
         }
         self.ready = result.is_ok();
         result
@@ -54,6 +58,15 @@ impl StateStore {
             return Err(io::Error::other("State has not been read successfully"));
         }
         save(&self.path, state)
+    }
+}
+
+fn remove_staging(path: &Path) -> io::Result<()> {
+    // Only the owning migration may discard an interrupted write; readers stay side-effect free.
+    match fs::remove_file(path.with_extension("pending")) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -178,6 +191,19 @@ mod tests {
         let restored: Legacy = ron::from_str(&disk).unwrap();
         assert_eq!(restored.current, 44);
         assert_eq!(restored.deadline, state.deadline);
+    }
+
+    #[test]
+    fn successful_owner_migration_discards_a_previous_interrupted_staging_record() {
+        let fixture = Fixture::new();
+        save(&fixture.path(), &vec![44_u64]).unwrap();
+        fs::write(fixture.path().with_extension("pending"), "[99]").unwrap();
+        let mut store = StateStore::new(fixture.path());
+        assert_eq!(
+            store.load_and_migrate::<Vec<u64>>().unwrap(),
+            Some(vec![44])
+        );
+        assert!(!fixture.path().with_extension("pending").exists());
     }
     #[test]
     fn successful_save_replaces_existing_state() {

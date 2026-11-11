@@ -75,11 +75,14 @@ fn current_config(dir: &Path) -> io::Result<SavedState> {
 
 fn remove_legacy_status(dir: &Path) -> io::Result<()> {
     // No runtime reader uses this redundant snapshot. Keep live transport in memory only.
-    match std::fs::remove_file(dir.join("guard-status.ron")) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
+    for name in ["guard-status.ron", "guard-status.pending"] {
+        match std::fs::remove_file(dir.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -139,6 +142,11 @@ mod tests {
             "legacy private snapshot: mail",
         )
         .unwrap();
+        std::fs::write(
+            fixture.0.join("guard-status.pending"),
+            "old interrupted snapshot: mail",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -155,6 +163,7 @@ mod tests {
         assert_eq!(state.cooldown_until_ms, Some(123_456));
         assert_eq!(state.last_triggered_day.as_deref(), Some("2026-11-11"));
         assert!(!fixture.0.join("guard-status.ron").exists());
+        assert!(!fixture.0.join("guard-status.pending").exists());
     }
 
     #[test]
