@@ -112,6 +112,15 @@ pub(crate) fn guard_save_due(changed: bool, critical: bool, elapsed: std::time::
 }
 
 impl GuardState {
+    pub(crate) fn stored_matches(&self, current: &Self) -> bool {
+        if !self.history.is_empty() {
+            return false;
+        }
+        let mut projection = current.clone();
+        projection.history.clear();
+        *self == projection
+    }
+
     pub(crate) fn merge_checkpoint(&mut self, other: &Self) {
         if self.day == other.day {
             for (to, from) in [

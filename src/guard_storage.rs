@@ -26,12 +26,23 @@ fn read<T: serde::de::DeserializeOwned>(path: PathBuf) -> io::Result<Option<T>> 
     StateStore::new(path).load()
 }
 
-fn put<T: serde::Serialize + serde::de::DeserializeOwned + PartialEq>(
-    path: PathBuf,
-    value: &T,
-) -> io::Result<()> {
+trait Stored: serde::Serialize + serde::de::DeserializeOwned + PartialEq {
+    fn matches_projection(&self, current: &Self) -> bool {
+        self == current
+    }
+}
+impl Stored for SavedState {}
+impl Stored for GuardState {
+    fn matches_projection(&self, current: &Self) -> bool {
+        self.stored_matches(current)
+    }
+}
+#[cfg(test)]
+impl Stored for std::collections::HashMap<String, u64> {}
+
+fn put<T: Stored>(path: PathBuf, value: &T) -> io::Result<()> {
     match std::fs::read_to_string(&path) {
-        Ok(old) if ron::from_str::<T>(&old).is_ok_and(|old| old == *value) => {
+        Ok(old) if ron::from_str::<T>(&old).is_ok_and(|old| old.matches_projection(value)) => {
             match std::fs::remove_file(path.with_extension("pending")) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -686,6 +697,29 @@ mod tests {
         std::fs::write(&path, old).unwrap();
         put(path.clone(), &map).unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), old);
+    }
+
+    #[test]
+    fn stopped_ui_save_migrates_legacy_checkpoint_history_even_when_metrics_match() {
+        let fixture = Fixture::new();
+        seed(&fixture);
+        let config = config(&["video"]);
+        save_policy(&fixture.0, &config, Some("2026-11-11")).unwrap();
+        let path = fixture.0.join("guard-state.ron");
+        let legacy = std::fs::read_to_string(&path).unwrap();
+        let legacy = format!(
+            "{},history:[(day:\"2026-11-10\",usage_ms:{{\"video\":999}},playback_ms:{{}},raw_ms:{{}},boot:None,triggered_day:None)])",
+            legacy.strip_suffix(')').unwrap()
+        );
+        std::fs::write(&path, &legacy).unwrap();
+        let mut ui = StateStore::new(fixture.0.join("usage-state.ron"));
+        load_usage(&mut ui, Some("2026-11-11")).unwrap();
+        save_usage_transaction(&ui, &fixture.0, &config, || Ok(("2026-11-11".into(), 1000)))
+            .unwrap();
+        let disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!disk.contains("history"));
+        assert_eq!(fixture.state().usage_ms["video"], 61_000);
+        assert_eq!(fixture.state().cooldown_until_ms, Some(123_456));
     }
 
     #[test]
