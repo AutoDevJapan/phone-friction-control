@@ -268,6 +268,7 @@ struct UnreadSettingEdits {
     targets: HashMap<String, (TrackedApp, bool)>,
 }
 
+#[cfg(any(target_os = "android", test))]
 impl UnreadSettingEdits {
     fn is_empty(&self) -> bool {
         self.daily_limit.is_none()
@@ -943,25 +944,19 @@ impl ControlApp {
 
     fn edit_daily_limit(&mut self, value: u32) {
         self.remember_unread_settings();
-        if self.unread_settings_pending || !self.unread_explicit_edits.is_empty() {
-            self.unread_explicit_edits.daily_limit = Some(value);
-        }
+        self.unread_explicit_edits.daily_limit = Some(value);
         self.saved.daily_limit_minutes = value;
     }
 
     fn edit_break_minutes(&mut self, value: u32) {
         self.remember_unread_settings();
-        if self.unread_settings_pending || !self.unread_explicit_edits.is_empty() {
-            self.unread_explicit_edits.break_minutes = Some(value);
-        }
+        self.unread_explicit_edits.break_minutes = Some(value);
         self.saved.break_minutes = value;
     }
 
     fn edit_playback_only(&mut self, value: bool) {
         self.remember_unread_settings();
-        if self.unread_settings_pending || !self.unread_explicit_edits.is_empty() {
-            self.unread_explicit_edits.playback = Some(value);
-        }
+        self.unread_explicit_edits.playback = Some(value);
         self.saved.playback_only = value;
         self.measurement_available = false;
         self.last_refresh = Instant::now() - Duration::from_secs(120);
@@ -1073,9 +1068,7 @@ impl ControlApp {
 
     fn request_usage_settings(&mut self, ctx: egui::Context) {
         self.remember_unread_settings();
-        if self.unread_settings_pending || !self.unread_explicit_edits.is_empty() {
-            self.unread_explicit_edits.usage_disclosure = Some(true);
-        }
+        self.unread_explicit_edits.usage_disclosure = Some(true);
         self.saved.usage_disclosure_accepted = true;
         self.screen = Screen::Home;
         self.notice = None;
@@ -1112,9 +1105,7 @@ impl ControlApp {
             return;
         }
         self.remember_unread_settings();
-        if self.unread_settings_pending || !self.unread_explicit_edits.is_empty() {
-            self.unread_explicit_edits.service_disclosure = Some(true);
-        }
+        self.unread_explicit_edits.service_disclosure = Some(true);
         self.saved.service_disclosure_accepted = true;
         #[cfg(target_os = "android")]
         if let Some(android_app) = &self.android_app {
@@ -1160,16 +1151,14 @@ impl ControlApp {
         self.saved
             .target_apps
             .sort_by_key(|app| app.label.to_lowercase());
-        if self.unread_settings_pending || !self.unread_explicit_edits.is_empty() {
-            let selected = self
-                .saved
-                .target_apps
-                .iter()
-                .any(|old| old.package == app.package);
-            self.unread_explicit_edits
-                .targets
-                .insert(app.package.clone(), (app.clone(), selected));
-        }
+        let selected = self
+            .saved
+            .target_apps
+            .iter()
+            .any(|old| old.package == app.package);
+        self.unread_explicit_edits
+            .targets
+            .insert(app.package.clone(), (app.clone(), selected));
         // An aggregate from the previous selection is no longer this selection's total.
         self.saved.daily_records.clear();
         self.refresh_usage(ctx.clone());
@@ -2675,6 +2664,97 @@ mod tests {
         let actual: SavedState =
             ron::from_str(&std::fs::read_to_string(fixture.path()).unwrap()).unwrap();
         assert_eq!(actual.daily_limit_minutes, 180);
+    }
+
+    #[test]
+    fn first_edit_after_successful_read_survives_save_failure_and_activity_recreation() {
+        let fixture = ReloadFixture::new();
+        let disk = SavedState {
+            daily_limit_minutes: 240,
+            break_minutes: 45,
+            ..SavedState::default()
+        };
+        std::fs::write(fixture.path(), ron::to_string(&disk).unwrap()).unwrap();
+        let mut store = crate::persistence::StateStore::new(fixture.path());
+        let mut old = app();
+        old.restore_saved_state(store.load_and_migrate().unwrap().unwrap());
+        old.state_store = Some(store);
+        assert!(!old.unread_settings_pending);
+        assert!(old.unread_explicit_edits.is_empty());
+        old.edit_daily_limit(300);
+        std::fs::create_dir(fixture.path().with_extension("pending")).unwrap();
+        old.persist_changed_state(&mut eframe::Frame::_new_kittest());
+        assert!(old.storage_error.is_some());
+        let handoff = old.unread_explicit_edits.clone();
+        drop(old);
+        std::fs::remove_dir(fixture.path().with_extension("pending")).unwrap();
+        let mut store = crate::persistence::StateStore::new(fixture.path());
+        let mut recreated = app();
+        recreated.restore_saved_state(store.load_and_migrate().unwrap().unwrap());
+        recreated.state_store = Some(store);
+        recreated.resume_activity_edits(handoff);
+        assert_eq!(
+            recreated.saved.daily_limit_minutes, 300,
+            "ready-store edit was not handed off"
+        );
+        assert_eq!(recreated.saved.break_minutes, 45);
+        recreated.persist_changed_state(&mut eframe::Frame::_new_kittest());
+        assert!(recreated.unread_explicit_edits.is_empty());
+        let actual: SavedState =
+            ron::from_str(&std::fs::read_to_string(fixture.path()).unwrap()).unwrap();
+        assert_eq!(actual.daily_limit_minutes, 300);
+        assert_eq!(actual.break_minutes, 45);
+    }
+
+    #[test]
+    fn ready_edit_failure_reedit_and_repeated_recreation_keep_latest_selection_and_settings() {
+        let fixture = ReloadFixture::new();
+        let mut old = unread_model(&fixture);
+        let selected = old.saved.target_apps[0].clone();
+        let disk = SavedState {
+            target_apps: vec![selected.clone()],
+            daily_limit_minutes: 240,
+            break_minutes: 45,
+            ..SavedState::default()
+        };
+        recover_edited_model(&mut old, &disk, &fixture);
+        assert!(!old.unread_settings_pending);
+        old.edit_daily_limit(300);
+        old.edit_playback_only(true);
+        old.toggle_app(&selected, &egui::Context::default());
+        std::fs::create_dir(fixture.path().with_extension("pending")).unwrap();
+        old.persist_changed_state(&mut eframe::Frame::_new_kittest());
+        assert!(old.storage_error.is_some());
+        let mut pending = old.unread_explicit_edits.clone();
+        drop(old);
+        for limit in [180, 120] {
+            let mut recreated = app();
+            let mut store = crate::persistence::StateStore::new(fixture.path());
+            assert!(store.load_and_migrate::<SavedState>().is_err());
+            recreated.state_store = Some(store);
+            recreated.resume_activity_edits(pending);
+            recreated.edit_daily_limit(limit);
+            recreated.toggle_app(&selected, &egui::Context::default());
+            recreated.persist_changed_state(&mut eframe::Frame::_new_kittest());
+            pending = recreated.unread_explicit_edits.clone();
+        }
+        std::fs::remove_dir(fixture.path().with_extension("pending")).unwrap();
+        let mut restored = app();
+        let mut store = crate::persistence::StateStore::new(fixture.path());
+        restored.restore_saved_state(store.load_and_migrate().unwrap().unwrap());
+        restored.state_store = Some(store);
+        restored.resume_activity_edits(pending);
+        assert_eq!(restored.saved.daily_limit_minutes, 120);
+        assert_eq!(restored.saved.break_minutes, 45);
+        assert!(restored.saved.playback_only);
+        assert!(restored.saved.target_apps.is_empty());
+        restored.persist_changed_state(&mut eframe::Frame::_new_kittest());
+        assert!(restored.unread_explicit_edits.is_empty());
+        let mut restart = crate::persistence::StateStore::new(fixture.path());
+        assert_eq!(
+            restart.load_and_migrate::<SavedState>().unwrap().unwrap(),
+            restored.saved
+        );
     }
 
     #[test]

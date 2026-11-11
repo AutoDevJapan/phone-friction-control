@@ -11,6 +11,86 @@ use crate::app::{PlatformEvent, UsageSnapshot};
 
 const OWN_PACKAGE: &str = "com.autodevjapan.phonefrictioncontrol";
 
+pub(crate) fn activity_task_id(app: &AndroidApp) -> Result<i32, String> {
+    with_activity(app, |env, activity| {
+        env.call_method(activity, "getTaskId", "()I", &[])?.i()
+    })
+}
+
+pub(crate) fn reuse_ui_task_and_retire_duplicate(app: &AndroidApp, owner: i32) {
+    let callback_app = app.clone();
+    app.run_on_java_main_thread(Box::new(move || {
+        let result = with_activity(&callback_app, |env, activity| {
+            let manager = get_system_service(env, activity, "activity")?;
+            let tasks = env
+                .call_method(&manager, "getAppTasks", "()Ljava/util/List;", &[])?
+                .l()?;
+            let count = env.call_method(&tasks, "size", "()I", &[])?.i()?;
+            let mut found = false;
+            for index in 0..count {
+                let task = env
+                    .call_method(
+                        &tasks,
+                        "get",
+                        "(I)Ljava/lang/Object;",
+                        &[JValue::Int(index)],
+                    )?
+                    .l()?;
+                let info = env
+                    .call_method(
+                        &task,
+                        "getTaskInfo",
+                        "()Landroid/app/ActivityManager$RecentTaskInfo;",
+                        &[],
+                    )?
+                    .l()?;
+                // RecentTaskInfo.id exists throughout the supported API range.
+                if env.get_field(&info, "id", "I")?.i()? == owner {
+                    env.call_method(&task, "moveToFront", "()V", &[])?;
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Err(jni::errors::Error::NullPtr("Owning UI task"));
+            }
+            let duplicate = env.call_method(activity, "getTaskId", "()I", &[])?.i()?;
+            env.call_method(
+                activity,
+                if duplicate == owner {
+                    "finish"
+                } else {
+                    "finishAndRemoveTask"
+                },
+                "()V",
+                &[],
+            )?;
+            eprintln!("Reused native UI task={owner}; retiring duplicate task={duplicate}");
+            Ok(())
+        });
+        if let Err(error) = result {
+            eprintln!("既存の画面へ戻せません: {error}");
+            let _ = with_activity(&callback_app, |env, activity| {
+                env.call_method(activity, "finish", "()V", &[])?;
+                Ok(())
+            });
+        }
+    }));
+    // NativeActivity callbacks wait for this thread. Drain their lifecycle until
+    // Destroy so retiring the duplicate cannot block Android's main thread.
+    let mut destroyed = false;
+    while !destroyed {
+        app.poll_events(None, |event| {
+            if matches!(
+                event,
+                android_activity::PollEvent::Main(android_activity::MainEvent::Destroy)
+            ) {
+                destroyed = true;
+            }
+        });
+    }
+}
+
 pub fn request_insets(app: AndroidApp, events: Sender<PlatformEvent>, repaint: Context) {
     let callback_app = app.clone();
     app.run_on_java_main_thread(Box::new(move || {
