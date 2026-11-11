@@ -2,13 +2,13 @@
 
 ## 最新の受入範囲
 
-iOS 18.5のarm64 Simulatorで、Rustからの所有付き `Binding<Bool>` 操作と、PR19時点の製品ソース（`ebb79b4`）による既存プレビュー画面の起動・設定保存・プロセス再起動後の復元を確認しました。製品ソース `e594c97` では、追加したRuntime入口の実起動・画面での設定変更・実data containerへの保存・新しいプロセスでの復元も確認しました。PR21後のPreview保存先（`preview-usage-state.ron`）での再起動復元は未確認です。実アプリの選択・利用時間の計測・製品のScreen Time許可・監視・遮蔽・SwiftUI所有者の完全排出・正式配布は未達です。以下のSDK18.5の結果を、後半に残したSDK17.5の履歴と混ぜません。
+iOS 18.5のarm64 Simulatorで、Rustからの所有付き `Binding<Bool>` 操作と、PR19時点の製品ソース（`ebb79b4`）による既存プレビュー画面の起動・設定保存・プロセス再起動後の復元を確認しました。Runtime入口は、先行ソース `e594c97` と、共有保存修復を取り込んだ製品ソース `3d6e7a9` で、実起動・画面での設定変更・実data containerへの保存・新しいプロセスでの復元を確認しました。PR21後のPreview保存先（`preview-usage-state.ron`）での再起動復元は未確認です。実アプリの選択・利用時間の計測・製品のScreen Time許可・監視・遮蔽・SwiftUI所有者の完全排出・正式配布は未達です。以下のSDK18.5の結果を、後半に残したSDK17.5の履歴と混ぜません。
 
 ### 製品のiOS入口
 
 既存の `phone-friction-control-preview` はPreviewモードを使い、`desktop-preview` featureで選びます。追加した `phone-friction-control-ios-runtime` は `ios-runtime` featureで選び、既存の `ControlApp::new` によりRuntimeモードを構築します。既定の入口を置き換える変更ではありません。両入口はiOS用の同じMetal limit修正を使います。
 
-Runtimeの保存先は `Documents/usage-state.ron`、Previewは `Documents/preview-usage-state.ron` です。Runtime入口の実factoryを使うホスト試験2件で、通常の日付・設定・当日記録の保持と、既知のPreviewセッションだけの除去を確認しました。共有lib全75試験にこの2件を含みます。Windowsからの `aarch64-apple-ios-sim` 向けlib・Runtime binaryの型検査も成功しました。
+Runtimeの保存先は `Documents/usage-state.ron`、Previewは `Documents/preview-usage-state.ron` です。Runtime入口の実factoryを使うホスト試験2件で、通常の日付・設定・当日記録の保持と、既知のPreviewセッションだけの除去を確認しました。先行ソース `e594c97` の共有lib全75試験にこの2件を含みます。Windowsからの `aarch64-apple-ios-sim` 向けlib・Runtime binaryの型検査も成功しました。
 
 ビルド指定と必要環境は[READMEのiOS入口](../README.md#iosの検査用入口)を参照してください。
 
@@ -26,6 +26,21 @@ XCTest内のPID13198→13607の再起動と、さらに通常起動したPID1491
 これはRuntimeの表示・設定保存・プロセス再起動復元の受入です。実利用時間を取得した結果ではなく、物理iOS端末・Family Controls配布許可・正式配布を検証した結果でもありません。
 
 この入口は製品のScreen Time許可・選択・計測・監視・遮蔽へ未接続です。既存UIのAndroid専用説明・操作も残っています。検査ホストでのカテゴリsetterやBinding所有の結果を、製品への接続成功に数えません。Device Activity／Managed Settingsの拡張の構成・署名・起動・実制御も残作業です。
+
+### 共有保存修復を取り込んだRuntimeの受入
+
+共有main `8af1adf` を取り込んだ製品ソース `3d6e7a9278e7dcf43758588745953b5e1a1ed268` を、[実行43022656179](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/43022656179)で確認しました。Rust1.97.1・Xcode16.4・iOS18.5 SDKで `--locked` ビルドし、製品への追加パッチ・診断loggerは適用していません。検証用bundle IDを持つ同じad hoc署名済みアプリを、途中の再ビルドなしで使いました。
+
+| 対象 | SHA-256 |
+| --- | --- |
+| Runtime実行バイナリ | `171ab8a2b97eb88e4de8872b4ccfc0c7a85ab3a384b7bcafa730b04f5c3976e2` |
+| 実効Cargo.lock | `ce89b963e268a1dd2b724be1c1a04d54a58864ed1c8db31d05788301c680b661` |
+
+初回の通常起動PID6888は20秒後も生存し、原画像に「2時間」を確認しました。public XCTestで設定を120分から300分へ変更し、アプリ自身が作成した `Documents/usage-state.ron` の値を確認しました。XCTest内のPID11162→11530と、その後の通常起動PID13213を区別して記録しています。最後のPIDも20秒後に生存し、XCTestの再起動画像と通常起動画像はいずれも「5時間」でした。
+
+変更後・再起動後・cleanup時の保存ファイルはbyte単位で一致し、SHA-256は `ddf76c957cbb79c6d73c55b684a68a8d9e593e6f6ca07eb8229d598dab30d216` でした。外部から保存値を書き換えておらず、Preview用保存ファイルも作成されていません。通常起動2回のstdout/stderrに対象のエラーはなく、テスト1件が成功し、アプリ終了・Simulator shutdown・削除は各status0でした。
+
+この結果は通常の設定変更と保存・別プロセス復元の受入です。読取りエラー中の編集をiOS画面へ注入した試験ではありません。画面の利用時間は「取得できません」で、実アプリ選択・token保存・監視・遮蔽・SwiftUI所有者の完全排出・物理端末・正式配布は未確認です。この実行ではSDK検査jobもスキップされています。
 
 ### 所有付きBindingの実呼出し
 
