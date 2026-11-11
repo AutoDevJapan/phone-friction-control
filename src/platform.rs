@@ -44,8 +44,11 @@ pub(crate) fn reuse_ui_task_and_retire_duplicate(app: &AndroidApp, owner: i32) {
                         &[],
                     )?
                     .l()?;
-                // RecentTaskInfo.id exists throughout the supported API range.
-                if env.get_field(&info, "id", "I")?.i()? == owner {
+                // id becomes -1 while a task is not running. persistentId is
+                // the true task identity even while Back has backgrounded it.
+                let task_id = env.get_field(&info, "persistentId", "I")?.i()?;
+                eprintln!("Native UI task candidate={task_id}, owner={owner}");
+                if task_id == owner {
                     env.call_method(&task, "moveToFront", "()V", &[])?;
                     found = true;
                     break;
