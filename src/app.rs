@@ -601,6 +601,16 @@ impl ControlApp {
         }
     }
 
+    #[cfg(any(target_os = "android", test))]
+    fn accept_calendar_day(&mut self, day: &str) {
+        if !day.is_empty() && self.saved.current_day_key != day {
+            self.saved.retain_current_day(day);
+            self.usage_by_package_ms.clear();
+            self.measurement_available = false;
+            self.last_refresh = Instant::now() - Duration::from_secs(120);
+        }
+    }
+
     fn begin_break(&mut self, now_ms: i64, day_key: String) {
         self.saved.limit_triggered_day = Some(day_key.clone());
         if self
@@ -1648,7 +1658,7 @@ impl eframe::App for ControlApp {
         if let Some(app) = &self.android_app
             && let Ok(day) = crate::platform::current_day(app)
         {
-            self.saved.retain_current_day(&day);
+            self.accept_calendar_day(&day);
         }
     }
 
@@ -2375,6 +2385,23 @@ mod tests {
         assert!(model.saved.target_apps.is_empty());
         assert!(model.saved.daily_records.is_empty());
         assert_eq!(model.saved.cooldown_until_ms, Some(9_000_000));
+        assert_eq!(
+            model.saved.last_limit_triggered_day.as_deref(),
+            Some("2026-10-01")
+        );
+    }
+
+    #[test]
+    fn calendar_rollover_does_not_credit_yesterdays_in_memory_usage_to_today() {
+        let mut model = app();
+        model.apply_usage_snapshot(snapshot(1, 44));
+        model.saved.daily_limit_minutes = 30;
+        model.saved.last_limit_triggered_day = Some("2026-10-01".into());
+        model.accept_calendar_day("2026-10-02");
+        assert!(!model.measurement_available);
+        assert_eq!(model.today_usage_ms(), 0);
+        model.open_target_app(model.saved.target_apps[0].clone(), egui::Context::default());
+        assert_eq!(model.saved.cooldown_until_ms, None);
         assert_eq!(
             model.saved.last_limit_triggered_day.as_deref(),
             Some("2026-10-01")
