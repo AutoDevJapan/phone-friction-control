@@ -26,14 +26,18 @@ fn read<T: serde::de::DeserializeOwned>(path: PathBuf) -> io::Result<Option<T>> 
     StateStore::new(path).load()
 }
 
-fn put<T: serde::Serialize>(path: PathBuf, value: &T) -> io::Result<()> {
-    let canonical = ron::to_string(value).map_err(io::Error::other)?;
+fn put<T: serde::Serialize + serde::de::DeserializeOwned + PartialEq>(
+    path: PathBuf,
+    value: &T,
+) -> io::Result<()> {
     match std::fs::read_to_string(&path) {
-        Ok(old) if old == canonical => match std::fs::remove_file(path.with_extension("pending")) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        },
+        Ok(old) if ron::from_str::<T>(&old).is_ok_and(|old| old == *value) => {
+            match std::fs::remove_file(path.with_extension("pending")) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
+            }
+        }
         Ok(_) => crate::persistence::write_atomic(&path, value),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             crate::persistence::write_atomic(&path, value)
@@ -663,6 +667,24 @@ mod tests {
                 .unwrap()
                 .contains("daily_records:[]")
         );
+    }
+
+    #[test]
+    fn equivalent_map_order_is_not_a_new_checkpoint_write() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("unordered.ron");
+        let map =
+            std::collections::HashMap::<String, u64>::from([("a".into(), 1), ("b".into(), 2)]);
+        let canonical = ron::to_string(&map).unwrap();
+        let old = if canonical.starts_with("{\"a\"") {
+            "{\"b\":2,\"a\":1}"
+        } else {
+            "{\"a\":1,\"b\":2}"
+        };
+        assert_ne!(old, canonical);
+        std::fs::write(&path, old).unwrap();
+        put(path.clone(), &map).unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), old);
     }
 
     #[test]
