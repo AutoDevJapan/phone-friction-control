@@ -1,3 +1,5 @@
+#[cfg(any(target_os = "android", test))]
+mod android_lifecycle;
 mod app;
 #[cfg(any(target_os = "ios", all(test, not(target_os = "android"))))]
 mod ios_runtime;
@@ -60,6 +62,22 @@ pub use app::ControlApp;
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 fn android_main(android_app: android_activity::AndroidApp) {
+    static UI_OWNER: android_lifecycle::UiOwner = android_lifecycle::UiOwner::new();
+    let task = match platform::activity_task_id(&android_app) {
+        Ok(task) => task,
+        Err(error) => {
+            eprintln!("Activityの所属を取得できません: {error}");
+            return;
+        }
+    };
+    let _ui_lease = match UI_OWNER.claim(task) {
+        Ok(lease) => lease,
+        Err(owner) => {
+            platform::reuse_ui_task_and_retire_duplicate(&android_app, owner);
+            return;
+        }
+    };
+    eprintln!("Native UI owner acquired: task={task}");
     let Some(data_dir) = android_app.internal_data_path() else {
         eprintln!("端末内の保存先を取得できないため起動を中止しました");
         return;
@@ -85,6 +103,7 @@ fn android_main(android_app: android_activity::AndroidApp) {
     ) {
         eprintln!("アプリを起動できませんでした: {error}");
     }
+    eprintln!("Native UI resources released: task={task}");
 }
 
 #[cfg(not(target_os = "android"))]
