@@ -138,6 +138,14 @@ impl SavedState {
 
 #[cfg(any(target_os = "android", test))]
 impl SavedState {
+    fn retain_current_day(&mut self, day: &str) {
+        if day.is_empty() {
+            return;
+        }
+        self.current_day_key = day.to_owned();
+        self.daily_records.retain(|record| record.day_key == day);
+    }
+
     fn accept_service_break(
         &mut self,
         deadline: Option<i64>,
@@ -311,7 +319,20 @@ impl ControlApp {
         #[cfg(not(target_os = "ios"))]
         let mut storage_error = None;
         if let Some(store) = &mut state_store {
-            match store.load_and_migrate() {
+            #[cfg(target_os = "android")]
+            let restored = {
+                let day = android_app
+                    .as_ref()
+                    .and_then(|app| crate::platform::current_day(app).ok());
+                store.load_and_migrate_with(|state: &mut SavedState| {
+                    if let Some(day) = &day {
+                        state.retain_current_day(day);
+                    }
+                })
+            };
+            #[cfg(not(target_os = "android"))]
+            let restored = store.load_and_migrate();
+            match restored {
                 Ok(Some(state)) => saved = state,
                 Ok(None) => {}
                 Err(_) => storage_error = Some("記録を読み込めないため保存を止めています。元の記録を保持して、もう一度読み込みます。".to_owned()),
@@ -321,6 +342,12 @@ impl ControlApp {
         let saved = mode.prepare_saved_state(saved);
         #[cfg(target_os = "android")]
         let (events_tx, events_rx) = mpsc::channel();
+        #[cfg(target_os = "android")]
+        if let Some(app) = &android_app
+            && let Ok(day) = crate::platform::current_day(app)
+        {
+            saved.retain_current_day(&day);
+        }
         let mut app = Self {
             #[cfg(all(
                 target_os = "android",
@@ -631,6 +658,7 @@ impl ControlApp {
             && previous.break_minutes == self.saved.break_minutes
             && previous.cooldown_until_ms == self.saved.cooldown_until_ms
             && previous.limit_triggered_day == self.saved.limit_triggered_day
+            && previous.last_limit_triggered_day == self.saved.last_limit_triggered_day
             && previous.current_day_key == self.saved.current_day_key
             && previous.usage_disclosure_accepted == self.saved.usage_disclosure_accepted
             && previous.service_disclosure_accepted == self.saved.service_disclosure_accepted
@@ -650,19 +678,30 @@ impl ControlApp {
                         .android_app
                         .as_ref()
                         .and_then(|app| app.internal_data_path())
-                        && crate::persistence::write_atomic(
-                            &dir.join("guard-config.ron"),
-                            &self.saved,
-                        )
-                        .is_err()
                     {
-                        self.storage_error =
-                            Some("使用中の制限設定を保存できません。保存を再試行します。".into());
-                        return;
+                        let day = self
+                            .android_app
+                            .as_ref()
+                            .and_then(|app| crate::platform::current_day(app).ok());
+                        if crate::guard_storage::save_policy(&dir, &self.saved, day.as_deref())
+                            .is_err()
+                        {
+                            self.storage_error = Some(
+                                "使用中の制限設定を保存できません。保存を再試行します。".into(),
+                            );
+                            return;
+                        }
                     }
                     self.last_persisted = Some(self.saved.clone());
                     self.last_persist_at = Instant::now();
                     self.storage_error = None;
+                    #[cfg(target_os = "android")]
+                    if let Some(storage) = frame.storage_mut() {
+                        // The canonical state has been saved. Do not leave the pre-migration
+                        // app record in eframe's independent preferences file.
+                        storage.remove_string(SAVE_KEY);
+                        storage.flush();
+                    }
                 }
                 Err(_) => {
                     self.storage_error = Some(
@@ -849,6 +888,8 @@ impl ControlApp {
         self.saved
             .target_apps
             .sort_by_key(|app| app.label.to_lowercase());
+        // An aggregate from the previous selection is no longer this selection's total.
+        self.saved.daily_records.clear();
         self.refresh_usage(ctx.clone());
     }
 
@@ -1579,7 +1620,21 @@ impl eframe::App for ControlApp {
             && !store.is_ready()
         {
             self.last_state_reload = Instant::now();
-            if let Ok(state) = store.load_and_migrate() {
+            #[cfg(target_os = "android")]
+            let restored = {
+                let day = self
+                    .android_app
+                    .as_ref()
+                    .and_then(|app| crate::platform::current_day(app).ok());
+                store.load_and_migrate_with(|state: &mut SavedState| {
+                    if let Some(day) = &day {
+                        state.retain_current_day(day);
+                    }
+                })
+            };
+            #[cfg(not(target_os = "android"))]
+            let restored = store.load_and_migrate();
+            if let Ok(state) = restored {
                 if let Some(state) = state {
                     self.restore_saved_state(state);
                 }
@@ -1589,6 +1644,12 @@ impl eframe::App for ControlApp {
             }
         }
         self.drain_platform_events(ctx);
+        #[cfg(target_os = "android")]
+        if let Some(app) = &self.android_app
+            && let Ok(day) = crate::platform::current_day(app)
+        {
+            self.saved.retain_current_day(&day);
+        }
     }
 
     fn ui(&mut self, root_ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -1698,6 +1759,23 @@ impl eframe::App for ControlApp {
         }
         if let Some(store) = &self.state_store {
             if store.save(&self.saved).is_ok() {
+                #[cfg(target_os = "android")]
+                if let Some(dir) = self
+                    .android_app
+                    .as_ref()
+                    .and_then(|app| app.internal_data_path())
+                {
+                    let day = self
+                        .android_app
+                        .as_ref()
+                        .and_then(|app| crate::platform::current_day(app).ok());
+                    if crate::guard_storage::save_policy(&dir, &self.saved, day.as_deref()).is_err()
+                    {
+                        self.storage_error =
+                            Some("使用中の制限設定を保存できません。保存を再試行します。".into());
+                        return;
+                    }
+                }
                 self.last_persisted = Some(self.saved.clone());
                 storage.remove_string(SAVE_KEY);
             }
@@ -2265,6 +2343,42 @@ mod tests {
         app.apply_usage_snapshot(snapshot(16, 22));
         assert_eq!(app.saved.daily_records.len(), 1);
         assert_eq!(app.saved.daily_records.last().unwrap().used_ms, 22 * 60_000);
+    }
+
+    #[test]
+    fn known_calendar_without_usage_prunes_old_days_but_keeps_break_and_today_max() {
+        let mut model = app();
+        model.apply_usage_snapshot(snapshot(1, 44));
+        model.saved.cooldown_until_ms = Some(9_000_000);
+        model.saved.last_limit_triggered_day = Some("2026-10-01".into());
+        model.saved.retain_current_day("2026-10-01");
+        assert_eq!(model.saved.daily_records[0].used_ms, 44 * 60_000);
+        model.saved.retain_current_day("2026-10-02");
+        assert!(model.saved.daily_records.is_empty());
+        assert_eq!(model.saved.cooldown_until_ms, Some(9_000_000));
+        assert_eq!(
+            model.saved.last_limit_triggered_day.as_deref(),
+            Some("2026-10-01")
+        );
+    }
+
+    #[test]
+    fn changing_selection_while_permission_is_denied_removes_the_old_aggregate_only() {
+        let mut model = app();
+        model.apply_usage_snapshot(snapshot(1, 44));
+        model.permission_granted = false;
+        model.measurement_available = false;
+        model.saved.cooldown_until_ms = Some(9_000_000);
+        model.saved.last_limit_triggered_day = Some("2026-10-01".into());
+        let target = model.saved.target_apps[0].clone();
+        model.toggle_app(&target, &egui::Context::default());
+        assert!(model.saved.target_apps.is_empty());
+        assert!(model.saved.daily_records.is_empty());
+        assert_eq!(model.saved.cooldown_until_ms, Some(9_000_000));
+        assert_eq!(
+            model.saved.last_limit_triggered_day.as_deref(),
+            Some("2026-10-01")
+        );
     }
 
     #[test]

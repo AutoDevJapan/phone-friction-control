@@ -112,7 +112,7 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
     let mut config_store = crate::persistence::StateStore::new(dir.join("guard-config.ron"));
     let mut last_config: Option<SavedState> = None;
     RUNNING.store(true, Ordering::SeqCst);
-    let mut guard_store = crate::persistence::StateStore::new(dir.join("guard-state.ron"));
+    let mut guard_store = crate::guard_storage::GuardStore::new(dir.clone());
     let mut state: Option<GuardState> = None;
     let mut last_saved: Option<GuardState> = None;
     let mut selection_save_pending = false;
@@ -124,9 +124,14 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
     let mut last_interruption = Instant::now() - Duration::from_secs(10);
     let mut last_pause = Instant::now() - Duration::from_secs(10);
     while GENERATION.load(Ordering::SeqCst) == generation {
+        let current_day = crate::platform::current_day_env(&mut env).ok();
+        if current_day.is_none() {
+            let _ = env.exception_clear();
+        }
+        guard_store.set_day(current_day.clone());
         if !guard_store.is_ready() && last_load.elapsed() >= Duration::from_secs(5) {
             last_load = Instant::now();
-            match guard_store.load_and_migrate::<GuardState>() {
+            match guard_store.load() {
                 Ok(restored) => {
                     let mut restored = restored.unwrap_or_default();
                     last_saved = Some(restored.clone());
@@ -148,6 +153,11 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
             && let Some(config) = &last_config
         {
             let policy = config.policy();
+            if current_day.as_deref().is_some_and(|day| state.day != day) {
+                last_playing = None;
+                last_sample = Instant::now();
+            }
+            selection_save_pending |= state.prepare_persistence(&policy, current_day.as_deref());
             // Explicit selection changes apply even while measurement permission is absent.
             if crate::enforcement::persist_selection_prune(
                 state,
@@ -262,7 +272,6 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                                 || old.day != state.day
                         });
                         let mut storage_error = !guard_store.is_ready() || !config_store.is_ready();
-                        let mut wrote = false;
                         if crate::enforcement::guard_save_due(
                             last_saved.as_ref() != Some(state),
                             critical,
@@ -272,7 +281,6 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                                 Ok(()) => {
                                     last_saved = Some(state.clone());
                                     last_save = Instant::now();
-                                    wrote = true;
                                 }
                                 Err(_) => {
                                     storage_error = true;
@@ -311,13 +319,6 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                         if GENERATION.load(Ordering::SeqCst) == generation {
                             *LIVE_STATUS.lock().unwrap_or_else(|p| p.into_inner()) =
                                 Some(status.clone());
-                            // This is a diagnostic/recovery snapshot, not the per-second UI transport.
-                            if wrote {
-                                let _ = crate::persistence::write_atomic(
-                                    &dir.join("guard-status.ron"),
-                                    &status,
-                                );
-                            }
                         }
                         Ok(Some(status))
                     });

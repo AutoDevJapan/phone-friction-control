@@ -26,6 +26,8 @@ pub extern "C" fn phone_control_ads_production() -> u32 {
 }
 #[cfg(any(target_os = "android", test))]
 mod enforcement;
+#[cfg(any(target_os = "android", test))]
+mod guard_storage;
 mod persistence;
 #[cfg(any(target_os = "android", test))]
 mod usage;

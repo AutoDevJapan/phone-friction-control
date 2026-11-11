@@ -91,7 +91,7 @@ pub(crate) fn persist_selection_prune(
     state: &mut GuardState,
     policy: &Policy,
     pending: &mut bool,
-    store: &crate::persistence::StateStore,
+    store: &crate::guard_storage::GuardStore,
 ) -> bool {
     *pending |= state.retain_selected(policy);
     if *pending && store.is_ready() && store.save(state).is_ok() {
@@ -107,6 +107,17 @@ pub(crate) fn guard_save_due(changed: bool, critical: bool, elapsed: std::time::
 }
 
 impl GuardState {
+    pub fn prepare_persistence(&mut self, policy: &Policy, current_day: Option<&str>) -> bool {
+        let before = self.clone();
+        if let Some(day) = current_day.filter(|day| !day.is_empty())
+            && self.day != day
+        {
+            self.sample_usage(day, self.boot.unwrap_or(-1), &HashMap::new());
+        }
+        self.retain_selected(policy);
+        *self != before
+    }
+
     /// This worker has not saved while reads failed. Its playback observations
     /// are newer than the recovered file; cumulative OS usage still overlaps.
     pub fn merge_unpersisted(&mut self, mut memory: Self) {
@@ -397,7 +408,7 @@ mod tests {
     }
     #[test]
     fn failed_selection_prune_save_retries_until_success_and_keeps_current_data() {
-        use crate::persistence::StateStore;
+        use crate::guard_storage::GuardStore;
         use std::time::Duration;
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         struct TempDir(std::path::PathBuf);
@@ -419,8 +430,15 @@ mod tests {
         old.usage_ms.insert("mail".into(), 99);
         old.cooldown_until_ms = Some(123_456);
         std::fs::write(&path, ron::to_string(&old).unwrap()).unwrap();
-        let mut store = StateStore::new(path.clone());
-        let mut state = store.load::<GuardState>().unwrap().unwrap();
+        let mut config = crate::app::SavedState::default();
+        config.target_apps.push(crate::app::TrackedApp {
+            package: "video".into(),
+            label: "Video".into(),
+        });
+        crate::persistence::write_atomic(&dir.join("guard-config.ron"), &config).unwrap();
+        let mut store = GuardStore::new(dir.clone());
+        let mut state = store.load().unwrap().unwrap();
+        state.usage_ms.insert("mail".into(), 99);
         std::fs::create_dir(path.with_extension("pending")).unwrap();
         let mut pending = false;
         assert!(!persist_selection_prune(
@@ -477,6 +495,24 @@ mod tests {
         assert!(
             state.usage_ms.is_empty() && state.playback_ms.is_empty() && state.raw_ms.is_empty()
         );
+    }
+
+    #[test]
+    fn a_known_new_day_without_measurements_does_not_persist_yesterdays_metrics() {
+        let mut state = GuardState::default();
+        sample(&mut state, "2026-11-10", 1, 61_000);
+        state.enforce(&policy(), 1000);
+        let deadline = state.cooldown_until_ms;
+        // The calendar is available even when Usage access is denied or the screen is locked.
+        state.prepare_persistence(&policy(), Some("2026-11-11"));
+        let disk = ron::to_string(&state).unwrap();
+        let restored: GuardState = ron::from_str(&disk).unwrap();
+        assert!(
+            restored.usage_ms.is_empty(),
+            "old-day usage still persisted without a measurement"
+        );
+        assert_eq!(restored.cooldown_until_ms, deadline);
+        assert_eq!(restored.last_triggered_day.as_deref(), Some("2026-11-10"));
     }
 
     #[test]

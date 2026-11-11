@@ -21,12 +21,21 @@ impl StateStore {
         result
     }
 
+    #[cfg(any(not(target_os = "android"), test))]
     pub fn load_and_migrate<T: serde::de::DeserializeOwned + serde::Serialize>(
         &mut self,
     ) -> io::Result<Option<T>> {
+        self.load_and_migrate_with(|_| {})
+    }
+
+    pub(crate) fn load_and_migrate_with<T: serde::de::DeserializeOwned + serde::Serialize>(
+        &mut self,
+        update: impl FnOnce(&mut T),
+    ) -> io::Result<Option<T>> {
         self.ready = false;
-        let result = load(&self.path);
-        if let Ok(Some(value)) = &result {
+        let mut result = load(&self.path);
+        if let Ok(Some(value)) = &mut result {
+            update(value);
             let canonical = ron::to_string(value).map_err(io::Error::other)?;
             if fs::read_to_string(&self.path)? != canonical {
                 save(&self.path, value)?;
@@ -63,7 +72,7 @@ fn save<T: serde::Serialize>(path: &Path, state: &T) -> io::Result<()> {
     replace_with(path, |file| file.write_all(text.as_bytes()))
 }
 
-#[cfg(any(target_os = "android", target_os = "ios"))]
+#[cfg(any(target_os = "android", target_os = "ios", test))]
 pub(crate) fn write_atomic<T: serde::Serialize>(path: &Path, state: &T) -> io::Result<()> {
     save(path, state)
 }

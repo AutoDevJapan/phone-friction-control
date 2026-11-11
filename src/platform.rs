@@ -341,6 +341,34 @@ fn query_selected_usage(
     })
 }
 
+pub(crate) fn current_day(app: &AndroidApp) -> Result<String, String> {
+    with_activity(app, |env, _| current_day_env(env))
+}
+
+pub(crate) fn current_day_env(env: &mut jni::JNIEnv<'_>) -> jni::errors::Result<String> {
+    env.with_local_frame(8, |env| {
+        let calendar = env
+            .call_static_method(
+                "java/util/Calendar",
+                "getInstance",
+                "()Ljava/util/Calendar;",
+                &[],
+            )?
+            .l()?;
+        let year = env
+            .call_method(&calendar, "get", "(I)I", &[JValue::Int(1)])?
+            .i()?;
+        let month = env
+            .call_method(&calendar, "get", "(I)I", &[JValue::Int(2)])?
+            .i()?
+            + 1;
+        let day = env
+            .call_method(&calendar, "get", "(I)I", &[JValue::Int(5)])?
+            .i()?;
+        Ok(format!("{year:04}-{month:02}-{day:02}"))
+    })
+}
+
 pub(crate) fn query_selected_usage_env(
     env: &mut jni::JNIEnv<'_>,
     activity: &JObject<'_>,
