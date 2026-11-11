@@ -53,6 +53,18 @@ impl StateStore {
         self.ready
     }
 
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn directory(&self) -> io::Result<&Path> {
+        self.path
+            .parent()
+            .ok_or_else(|| io::Error::other("Missing state directory"))
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn invalidate(&mut self) {
+        self.ready = false;
+    }
+
     pub fn save<T: serde::Serialize>(&self, state: &T) -> io::Result<()> {
         if !self.ready {
             return Err(io::Error::other("State has not been read successfully"));

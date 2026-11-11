@@ -111,6 +111,47 @@ pub(crate) fn guard_save_due(changed: bool, critical: bool, elapsed: std::time::
     changed && (critical || elapsed >= std::time::Duration::from_secs(10))
 }
 
+/// A triggered day with no deadline records completion, not a missing measurement.
+/// Keep that evidence when merging stale copies, including after a clock rollback.
+pub(crate) struct BreakState {
+    pub deadline: Option<i64>,
+    pub triggered_day: Option<String>,
+    pub last_triggered_day: Option<String>,
+}
+
+impl BreakState {
+    pub fn merge(&mut self, mut other: Self, now: i64) {
+        self.deadline = self.deadline.filter(|until| *until > now);
+        other.deadline = other.deadline.filter(|until| *until > now);
+        let marker = |value: &Self| {
+            value
+                .last_triggered_day
+                .clone()
+                .max(value.triggered_day.clone())
+        };
+        let completed = [self as &Self, &other]
+            .into_iter()
+            .filter(|value| value.deadline.is_none())
+            .filter_map(marker)
+            .max();
+        let latest = marker(self).max(marker(&other));
+        let active = |value: &Self| {
+            let day = marker(value);
+            value.deadline.filter(|_| {
+                (day.is_none() || day == latest)
+                    && day
+                        .as_ref()
+                        .zip(completed.as_ref())
+                        .is_none_or(|(day, done)| day > done)
+            })
+        };
+        let deadline = active(self).max(active(&other));
+        self.last_triggered_day = marker(self).max(marker(&other));
+        self.triggered_day = self.triggered_day.clone().max(other.triggered_day);
+        self.deadline = deadline;
+    }
+}
+
 impl GuardState {
     pub(crate) fn stored_matches(&self, current: &Self) -> bool {
         if !self.history.is_empty() {
@@ -121,7 +162,7 @@ impl GuardState {
         *self == projection
     }
 
-    pub(crate) fn merge_checkpoint(&mut self, other: &Self) {
+    pub(crate) fn merge_checkpoint(&mut self, other: &Self, now: i64) {
         if self.day == other.day {
             for (to, from) in [
                 (&mut self.usage_ms, &other.usage_ms),
@@ -142,12 +183,37 @@ impl GuardState {
                 self.raw_ms = other.raw_ms.clone();
             }
         }
-        self.cooldown_until_ms = self.cooldown_until_ms.max(other.cooldown_until_ms);
-        self.triggered_day = self.triggered_day.clone().max(other.triggered_day.clone());
-        self.last_triggered_day = self
-            .last_triggered_day
-            .clone()
-            .max(other.last_triggered_day.clone());
+        self.merge_break(
+            other.cooldown_until_ms,
+            other.triggered_day.clone(),
+            other.last_triggered_day.clone(),
+            now,
+        );
+    }
+
+    fn merge_break(
+        &mut self,
+        deadline: Option<i64>,
+        triggered_day: Option<String>,
+        last_triggered_day: Option<String>,
+        now: i64,
+    ) {
+        let mut current = BreakState {
+            deadline: self.cooldown_until_ms,
+            triggered_day: self.triggered_day.clone(),
+            last_triggered_day: self.last_triggered_day.clone(),
+        };
+        current.merge(
+            BreakState {
+                deadline,
+                triggered_day,
+                last_triggered_day,
+            },
+            now,
+        );
+        self.cooldown_until_ms = current.deadline;
+        self.triggered_day = current.triggered_day;
+        self.last_triggered_day = current.last_triggered_day;
     }
 
     pub fn prepare_persistence(&mut self, policy: &Policy, current_day: Option<&str>) -> bool {
@@ -163,8 +229,18 @@ impl GuardState {
 
     /// This worker has not saved while reads failed. Its playback observations
     /// are newer than the recovered file; cumulative OS usage still overlaps.
-    pub fn merge_unpersisted(&mut self, mut memory: Self) {
-        let until = self.cooldown_until_ms.max(memory.cooldown_until_ms);
+    pub fn merge_unpersisted(&mut self, mut memory: Self, now: i64) {
+        self.merge_break(
+            memory.cooldown_until_ms,
+            memory.triggered_day.clone(),
+            memory.last_triggered_day.clone(),
+            now,
+        );
+        let merged_break = BreakState {
+            deadline: self.cooldown_until_ms,
+            triggered_day: self.triggered_day.clone(),
+            last_triggered_day: self.last_triggered_day.clone(),
+        };
         memory.history.push(DayLedger {
             day: memory.day,
             usage_ms: memory.usage_ms,
@@ -190,17 +266,28 @@ impl GuardState {
                 self.triggered_day = record.triggered_day;
             }
         }
-        self.cooldown_until_ms = until;
+        self.cooldown_until_ms = merged_break.deadline;
+        self.triggered_day = merged_break.triggered_day;
+        self.last_triggered_day = merged_break.last_triggered_day;
     }
 
-    pub fn import_break(&mut self, until: Option<i64>, day: &Option<String>, now: i64) {
-        if self.triggered_day.is_none() && day.as_deref() == Some(self.day.as_str()) {
-            self.triggered_day = day.clone();
-        }
-        if self.cooldown_until_ms.is_none() && until.is_some_and(|until| until > now) {
-            self.cooldown_until_ms = until;
-            self.triggered_day = day.clone();
-        }
+    pub fn import_break(
+        &mut self,
+        until: Option<i64>,
+        day: &Option<String>,
+        last_day: &Option<String>,
+        now: i64,
+    ) {
+        // An imported duplicate of the current live break must not extend its deadline.
+        let until = if self.triggered_day == *day
+            && self.cooldown_until_ms.is_some_and(|until| until > now)
+            && until.is_some_and(|until| until > now)
+        {
+            self.cooldown_until_ms
+        } else {
+            until
+        };
+        self.merge_break(until, day.clone(), last_day.clone(), now);
     }
 
     pub fn observe_playback(
@@ -347,10 +434,49 @@ mod tests {
     fn a_completed_break_in_config_survives_missing_service_history() {
         let mut memory = GuardState::default();
         sample(&mut memory, "day1", 1, 65_000);
-        memory.import_break(None, &Some("day1".into()), 100);
+        memory.import_break(None, &Some("day1".into()), &None, 100);
         memory.enforce(&policy(), 100);
         assert_eq!(memory.cooldown_until_ms, None);
         assert_eq!(memory.triggered_day.as_deref(), Some("day1"));
+    }
+
+    #[test]
+    fn completed_break_dominates_stale_deadlines_but_not_a_later_days_active_break() {
+        let record = |deadline, day: &str| BreakState {
+            deadline,
+            triggered_day: Some(day.into()),
+            last_triggered_day: Some(day.into()),
+        };
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let mut result = record(Some(5000), "day1");
+            for index in order {
+                let next = match index {
+                    0 => record(Some(5000), "day1"),
+                    1 => record(None, "day1"),
+                    _ => record(Some(3000), "day2"),
+                };
+                result.merge(next, 1000);
+            }
+            assert_eq!(result.deadline, Some(3000));
+            assert_eq!(result.last_triggered_day.as_deref(), Some("day2"));
+        }
+        let mut live = record(Some(5000), "day1");
+        live.merge(record(None, "day0"), 1000);
+        assert_eq!(
+            live.deadline,
+            Some(5000),
+            "midnight must not shorten an active break"
+        );
+        live.merge(record(None, "day1"), 1000);
+        live.merge(record(Some(5000), "day1"), 500);
+        assert_eq!(live.deadline, None);
     }
 
     #[test]
@@ -364,7 +490,7 @@ mod tests {
         memory.playback_ms.insert("video".into(), 3_000);
         memory.cooldown_until_ms = Some(100_000);
         memory.triggered_day = Some("day1".into());
-        recovered.merge_unpersisted(memory);
+        recovered.merge_unpersisted(memory, 1000);
         assert_eq!(recovered.usage_ms["video"], 5_000);
         assert_eq!(recovered.playback_ms["video"], 5_000);
         assert_eq!(recovered.cooldown_until_ms, Some(200_000));
@@ -419,11 +545,11 @@ mod tests {
     #[test]
     fn importing_launcher_break_never_replaces_an_existing_deadline() {
         let mut state = GuardState::default();
-        state.import_break(Some(1000), &Some("day1".into()), 100);
-        state.import_break(Some(5000), &Some("day1".into()), 100);
+        state.import_break(Some(1000), &Some("day1".into()), &None, 100);
+        state.import_break(Some(5000), &Some("day1".into()), &None, 100);
         assert_eq!(state.cooldown_until_ms, Some(1000));
         let mut empty = GuardState::default();
-        empty.import_break(Some(1000), &None, 1000);
+        empty.import_break(Some(1000), &None, &None, 1000);
         assert_eq!(empty.cooldown_until_ms, None);
     }
 

@@ -60,11 +60,12 @@ fn put<T: Stored>(path: PathBuf, value: &T) -> io::Result<()> {
 fn normalize_guard(state: &mut GuardState, config: &SavedState, day: &str, now: i64) {
     state.prepare_persistence(&config.policy(), Some(day));
     state.cooldown_until_ms = state.cooldown_until_ms.filter(|until| *until > now);
-    state.last_triggered_day = state
-        .last_triggered_day
-        .clone()
-        .max(config.last_limit_triggered_day.clone());
-    state.import_break(config.cooldown_until_ms, &config.limit_triggered_day, now);
+    state.import_break(
+        config.cooldown_until_ms,
+        &config.limit_triggered_day,
+        &config.last_limit_triggered_day,
+        now,
+    );
 }
 
 pub(crate) struct GuardStore {
@@ -93,8 +94,11 @@ impl GuardStore {
     ) -> io::Result<Option<GuardState>> {
         self.state = StateStore::new(self.dir.join("guard-state.ron"));
         transaction(calendar, |day, now| {
-            let config = read::<SavedState>(self.dir.join("guard-config.ron"))?
+            let mut config = read::<SavedState>(self.dir.join("guard-config.ron"))?
                 .ok_or_else(|| io::Error::other("Guard policy unavailable"))?;
+            if let Some(usage) = read::<SavedState>(self.dir.join("usage-state.ron"))? {
+                config.merge_persisted(&usage, day, now);
+            }
             // Complete fallible legacy cleanup before StateStore can become ready.
             remove_legacy_status(&self.dir)?;
             let result = self.state.load_and_migrate_with(|state: &mut GuardState| {
@@ -122,15 +126,18 @@ impl GuardStore {
             if !self.state.is_ready() {
                 return Err(io::Error::other("Guard state has not been read"));
             }
-            let config = read::<SavedState>(self.dir.join("guard-config.ron"))?
+            let mut config = read::<SavedState>(self.dir.join("guard-config.ron"))?
                 .ok_or_else(|| io::Error::other("Guard policy unavailable"))?;
+            if let Some(usage) = read::<SavedState>(self.dir.join("usage-state.ron"))? {
+                config.merge_persisted(&usage, day, now);
+            }
             let disk = read::<GuardState>(self.dir.join("guard-state.ron"))?;
             after_read();
             let mut current = state.clone();
             normalize_guard(&mut current, &config, day, now);
             if let Some(mut disk) = disk {
                 normalize_guard(&mut disk, &config, day, now);
-                current.merge_checkpoint(&disk);
+                current.merge_checkpoint(&disk, now);
             }
             current.cooldown_until_ms = current.cooldown_until_ms.filter(|until| *until > now);
             put(self.dir.join("guard-state.ron"), &current)?;
@@ -168,8 +175,21 @@ pub(crate) fn load_usage_transaction(
     store: &mut StateStore,
     calendar: impl FnOnce() -> io::Result<Calendar>,
 ) -> io::Result<Option<SavedState>> {
-    transaction(calendar, |day, _| {
-        store.load_and_migrate_with(|state: &mut SavedState| state.retain_current_day(day))
+    store.invalidate();
+    transaction(calendar, |day, now| {
+        let dir = store.directory()?;
+        let config = read::<SavedState>(dir.join("guard-config.ron"))?;
+        let guard = read::<GuardState>(dir.join("guard-state.ron"))?;
+        store.load_and_migrate_with(|state: &mut SavedState| {
+            state.retain_current_day(day);
+            state.cooldown_until_ms = state.cooldown_until_ms.filter(|until| *until > now);
+            if let Some(config) = config {
+                state.merge_persisted(&config, day, now);
+            }
+            if let Some(guard) = guard {
+                state.merge_guard(&guard, now);
+            }
+        })
     })
 }
 
@@ -217,17 +237,29 @@ pub(crate) fn sync_calendar_transaction(
         let usage = read::<SavedState>(dir.join("usage-state.ron"))?;
         let config = read::<SavedState>(dir.join("guard-config.ron"))?;
         let guard = read::<GuardState>(dir.join("guard-state.ron"))?;
+        let mut merged = config.clone().or_else(|| usage.clone());
+        if let Some(merged) = &mut merged {
+            for saved in [usage.as_ref(), config.as_ref()].into_iter().flatten() {
+                merged.merge_persisted(saved, day, now);
+            }
+            if let Some(guard) = &guard {
+                merged.merge_guard(guard, now);
+            }
+        }
         for (name, value) in [
             ("usage-state.ron", usage),
             ("guard-config.ron", config.clone()),
         ] {
             if let Some(mut value) = value {
                 value.retain_current_day(day);
+                if let Some(merged) = &merged {
+                    value.merge_persisted(merged, day, now);
+                }
                 value.cooldown_until_ms = value.cooldown_until_ms.filter(|until| *until > now);
                 put(dir.join(name), &value)?;
             }
         }
-        if let (Some(mut state), Some(config)) = (guard, config) {
+        if let (Some(mut state), Some(config)) = (guard, merged) {
             normalize_guard(&mut state, &config, day, now);
             put(dir.join("guard-state.ron"), &state)?;
         }
@@ -797,6 +829,166 @@ mod tests {
             .unwrap();
         assert_eq!(fixture.state().playback_ms["video"], 99);
         assert_eq!(fixture.state().cooldown_until_ms, None);
+    }
+
+    #[test]
+    fn expired_break_partial_save_cannot_revive_on_rollback_and_restart() {
+        let fixture = Fixture::new();
+        seed(&fixture);
+        let mut initial = dated_config();
+        initial.limit_triggered_day = Some("2026-11-11".into());
+        save_policy(&fixture.0, &initial, Some("2026-11-11")).unwrap();
+        let mut ui = StateStore::new(fixture.0.join("usage-state.ron"));
+        let mut current = load_usage(&mut ui, Some("2026-11-11")).unwrap().unwrap();
+        current.cooldown_until_ms = None;
+        let pending = fixture.0.join("guard-config.pending");
+        std::fs::create_dir(&pending).unwrap();
+        assert!(
+            save_usage_transaction(&ui, &fixture.0, &current, || Ok((
+                "2026-11-11".into(),
+                200_000
+            )))
+            .is_err()
+        );
+        let committed: SavedState = read(fixture.0.join("usage-state.ron")).unwrap().unwrap();
+        assert_eq!(committed.cooldown_until_ms, None);
+        assert_eq!(fixture.state().cooldown_until_ms, Some(123_456));
+        std::fs::remove_dir(pending).unwrap();
+        let restored = save_usage_transaction(&ui, &fixture.0, &current, || {
+            Ok(("2026-11-11".into(), 1000))
+        })
+        .unwrap();
+        assert_eq!(
+            restored.cooldown_until_ms, None,
+            "expired break returned from an old canonical copy after clock rollback"
+        );
+        let mut restarted = GuardStore::new(fixture.0.clone());
+        let state = restarted
+            .load_transaction(|| Ok(("2026-11-11".into(), 1000)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.cooldown_until_ms, None);
+        assert_eq!(state.last_triggered_day.as_deref(), Some("2026-11-11"));
+    }
+
+    #[test]
+    fn each_partial_write_and_cleanup_failure_preserves_completion_for_all_recovery_owners() {
+        for fault in [
+            "guard-config.pending",
+            "guard-state.pending",
+            "guard-status.ron",
+        ] {
+            for recover in 0..3 {
+                let fixture = Fixture::new();
+                seed(&fixture);
+                let mut initial = dated_config();
+                initial.limit_triggered_day = Some("2026-11-11".into());
+                save_policy(&fixture.0, &initial, Some("2026-11-11")).unwrap();
+                let mut ui = StateStore::new(fixture.0.join("usage-state.ron"));
+                let mut current = load_usage(&mut ui, Some("2026-11-11")).unwrap().unwrap();
+                let mut worker = GuardStore::new(fixture.0.clone());
+                let stale = worker.load().unwrap().unwrap();
+                current.cooldown_until_ms = None;
+                std::fs::create_dir(fixture.0.join(fault)).unwrap();
+                assert!(
+                    save_usage_transaction(&ui, &fixture.0, &current, || Ok((
+                        "2026-11-11".into(),
+                        200_000
+                    )))
+                    .is_err(),
+                    "{fault}"
+                );
+                let committed = std::fs::read(fixture.0.join("usage-state.ron")).unwrap();
+                std::fs::remove_dir(fixture.0.join(fault)).unwrap();
+                match recover {
+                    0 => {
+                        sync_calendar_transaction(&fixture.0, || Ok(("2026-11-11".into(), 1000)))
+                            .unwrap();
+                    }
+                    1 => {
+                        worker
+                            .save_transaction(&stale, || Ok(("2026-11-11".into(), 1000)))
+                            .unwrap();
+                    }
+                    _ => {
+                        let mut restarted = GuardStore::new(fixture.0.clone());
+                        let mut state = restarted.load().unwrap().unwrap();
+                        state.merge_unpersisted(stale, 1000);
+                        assert_eq!(state.cooldown_until_ms, None);
+                        restarted
+                            .save_transaction(&state, || Ok(("2026-11-11".into(), 1000)))
+                            .unwrap();
+                    }
+                }
+                let restored = load_usage(&mut ui, Some("2026-11-11")).unwrap().unwrap();
+                assert_eq!(
+                    restored.cooldown_until_ms, None,
+                    "{fault}, recovery {recover}"
+                );
+                assert_eq!(
+                    std::fs::read(fixture.0.join("usage-state.ron")).unwrap(),
+                    committed
+                );
+                assert_eq!(fixture.state().usage_ms["video"], 61_000);
+                assert_eq!(fixture.state().cooldown_until_ms, None);
+                assert_eq!(
+                    fixture.state().last_triggered_day.as_deref(),
+                    Some("2026-11-11")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn worker_completion_before_cleanup_failure_wins_over_stale_ui_copies_on_restart() {
+        let fixture = Fixture::new();
+        seed(&fixture);
+        let mut initial = dated_config();
+        initial.limit_triggered_day = Some("2026-11-11".into());
+        save_policy(&fixture.0, &initial, Some("2026-11-11")).unwrap();
+        let mut worker = GuardStore::new(fixture.0.clone());
+        let mut state = worker.load().unwrap().unwrap();
+        state.playback_ms.insert("video".into(), 99);
+        state.cooldown_until_ms = None;
+        std::fs::create_dir(fixture.0.join("guard-status.ron")).unwrap();
+        assert!(
+            worker
+                .save_transaction(&state, || Ok(("2026-11-11".into(), 200_000)))
+                .is_err()
+        );
+        assert_eq!(fixture.state().cooldown_until_ms, None);
+        std::fs::remove_dir(fixture.0.join("guard-status.ron")).unwrap();
+        let mut ui = StateStore::new(fixture.0.join("usage-state.ron"));
+        let restored = load_usage(&mut ui, Some("2026-11-11")).unwrap().unwrap();
+        assert_eq!(restored.cooldown_until_ms, None);
+        let saved = save_usage_transaction(&ui, &fixture.0, &initial, || {
+            Ok(("2026-11-11".into(), 1000))
+        })
+        .unwrap();
+        assert_eq!(saved.cooldown_until_ms, None);
+        assert_eq!(fixture.state().playback_ms["video"], 99);
+    }
+
+    #[test]
+    fn failed_ui_reload_of_related_state_invalidates_readiness_without_writing() {
+        let fixture = Fixture::new();
+        save_policy(&fixture.0, &config(&["video"]), Some("2026-11-11")).unwrap();
+        let mut store = StateStore::new(fixture.0.join("usage-state.ron"));
+        load_usage(&mut store, Some("2026-11-11")).unwrap();
+        let before = std::fs::read(fixture.0.join("usage-state.ron")).unwrap();
+        std::fs::write(fixture.0.join("guard-config.ron"), "(broken").unwrap();
+        assert!(load_usage(&mut store, Some("2026-11-11")).is_err());
+        assert!(!store.is_ready());
+        assert!(save_usage(&store, &fixture.0, &config(&[]), Some("2026-11-11")).is_err());
+        assert_eq!(
+            std::fs::read(fixture.0.join("usage-state.ron")).unwrap(),
+            before
+        );
+        crate::persistence::write_atomic(&fixture.0.join("guard-config.ron"), &config(&["video"]))
+            .unwrap();
+        let restored = load_usage(&mut store, Some("2026-11-11")).unwrap().unwrap();
+        assert!(store.is_ready());
+        assert_eq!(restored.target_apps[0].package, "video");
     }
 
     #[test]
