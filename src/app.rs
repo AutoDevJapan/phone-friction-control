@@ -151,6 +151,34 @@ impl SavedState {
             now,
         );
     }
+
+    pub(crate) fn restore_guard_usage(&mut self, guard: &crate::enforcement::GuardState) {
+        if self.current_day_key != guard.day {
+            return;
+        }
+        let totals = if self.playback_only {
+            &guard.playback_ms
+        } else {
+            &guard.usage_ms
+        };
+        let used_ms = self.target_apps.iter().fold(0_u64, |sum, app| {
+            sum.saturating_add(*totals.get(&app.package).unwrap_or(&0))
+        });
+        if let Some(record) = self
+            .daily_records
+            .iter_mut()
+            .find(|record| record.playback_only == self.playback_only)
+        {
+            record.used_ms = record.used_ms.max(used_ms);
+        } else if used_ms > 0 {
+            self.daily_records.push(DailyRecord {
+                day_key: self.current_day_key.clone(),
+                label: "今日".into(),
+                used_ms,
+                playback_only: self.playback_only,
+            });
+        }
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -230,15 +258,32 @@ enum Screen {
     Break,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct UnreadSettingEdits {
-    daily_limit: bool,
-    break_minutes: bool,
-    playback: bool,
-    usage_disclosure: bool,
-    service_disclosure: bool,
+    daily_limit: Option<u32>,
+    break_minutes: Option<u32>,
+    playback: Option<bool>,
+    usage_disclosure: Option<bool>,
+    service_disclosure: Option<bool>,
     targets: HashMap<String, (TrackedApp, bool)>,
 }
+
+impl UnreadSettingEdits {
+    fn is_empty(&self) -> bool {
+        self.daily_limit.is_none()
+            && self.break_minutes.is_none()
+            && self.playback.is_none()
+            && self.usage_disclosure.is_none()
+            && self.service_disclosure.is_none()
+            && self.targets.is_empty()
+    }
+}
+
+// Only explicit setting events cross an Activity recreation. Records, deadlines
+// and measurement caches always come from the canonical transaction instead.
+#[cfg(target_os = "android")]
+static ACTIVITY_EDITS: std::sync::Mutex<Option<(std::path::PathBuf, UnreadSettingEdits)>> =
+    std::sync::Mutex::new(None);
 
 pub struct ControlApp {
     #[cfg(all(
@@ -447,6 +492,23 @@ impl ControlApp {
             #[cfg(target_os = "android")]
             last_inset_refresh: Instant::now() - Duration::from_secs(120),
         };
+
+        #[cfg(target_os = "android")]
+        if let Some(dir) = app
+            .state_store
+            .as_ref()
+            .and_then(|store| store.directory().ok())
+        {
+            let handoff = ACTIVITY_EDITS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            if let Some((owner, edits)) = handoff
+                && owner == dir
+            {
+                app.resume_activity_edits(edits);
+            }
+        }
 
         #[cfg(target_os = "android")]
         {
@@ -781,26 +843,26 @@ impl ControlApp {
         #[cfg(target_os = "android")]
         let mut state = state;
         let pending_edits = std::mem::take(&mut self.unread_settings_pending);
-        let explicit = std::mem::take(&mut self.unread_explicit_edits);
+        let explicit = self.unread_explicit_edits.clone();
         if pending_edits {
             // Disk owns usage/day/break authority. Reapply only settings edited
             // while the store was unreadable, never the stale in-memory record.
-            if explicit.daily_limit {
-                state.daily_limit_minutes = self.saved.daily_limit_minutes;
+            if let Some(value) = explicit.daily_limit {
+                state.daily_limit_minutes = value;
             }
-            if explicit.break_minutes {
-                state.break_minutes = self.saved.break_minutes;
+            if let Some(value) = explicit.break_minutes {
+                state.break_minutes = value;
             }
-            if explicit.usage_disclosure {
-                state.usage_disclosure_accepted = self.saved.usage_disclosure_accepted;
+            if let Some(value) = explicit.usage_disclosure {
+                state.usage_disclosure_accepted = value;
             }
-            if explicit.service_disclosure {
-                state.service_disclosure_accepted = self.saved.service_disclosure_accepted;
+            if let Some(value) = explicit.service_disclosure {
+                state.service_disclosure_accepted = value;
             }
             let old_targets = state.target_apps.clone();
             let old_playback = state.playback_only;
-            if explicit.playback {
-                state.playback_only = self.saved.playback_only;
+            if let Some(value) = explicit.playback {
+                state.playback_only = value;
             }
             for (app, selected) in explicit.targets.values() {
                 if *selected {
@@ -849,6 +911,26 @@ impl ControlApp {
         self.last_refresh = Instant::now() - Duration::from_secs(120);
     }
 
+    #[cfg(any(target_os = "android", test))]
+    fn resume_activity_edits(&mut self, edits: UnreadSettingEdits) {
+        self.unread_settings_pending = true;
+        self.unread_explicit_edits = edits;
+        let saved = self.saved.clone();
+        if self
+            .state_store
+            .as_ref()
+            .is_some_and(|store| !store.is_ready())
+        {
+            let edits = self.unread_explicit_edits.clone();
+            self.restore_saved_state(saved);
+            // The canonical read still failed. Keep these events for its retry.
+            self.unread_settings_pending = true;
+            self.unread_explicit_edits = edits;
+        } else {
+            self.restore_saved_state(saved);
+        }
+    }
+
     fn remember_unread_settings(&mut self) {
         if self
             .state_store
@@ -861,19 +943,25 @@ impl ControlApp {
 
     fn edit_daily_limit(&mut self, value: u32) {
         self.remember_unread_settings();
-        self.unread_explicit_edits.daily_limit |= self.unread_settings_pending;
+        if self.unread_settings_pending || !self.unread_explicit_edits.is_empty() {
+            self.unread_explicit_edits.daily_limit = Some(value);
+        }
         self.saved.daily_limit_minutes = value;
     }
 
     fn edit_break_minutes(&mut self, value: u32) {
         self.remember_unread_settings();
-        self.unread_explicit_edits.break_minutes |= self.unread_settings_pending;
+        if self.unread_settings_pending || !self.unread_explicit_edits.is_empty() {
+            self.unread_explicit_edits.break_minutes = Some(value);
+        }
         self.saved.break_minutes = value;
     }
 
     fn edit_playback_only(&mut self, value: bool) {
         self.remember_unread_settings();
-        self.unread_explicit_edits.playback |= self.unread_settings_pending;
+        if self.unread_settings_pending || !self.unread_explicit_edits.is_empty() {
+            self.unread_explicit_edits.playback = Some(value);
+        }
         self.saved.playback_only = value;
         self.measurement_available = false;
         self.last_refresh = Instant::now() - Duration::from_secs(120);
@@ -887,6 +975,11 @@ impl ControlApp {
         self.last_persisted = Some(self.saved.clone());
         self.last_persist_at = Instant::now();
         self.storage_error = None;
+        self.unread_explicit_edits = UnreadSettingEdits::default();
+        #[cfg(target_os = "android")]
+        {
+            *ACTIVITY_EDITS.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        }
     }
 
     fn accept_persistence_result(&mut self, result: std::io::Result<SavedState>) -> bool {
@@ -980,7 +1073,9 @@ impl ControlApp {
 
     fn request_usage_settings(&mut self, ctx: egui::Context) {
         self.remember_unread_settings();
-        self.unread_explicit_edits.usage_disclosure |= self.unread_settings_pending;
+        if self.unread_settings_pending || !self.unread_explicit_edits.is_empty() {
+            self.unread_explicit_edits.usage_disclosure = Some(true);
+        }
         self.saved.usage_disclosure_accepted = true;
         self.screen = Screen::Home;
         self.notice = None;
@@ -1017,7 +1112,9 @@ impl ControlApp {
             return;
         }
         self.remember_unread_settings();
-        self.unread_explicit_edits.service_disclosure |= self.unread_settings_pending;
+        if self.unread_settings_pending || !self.unread_explicit_edits.is_empty() {
+            self.unread_explicit_edits.service_disclosure = Some(true);
+        }
         self.saved.service_disclosure_accepted = true;
         #[cfg(target_os = "android")]
         if let Some(android_app) = &self.android_app {
@@ -1063,7 +1160,7 @@ impl ControlApp {
         self.saved
             .target_apps
             .sort_by_key(|app| app.label.to_lowercase());
-        if self.unread_settings_pending {
+        if self.unread_settings_pending || !self.unread_explicit_edits.is_empty() {
             let selected = self
                 .saved
                 .target_apps
@@ -1834,7 +1931,6 @@ impl eframe::App for ControlApp {
                     self.restore_saved_state(state);
                 } else {
                     self.unread_settings_pending = false;
-                    self.unread_explicit_edits = UnreadSettingEdits::default();
                 }
                 self.storage_error = None;
                 self.last_persisted = None;
@@ -1951,6 +2047,18 @@ impl eframe::App for ControlApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        #[cfg(target_os = "android")]
+        if let Some(dir) = self
+            .state_store
+            .as_ref()
+            .and_then(|store| store.directory().ok())
+        {
+            // eframe calls save before dropping the app on Destroy. Do not write
+            // a fallback file over unread canonical data or retain usage copies.
+            let pending = (!self.unread_explicit_edits.is_empty())
+                .then(|| (dir.to_owned(), self.unread_explicit_edits.clone()));
+            *ACTIVITY_EDITS.lock().unwrap_or_else(|p| p.into_inner()) = pending;
+        }
         #[cfg(target_os = "android")]
         let calendar_day = self
             .android_app
@@ -2483,6 +2591,90 @@ mod tests {
         recover_edited_model(&mut model, &disk, &fixture);
         assert_eq!(model.saved.daily_limit_minutes, 120);
         assert_eq!(model.saved.break_minutes, 45);
+    }
+
+    #[test]
+    fn activity_recreation_retains_only_explicit_settings_until_canonical_recovery() {
+        for recovered_before_create in [false, true] {
+            let fixture = ReloadFixture::new();
+            let mut old = unread_model(&fixture);
+            old.edit_daily_limit(300);
+            old.edit_daily_limit(120);
+            old.saved.cooldown_until_ms = Some(now_epoch_ms() + 900_000);
+            old.saved.daily_records.push(DailyRecord {
+                day_key: "old".into(),
+                label: "old".into(),
+                used_ms: 999_999,
+                playback_only: false,
+            });
+            let handoff = old.unread_explicit_edits.clone();
+            drop(old);
+            let disk = SavedState {
+                daily_limit_minutes: 240,
+                break_minutes: 45,
+                current_day_key: "2026-11-11".into(),
+                last_limit_triggered_day: Some("2026-11-11".into()),
+                ..SavedState::default()
+            };
+            let mut recreated = unread_model(&fixture);
+            if recovered_before_create {
+                recover_edited_model(&mut recreated, &disk, &fixture);
+            }
+            recreated.resume_activity_edits(handoff);
+            assert_eq!(recreated.saved.daily_limit_minutes, 120);
+            assert_eq!(recreated.saved.cooldown_until_ms, None);
+            if !recovered_before_create {
+                assert!(recreated.unread_settings_pending);
+                assert_eq!(std::fs::read(fixture.path()).unwrap(), b"(corrupt");
+                // A second recreation while reads still fail carries the same event.
+                let handoff = recreated.unread_explicit_edits.clone();
+                recreated = unread_model(&fixture);
+                recreated.resume_activity_edits(handoff);
+                recover_edited_model(&mut recreated, &disk, &fixture);
+            }
+            assert_eq!(recreated.saved.daily_limit_minutes, 120);
+            assert_eq!(recreated.saved.break_minutes, 45);
+            assert!(recreated.saved.daily_records.is_empty());
+            assert_eq!(recreated.saved.cooldown_until_ms, None);
+            recreated.persist_changed_state(&mut eframe::Frame::_new_kittest());
+            let actual: SavedState =
+                ron::from_str(&std::fs::read_to_string(fixture.path()).unwrap()).unwrap();
+            assert_eq!(actual.daily_limit_minutes, 120);
+            assert_eq!(actual.break_minutes, 45);
+        }
+    }
+
+    #[test]
+    fn activity_recreation_after_recovery_save_failure_keeps_uncommitted_events() {
+        let fixture = ReloadFixture::new();
+        let mut old = unread_model(&fixture);
+        old.edit_daily_limit(300);
+        let disk = SavedState {
+            daily_limit_minutes: 240,
+            break_minutes: 45,
+            ..SavedState::default()
+        };
+        recover_edited_model(&mut old, &disk, &fixture);
+        std::fs::create_dir(fixture.path().with_extension("pending")).unwrap();
+        old.persist_changed_state(&mut eframe::Frame::_new_kittest());
+        assert!(old.storage_error.is_some());
+        assert!(!old.unread_explicit_edits.is_empty());
+        old.edit_daily_limit(180);
+        let handoff = old.unread_explicit_edits.clone();
+        drop(old);
+        std::fs::remove_dir(fixture.path().with_extension("pending")).unwrap();
+        let mut recreated = app();
+        let mut store = crate::persistence::StateStore::new(fixture.path());
+        recreated.restore_saved_state(store.load_and_migrate().unwrap().unwrap());
+        recreated.state_store = Some(store);
+        recreated.resume_activity_edits(handoff);
+        assert_eq!(recreated.saved.daily_limit_minutes, 180);
+        assert_eq!(recreated.saved.break_minutes, 45);
+        recreated.persist_changed_state(&mut eframe::Frame::_new_kittest());
+        assert!(recreated.unread_explicit_edits.is_empty());
+        let actual: SavedState =
+            ron::from_str(&std::fs::read_to_string(fixture.path()).unwrap()).unwrap();
+        assert_eq!(actual.daily_limit_minutes, 180);
     }
 
     #[test]
