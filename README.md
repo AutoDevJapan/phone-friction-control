@@ -84,7 +84,11 @@ android-bridge pack-ads-release <プロジェクト> <ライブラリ.so> <ABI> 
 
 Gradleが未署名release APKを作り、通常版と共有する署名処理がデバッグ不可・証明書の単一一致・Android Debug証明書の拒否・16KB配置を確認します。パスワードは上記の2つの秘密環境変数を使い、署名診断を表示しません。すべて通った後だけ `phone-control-<ABI>-ads-release.apk` を出力します。既存の出力フォルダーは上書きしません。試験と製品のSOの取り違えも出力フォルダーの作成前に拒否します。
 
-CIの非sample IDは構文検査・APK作成専用のfixtureです。AdMobに登録された実物IDではなく、そのAPKを起動・インストール・実配信に使用しません。実IDは作成済みですが、そのIDを組み込んだAPKの既存製品署名鍵による署名・配布と、実SDK・実端末の動作確認は別途必要です。広告は製品版でも任意で、休憩解除の条件にはしません。
+CIの非sample IDは構文検査・APK作成専用のfixtureです。AdMobに登録された実物IDではなく、そのAPKを起動・インストール・実配信に使用しません。2026年11月10日には、登録済みAppIDとホーム用バナーIDを組み込んだ両ABIの `0.4.3-ads-candidate`（versionCode 14）を既存製品鍵で署名し、ID・証明書・デバッグ不可・16KB配置を確認しました。広告なし0.4.2/code13とは別の未公開候補です。
+
+実ID候補は、Googleが[自動的にtest deviceへ設定する](https://developers.google.com/admob/android/next-gen/test-ads)と説明するAPI37 Android emulatorで起動・保存設定・Back復帰・サービス接続まで確認しました。広告表示を選ぶとUMPが対象AppIDの同意フォーム未設定を返したため、広告を表示せずアプリの利用を継続しました。実ID経路のTest Ad表示、物理端末、対応ストアとの紐付け、アプリ審査・実配信・一般配布は未完了です。GoogleのサンプルIDで確認済みのTest Adを、実IDの成功へ置き換えません。広告は製品版でも任意で、休憩解除の条件にはしません。
+
+端末内の記録、権限、広告SDKの取扱いは[Android版のプライバシーについて](docs/privacy-policy-ja.md)を参照してください。
 
 ## 一次資料
 
