@@ -1,8 +1,18 @@
-# iOSの検証状況（2026-11-10更新）
+# iOSの検証状況（2026-11-11更新）
 
 ## 最新の受入範囲
 
 iOS 18.5のarm64 Simulatorで、Rustからの所有付き `Binding<Bool>` 操作と、PR19時点の製品ソース（`ebb79b4`）による既存プレビュー画面の起動・設定保存・プロセス再起動後の復元を確認しました。PR21後のPreview保存先（`preview-usage-state.ron`）での再起動復元と、Runtimeの実data containerからの起動復元は未確認です。実アプリの選択・利用時間の計測・製品のScreen Time許可・監視・遮蔽・SwiftUI所有者の完全排出・正式配布は未達です。以下のSDK18.5の結果を、後半に残したSDK17.5の履歴と混ぜません。
+
+### 製品のiOS入口
+
+既存の `phone-friction-control-preview` はPreviewモードを使い、`desktop-preview` featureで選びます。追加した `phone-friction-control-ios-runtime` は `ios-runtime` featureで選び、既存の `ControlApp::new` によりRuntimeモードを構築します。既定の入口を置き換える変更ではありません。両入口はiOS用の同じMetal limit修正を使います。
+
+Runtimeの保存先は `Documents/usage-state.ron`、Previewは `Documents/preview-usage-state.ron` です。Runtime入口の実factoryを使うホスト試験2件で、通常の日付・設定・当日記録の保持と、既知のPreviewセッションだけの除去を確認しました。共有lib全75試験にこの2件を含みます。Windowsからの `aarch64-apple-ios-sim` 向けlib・Runtime binaryの型検査は成功しましたが、Apple上でのリンク・この入口の実起動・実containerでの保存後のプロセス再起動復元は未実行です。
+
+ビルド指定と必要環境は[READMEのiOS入口](../README.md#iosの検査用入口)を参照してください。次の受入では同じソース・lockfile・バイナリを識別し、実アプリの表示と生存、非既定値の保存、異なるPIDでの再起動後の値を個別に確認します。
+
+この入口は製品のScreen Time許可・選択・計測・監視・遮蔽へ未接続です。既存UIのAndroid専用説明・操作も残っています。検査ホストでのカテゴリsetterやBinding所有の結果を、製品への接続成功に数えません。Device Activity／Managed Settingsの拡張の構成・署名・起動・実制御も残作業です。
 
 ### 所有付きBindingの実呼出し
 
