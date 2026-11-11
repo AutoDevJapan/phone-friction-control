@@ -230,6 +230,16 @@ enum Screen {
     Break,
 }
 
+#[derive(Default)]
+struct UnreadSettingEdits {
+    daily_limit: bool,
+    break_minutes: bool,
+    playback: bool,
+    usage_disclosure: bool,
+    service_disclosure: bool,
+    targets: HashMap<String, (TrackedApp, bool)>,
+}
+
 pub struct ControlApp {
     #[cfg(all(
         target_os = "android",
@@ -255,7 +265,8 @@ pub struct ControlApp {
     last_fallback_refresh: Instant,
     state_store: Option<crate::persistence::StateStore>,
     storage_error: Option<String>,
-    unread_settings_baseline: Option<SavedState>,
+    unread_settings_pending: bool,
+    unread_explicit_edits: UnreadSettingEdits,
     last_state_reload: Instant,
     screen: Screen,
     permission_granted: bool,
@@ -403,10 +414,8 @@ impl ControlApp {
             last_persist_at: Instant::now(),
             #[cfg(target_os = "android")]
             last_fallback_refresh: Instant::now() - Duration::from_secs(120),
-            unread_settings_baseline: state_store
-                .as_ref()
-                .filter(|store| !store.is_ready())
-                .map(|_| saved.clone()),
+            unread_settings_pending: state_store.as_ref().is_some_and(|store| !store.is_ready()),
+            unread_explicit_edits: UnreadSettingEdits::default(),
             state_store,
             storage_error,
             last_state_reload: Instant::now(),
@@ -448,11 +457,6 @@ impl ControlApp {
         #[cfg(not(target_os = "android"))]
         if mode == AppMode::Preview {
             app.load_preview_data();
-        }
-        if app.unread_settings_baseline.is_some() {
-            // Preview initialization is fixture data, not a user edit made
-            // while the storage warning is visible.
-            app.unread_settings_baseline = Some(app.saved.clone());
         }
 
         app
@@ -776,56 +780,54 @@ impl ControlApp {
         let mut state = self.mode.prepare_saved_state(state);
         #[cfg(target_os = "android")]
         let mut state = state;
-        let pending_edits = self.unread_settings_baseline.take();
-        if let Some(before) = &pending_edits {
+        let pending_edits = std::mem::take(&mut self.unread_settings_pending);
+        let explicit = std::mem::take(&mut self.unread_explicit_edits);
+        if pending_edits {
             // Disk owns usage/day/break authority. Reapply only settings edited
             // while the store was unreadable, never the stale in-memory record.
-            if self.saved.daily_limit_minutes != before.daily_limit_minutes {
+            if explicit.daily_limit {
                 state.daily_limit_minutes = self.saved.daily_limit_minutes;
             }
-            if self.saved.break_minutes != before.break_minutes {
+            if explicit.break_minutes {
                 state.break_minutes = self.saved.break_minutes;
             }
-            if self.saved.usage_disclosure_accepted != before.usage_disclosure_accepted {
+            if explicit.usage_disclosure {
                 state.usage_disclosure_accepted = self.saved.usage_disclosure_accepted;
             }
-            if self.saved.service_disclosure_accepted != before.service_disclosure_accepted {
+            if explicit.service_disclosure {
                 state.service_disclosure_accepted = self.saved.service_disclosure_accepted;
             }
             let old_targets = state.target_apps.clone();
             let old_playback = state.playback_only;
-            if self.saved.playback_only != before.playback_only {
+            if explicit.playback {
                 state.playback_only = self.saved.playback_only;
             }
-            for removed in &before.target_apps {
-                if !self
-                    .saved
-                    .target_apps
-                    .iter()
-                    .any(|app| app.package == removed.package)
-                {
-                    state
-                        .target_apps
-                        .retain(|app| app.package != removed.package);
-                }
-            }
-            for added in &self.saved.target_apps {
-                if !before
-                    .target_apps
-                    .iter()
-                    .any(|app| app.package == added.package)
-                    && !state
+            for (app, selected) in explicit.targets.values() {
+                if *selected {
+                    if !state
                         .target_apps
                         .iter()
-                        .any(|app| app.package == added.package)
-                {
-                    state.target_apps.push(added.clone());
+                        .any(|old| old.package == app.package)
+                    {
+                        state.target_apps.push(app.clone());
+                    }
+                } else {
+                    state.target_apps.retain(|old| old.package != app.package);
                 }
             }
-            if state.target_apps != old_targets || state.playback_only != old_playback {
+            let selection_changed = state.target_apps.len() != old_targets.len()
+                || old_targets.iter().any(|old| {
+                    !state
+                        .target_apps
+                        .iter()
+                        .any(|app| app.package == old.package)
+                });
+            if !explicit.targets.is_empty() {
                 state
                     .target_apps
                     .sort_by_key(|app| app.label.to_lowercase());
+            }
+            if selection_changed || state.playback_only != old_playback {
                 state.daily_records.clear();
             }
         }
@@ -834,7 +836,7 @@ impl ControlApp {
             .is_some_and(|until| until > now_epoch_ms())
         {
             Screen::Break
-        } else if pending_edits.is_some() && self.screen != Screen::Break {
+        } else if pending_edits && self.screen != Screen::Break {
             self.screen
         } else {
             Screen::Home
@@ -848,14 +850,33 @@ impl ControlApp {
     }
 
     fn remember_unread_settings(&mut self) {
-        if self.unread_settings_baseline.is_none()
-            && self
-                .state_store
-                .as_ref()
-                .is_some_and(|store| !store.is_ready())
+        if self
+            .state_store
+            .as_ref()
+            .is_some_and(|store| !store.is_ready())
         {
-            self.unread_settings_baseline = Some(self.saved.clone());
+            self.unread_settings_pending = true;
         }
+    }
+
+    fn edit_daily_limit(&mut self, value: u32) {
+        self.remember_unread_settings();
+        self.unread_explicit_edits.daily_limit |= self.unread_settings_pending;
+        self.saved.daily_limit_minutes = value;
+    }
+
+    fn edit_break_minutes(&mut self, value: u32) {
+        self.remember_unread_settings();
+        self.unread_explicit_edits.break_minutes |= self.unread_settings_pending;
+        self.saved.break_minutes = value;
+    }
+
+    fn edit_playback_only(&mut self, value: bool) {
+        self.remember_unread_settings();
+        self.unread_explicit_edits.playback |= self.unread_settings_pending;
+        self.saved.playback_only = value;
+        self.measurement_available = false;
+        self.last_refresh = Instant::now() - Duration::from_secs(120);
     }
 
     fn accept_persisted_state(&mut self, state: SavedState) {
@@ -958,6 +979,8 @@ impl ControlApp {
     }
 
     fn request_usage_settings(&mut self, ctx: egui::Context) {
+        self.remember_unread_settings();
+        self.unread_explicit_edits.usage_disclosure |= self.unread_settings_pending;
         self.saved.usage_disclosure_accepted = true;
         self.screen = Screen::Home;
         self.notice = None;
@@ -993,6 +1016,8 @@ impl ControlApp {
             self.screen = Screen::Disclosure;
             return;
         }
+        self.remember_unread_settings();
+        self.unread_explicit_edits.service_disclosure |= self.unread_settings_pending;
         self.saved.service_disclosure_accepted = true;
         #[cfg(target_os = "android")]
         if let Some(android_app) = &self.android_app {
@@ -1023,6 +1048,7 @@ impl ControlApp {
     }
 
     fn toggle_app(&mut self, app: &TrackedApp, ctx: &egui::Context) {
+        self.remember_unread_settings();
         if let Some(index) = self
             .saved
             .target_apps
@@ -1037,6 +1063,16 @@ impl ControlApp {
         self.saved
             .target_apps
             .sort_by_key(|app| app.label.to_lowercase());
+        if self.unread_settings_pending {
+            let selected = self
+                .saved
+                .target_apps
+                .iter()
+                .any(|old| old.package == app.package);
+            self.unread_explicit_edits
+                .targets
+                .insert(app.package.clone(), (app.clone(), selected));
+        }
         // An aggregate from the previous selection is no longer this selection's total.
         self.saved.daily_records.clear();
         self.refresh_usage(ctx.clone());
@@ -1415,11 +1451,17 @@ impl ControlApp {
 
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(RichText::new("1日の利用上限").strong());
-            ui.add(
-                egui::Slider::new(&mut self.saved.daily_limit_minutes, 30..=360)
-                    .step_by(30.0)
-                    .suffix("分"),
-            );
+            let mut daily_limit = self.saved.daily_limit_minutes;
+            if ui
+                .add(
+                    egui::Slider::new(&mut daily_limit, 30..=360)
+                        .step_by(30.0)
+                        .suffix("分"),
+                )
+                .changed()
+            {
+                self.edit_daily_limit(daily_limit);
+            }
             ui.label(
                 RichText::new(format_limit(self.saved.daily_limit_minutes))
                     .size(20.0)
@@ -1428,11 +1470,17 @@ impl ControlApp {
 
             ui.add_space(8.0);
             ui.label(RichText::new("上限後の休憩時間").strong());
-            ui.add(
-                egui::Slider::new(&mut self.saved.break_minutes, 5..=120)
-                    .step_by(5.0)
-                    .suffix("分"),
-            );
+            let mut break_minutes = self.saved.break_minutes;
+            if ui
+                .add(
+                    egui::Slider::new(&mut break_minutes, 5..=120)
+                        .step_by(5.0)
+                        .suffix("分"),
+                )
+                .changed()
+            {
+                self.edit_break_minutes(break_minutes);
+            }
             ui.label(
                 RichText::new(format!("{}分", self.saved.break_minutes))
                     .size(20.0)
@@ -1473,9 +1521,9 @@ impl ControlApp {
             if ui.button("説明を確認してユーザー補助を開く").clicked() {
                 self.request_guard_settings(ctx.clone(), false);
             }
-            if ui.checkbox(&mut self.saved.playback_only, "再生中と通知された時間だけを数える").changed() {
-                self.measurement_available = false;
-                self.last_refresh = Instant::now() - Duration::from_secs(120);
+            let mut playback_only = self.saved.playback_only;
+            if ui.checkbox(&mut playback_only, "再生中と通知された時間だけを数える").changed() {
+                self.edit_playback_only(playback_only);
             }
             ui.label("再生時間には通知へのアクセスも必要です。通知本文は読みません。対象が前面にあり再生中の場合だけ数え、停止・読み込み待ち・画面消灯を除きます。休憩中は、選んだアプリの再生へ一時停止を要求します。対象が要求に応じない場合は止められません。動画と音声の区別や、画面を見ていたことは判定できません。再生状態を通知しないアプリには対応しません。");
             if ui.button("説明を確認して通知へのアクセスを開く").clicked() {
@@ -1785,7 +1833,8 @@ impl eframe::App for ControlApp {
                 if let Some(state) = state {
                     self.restore_saved_state(state);
                 } else {
-                    self.unread_settings_baseline = None;
+                    self.unread_settings_pending = false;
+                    self.unread_explicit_edits = UnreadSettingEdits::default();
                 }
                 self.storage_error = None;
                 self.last_persisted = None;
@@ -2288,7 +2337,7 @@ mod tests {
             used_ms: 1234,
             playback_only: false,
         }];
-        model.saved.daily_limit_minutes = 300;
+        model.edit_daily_limit(300);
         model.screen = Screen::Settings;
         model.persist_changed_state(&mut frame);
         assert_eq!(std::fs::read(&path).unwrap(), b"(corrupt");
@@ -2347,7 +2396,7 @@ mod tests {
             &mut eframe::Frame::_new_kittest(),
         );
         assert!(model.state_store.as_ref().unwrap().is_ready());
-        assert!(model.unread_settings_baseline.is_none());
+        assert!(!model.unread_settings_pending);
     }
 
     #[test]
@@ -2392,7 +2441,7 @@ mod tests {
     }
 
     #[test]
-    fn unread_recovery_cancelled_edits_preserve_new_disk_day_and_invalidate_cache() {
+    fn unread_recovery_unedited_settings_preserve_new_disk_day_and_invalidate_cache() {
         for day in ["2026-11-11", "2026-11-12"] {
             let fixture = ReloadFixture::new();
             let mut model = unread_model(&fixture);
@@ -2406,11 +2455,7 @@ mod tests {
                 used_ms: 9_000,
                 playback_only: false,
             });
-            model.saved.daily_limit_minutes = 300;
-            model.saved.daily_limit_minutes = 120; // User returns to the original value.
             let selected = model.saved.target_apps[0].clone();
-            model.toggle_app(&selected, &egui::Context::default());
-            model.toggle_app(&selected, &egui::Context::default());
             model.measurement_available = true;
             model.usage_by_package_ms.insert(selected.package, 999_999);
             model.screen = Screen::Settings;
@@ -2423,22 +2468,76 @@ mod tests {
     }
 
     #[test]
+    fn unread_recovery_explicit_return_to_displayed_default_is_not_unedited() {
+        let fixture = ReloadFixture::new();
+        let mut model = unread_model(&fixture);
+        let disk = SavedState {
+            daily_limit_minutes: 240,
+            break_minutes: 45,
+            ..SavedState::default()
+        };
+        // This is the displayed value, not the unread disk value. A second
+        // explicit edit must not be interpreted as cancelling to disk240.
+        model.edit_daily_limit(300);
+        model.edit_daily_limit(120);
+        recover_edited_model(&mut model, &disk, &fixture);
+        assert_eq!(model.saved.daily_limit_minutes, 120);
+        assert_eq!(model.saved.break_minutes, 45);
+    }
+
+    #[test]
+    fn unread_recovery_repeated_control_events_keep_final_policy_and_selection() {
+        let fixture = ReloadFixture::new();
+        let mut model = unread_model(&fixture);
+        let selected = model.saved.target_apps[0].clone();
+        let disk = SavedState {
+            daily_limit_minutes: 240,
+            break_minutes: 45,
+            playback_only: true,
+            current_day_key: "2026-11-12".into(),
+            cooldown_until_ms: Some(now_epoch_ms() + 600_000),
+            last_limit_triggered_day: Some("2026-11-12".into()),
+            ..SavedState::default()
+        };
+        model.edit_break_minutes(65);
+        model.edit_break_minutes(30);
+        model.edit_playback_only(true);
+        model.edit_playback_only(false);
+        model.toggle_app(&selected, &egui::Context::default());
+        model.toggle_app(&selected, &egui::Context::default());
+        recover_edited_model(&mut model, &disk, &fixture);
+        assert_eq!(model.saved.daily_limit_minutes, 240); // No control event for this field.
+        assert_eq!(model.saved.break_minutes, 30);
+        assert!(!model.saved.playback_only);
+        assert_eq!(model.saved.target_apps, vec![selected]);
+        assert_eq!(model.saved.cooldown_until_ms, disk.cooldown_until_ms);
+        assert_eq!(
+            model.saved.last_limit_triggered_day,
+            disk.last_limit_triggered_day
+        );
+        model.persist_changed_state(&mut eframe::Frame::_new_kittest());
+        let stored: SavedState =
+            ron::from_str(&std::fs::read_to_string(fixture.path()).unwrap()).unwrap();
+        assert_eq!(stored, model.saved);
+    }
+
+    #[test]
     fn unread_recovery_repeated_failure_and_missing_file_keep_pending_edit() {
         let fixture = ReloadFixture::new();
         let mut model = unread_model(&fixture);
-        model.saved.break_minutes = 65;
+        model.edit_break_minutes(65);
         model.last_state_reload = Instant::now() - Duration::from_secs(6);
         let mut frame = eframe::Frame::_new_kittest();
         eframe::App::logic(&mut model, &egui::Context::default(), &mut frame);
         model.persist_changed_state(&mut frame);
         assert!(!model.state_store.as_ref().unwrap().is_ready());
         assert_eq!(std::fs::read(fixture.path()).unwrap(), b"(corrupt");
-        assert!(model.unread_settings_baseline.is_some());
+        assert!(model.unread_settings_pending);
         std::fs::remove_file(fixture.path()).unwrap();
         model.last_state_reload = Instant::now() - Duration::from_secs(6);
         eframe::App::logic(&mut model, &egui::Context::default(), &mut frame);
         assert!(model.state_store.as_ref().unwrap().is_ready());
-        assert!(model.unread_settings_baseline.is_none());
+        assert!(!model.unread_settings_pending);
         assert_eq!(model.saved.break_minutes, 65);
         model.persist_changed_state(&mut frame);
         let disk: SavedState =
@@ -2455,7 +2554,7 @@ mod tests {
         model.saved.last_limit_triggered_day = Some("2026-11-10".into());
         model.saved.current_day_key = "2026-11-10".into();
         model.screen = Screen::Break;
-        model.saved.break_minutes = 65;
+        model.edit_break_minutes(65);
         let disk = SavedState {
             daily_limit_minutes: 240,
             break_minutes: 45,
@@ -2561,7 +2660,8 @@ mod tests {
             last_persist_at: Instant::now(),
             state_store: None,
             storage_error: None,
-            unread_settings_baseline: None,
+            unread_settings_pending: false,
+            unread_explicit_edits: UnreadSettingEdits::default(),
             last_state_reload: Instant::now(),
             screen: Screen::Home,
             permission_granted: false,
