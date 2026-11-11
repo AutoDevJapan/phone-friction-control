@@ -84,10 +84,11 @@ impl GuardStore {
         transaction(calendar, |day, now| {
             let config = read::<SavedState>(self.dir.join("guard-config.ron"))?
                 .ok_or_else(|| io::Error::other("Guard policy unavailable"))?;
+            // Complete fallible legacy cleanup before StateStore can become ready.
+            remove_legacy_status(&self.dir)?;
             let result = self.state.load_and_migrate_with(|state: &mut GuardState| {
                 normalize_guard(state, &config, day, now)
             })?;
-            remove_legacy_status(&self.dir)?;
             Ok(result)
         })
     }
@@ -685,6 +686,83 @@ mod tests {
         std::fs::write(&path, old).unwrap();
         put(path.clone(), &map).unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), old);
+    }
+
+    #[test]
+    fn failed_legacy_status_cleanup_keeps_load_unready_until_a_successful_retry() {
+        let fixture = Fixture::new();
+        seed(&fixture);
+        save_policy(&fixture.0, &config(&["video"]), Some("2026-11-11")).unwrap();
+        std::fs::create_dir(fixture.0.join("guard-status.ron")).unwrap();
+        let mut worker = GuardStore::new(fixture.0.clone());
+        assert!(
+            worker
+                .load_transaction(|| Ok(("2026-11-11".into(), 1000)))
+                .is_err()
+        );
+        assert!(
+            !worker.is_ready(),
+            "cleanup error left the state marked ready before it was handed to the worker"
+        );
+        assert!(
+            worker
+                .save_transaction(&GuardState::default(), || Ok(("2026-11-11".into(), 1000)))
+                .is_err()
+        );
+        std::fs::remove_dir(fixture.0.join("guard-status.ron")).unwrap();
+        let restored = worker
+            .load_transaction(|| Ok(("2026-11-11".into(), 1000)))
+            .unwrap()
+            .unwrap();
+        assert!(worker.is_ready());
+        assert_eq!(restored.usage_ms["video"], 61_000);
+    }
+
+    #[test]
+    fn checkpoint_commit_survives_cleanup_error_reload_and_stale_retry() {
+        let fixture = Fixture::new();
+        seed(&fixture);
+        save_policy(&fixture.0, &config(&["video"]), Some("2026-11-11")).unwrap();
+        let mut worker = GuardStore::new(fixture.0.clone());
+        let old = worker
+            .load_transaction(|| Ok(("2026-11-11".into(), 1000)))
+            .unwrap()
+            .unwrap();
+        let mut new = old.clone();
+        new.playback_ms.insert("video".into(), 99);
+        new.cooldown_until_ms = None;
+        std::fs::create_dir(fixture.0.join("guard-status.ron")).unwrap();
+        assert!(
+            worker
+                .save_transaction(&new, || Ok(("2026-11-11".into(), 200_000)))
+                .is_err()
+        );
+        // The checkpoint rename completed; only obsolete status cleanup failed afterwards.
+        assert_eq!(fixture.state().playback_ms["video"], 99);
+        assert_eq!(fixture.state().cooldown_until_ms, None);
+        let committed = std::fs::read(fixture.0.join("guard-state.ron")).unwrap();
+        let mut reloaded = GuardStore::new(fixture.0.clone());
+        assert!(
+            reloaded
+                .load_transaction(|| Ok(("2026-11-11".into(), 200_000)))
+                .is_err()
+        );
+        assert!(!reloaded.is_ready());
+        assert_eq!(
+            std::fs::read(fixture.0.join("guard-state.ron")).unwrap(),
+            committed
+        );
+        std::fs::remove_dir(fixture.0.join("guard-status.ron")).unwrap();
+        let restored = reloaded
+            .load_transaction(|| Ok(("2026-11-11".into(), 200_000)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.playback_ms["video"], 99);
+        worker
+            .save_transaction(&old, || Ok(("2026-11-11".into(), 200_000)))
+            .unwrap();
+        assert_eq!(fixture.state().playback_ms["video"], 99);
+        assert_eq!(fixture.state().cooldown_until_ms, None);
     }
 
     #[test]
