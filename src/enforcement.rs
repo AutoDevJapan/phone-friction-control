@@ -92,11 +92,12 @@ pub(crate) fn persist_selection_prune(
     policy: &Policy,
     pending: &mut bool,
     store: &crate::guard_storage::GuardStore,
+    calendar: impl FnOnce() -> std::io::Result<crate::guard_storage::Calendar>,
 ) -> bool {
     *pending |= state.retain_selected(policy);
     if *pending
         && store.is_ready()
-        && let Ok(saved) = store.save(state)
+        && let Ok(saved) = store.save_transaction(state, calendar)
     {
         *state = saved;
         *pending = false;
@@ -111,6 +112,35 @@ pub(crate) fn guard_save_due(changed: bool, critical: bool, elapsed: std::time::
 }
 
 impl GuardState {
+    pub(crate) fn merge_checkpoint(&mut self, other: &Self) {
+        if self.day == other.day {
+            for (to, from) in [
+                (&mut self.usage_ms, &other.usage_ms),
+                (&mut self.playback_ms, &other.playback_ms),
+            ] {
+                for (package, value) in from {
+                    let total = to.entry(package.clone()).or_default();
+                    *total = (*total).max(*value);
+                }
+            }
+            if self.boot == other.boot {
+                for (package, value) in &other.raw_ms {
+                    let total = self.raw_ms.entry(package.clone()).or_default();
+                    *total = (*total).max(*value);
+                }
+            } else if self.boot.is_none() {
+                self.boot = other.boot;
+                self.raw_ms = other.raw_ms.clone();
+            }
+        }
+        self.cooldown_until_ms = self.cooldown_until_ms.max(other.cooldown_until_ms);
+        self.triggered_day = self.triggered_day.clone().max(other.triggered_day.clone());
+        self.last_triggered_day = self
+            .last_triggered_day
+            .clone()
+            .max(other.last_triggered_day.clone());
+    }
+
     pub fn prepare_persistence(&mut self, policy: &Policy, current_day: Option<&str>) -> bool {
         let before = self.clone();
         if let Some(day) = current_day.filter(|day| !day.is_empty())
@@ -449,7 +479,8 @@ mod tests {
             &mut state,
             &policy(),
             &mut pending,
-            &store
+            &store,
+            || Ok(("day1".into(), 1000)),
         ));
         assert!(pending);
         assert!(!state.usage_ms.contains_key("mail"));
@@ -460,7 +491,8 @@ mod tests {
             &mut state,
             &policy(),
             &mut pending,
-            &store
+            &store,
+            || Ok(("day1".into(), 1000)),
         ));
         assert!(!pending);
         let restored: GuardState = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();

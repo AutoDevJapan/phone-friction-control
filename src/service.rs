@@ -124,16 +124,14 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
     let mut last_interruption = Instant::now() - Duration::from_secs(10);
     let mut last_pause = Instant::now() - Duration::from_secs(10);
     while GENERATION.load(Ordering::SeqCst) == generation {
-        let current_day = crate::platform::current_day_env(&mut env).ok();
-        if current_day.is_none() {
-            let _ = env.exception_clear();
-        }
-        guard_store.set_day(current_day.clone());
-        let calendar_storage_error =
-            crate::guard_storage::sync_calendar(&dir, current_day.as_deref()).is_err();
+        let calendar = crate::guard_storage::sync_calendar_transaction(&dir, || {
+            crate::platform::storage_calendar_env(&mut env)
+        });
+        let current_day = calendar.as_ref().ok().map(|(day, _)| day.clone());
+        let calendar_storage_error = calendar.is_err();
         if !guard_store.is_ready() && last_load.elapsed() >= Duration::from_secs(5) {
             last_load = Instant::now();
-            match guard_store.load() {
+            match guard_store.load_transaction(|| crate::platform::storage_calendar_env(&mut env)) {
                 Ok(restored) => {
                     let mut restored = restored.unwrap_or_default();
                     last_saved = Some(restored.clone());
@@ -166,6 +164,7 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                 &policy,
                 &mut selection_save_pending,
                 &guard_store,
+                || crate::platform::storage_calendar_env(&mut env),
             ) {
                 last_saved = Some(state.clone());
             }
@@ -213,10 +212,11 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                             true,
                             Some(&mut tracker),
                         )?;
-                        guard_store.set_day(Some(snapshot.day_key.clone()));
                         let snapshot_storage_error =
-                            crate::guard_storage::sync_calendar(&dir, Some(&snapshot.day_key))
-                                .is_err();
+                            crate::guard_storage::sync_calendar_transaction(&dir, || {
+                                crate::platform::storage_calendar_env(env)
+                            })
+                            .is_err();
                         // The query owns a fresh calendar observation; it may cross midnight
                         // or a manual clock change after the loop's earlier read.
                         let changed_day = state.day != snapshot.day_key;
@@ -292,7 +292,9 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                             critical,
                             last_save.elapsed(),
                         ) {
-                            match guard_store.save(state) {
+                            match guard_store.save_transaction(state, || {
+                                crate::platform::storage_calendar_env(env)
+                            }) {
                                 Ok(saved) => {
                                     *state = saved;
                                     last_saved = Some(state.clone());

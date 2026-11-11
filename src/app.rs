@@ -118,6 +118,41 @@ impl Default for SavedState {
     }
 }
 
+#[cfg(any(target_os = "android", test))]
+impl SavedState {
+    pub(crate) fn merge_persisted(&mut self, other: &Self, day: &str, now: i64) {
+        self.retain_current_day(day);
+        if self.target_apps == other.target_apps && self.playback_only == other.playback_only {
+            for record in other.daily_records.iter().filter(|r| r.day_key == day) {
+                if let Some(current) = self
+                    .daily_records
+                    .iter_mut()
+                    .find(|r| r.day_key == day && r.playback_only == record.playback_only)
+                {
+                    current.used_ms = current.used_ms.max(record.used_ms);
+                } else {
+                    self.daily_records.push(record.clone());
+                }
+            }
+        }
+        self.accept_service_break(
+            other.cooldown_until_ms,
+            other.limit_triggered_day.clone(),
+            other.last_limit_triggered_day.clone(),
+            now,
+        );
+    }
+
+    pub(crate) fn merge_guard(&mut self, guard: &crate::enforcement::GuardState, now: i64) {
+        self.accept_service_break(
+            guard.cooldown_until_ms,
+            guard.triggered_day.clone(),
+            guard.last_triggered_day.clone(),
+            now,
+        );
+    }
+}
+
 #[cfg(not(target_os = "android"))]
 impl SavedState {
     fn remove_preview_session(&mut self) {
@@ -321,10 +356,12 @@ impl ControlApp {
         if let Some(store) = &mut state_store {
             #[cfg(target_os = "android")]
             let restored = {
-                let day = android_app
-                    .as_ref()
-                    .and_then(|app| crate::platform::current_day(app).ok());
-                crate::guard_storage::load_usage(store, day.as_deref())
+                crate::guard_storage::load_usage_transaction(store, || {
+                    android_app
+                        .as_ref()
+                        .ok_or_else(|| std::io::Error::other("Android Activity unavailable"))
+                        .and_then(crate::platform::storage_calendar)
+                })
             };
             #[cfg(not(target_os = "android"))]
             let restored = store.load_and_migrate();
@@ -688,17 +725,18 @@ impl ControlApp {
                 .and_then(|app| app.internal_data_path())
                 .ok_or_else(|| std::io::Error::other("Missing Android state directory"))
                 .and_then(|dir| {
-                    crate::guard_storage::save_usage(
-                        store,
-                        &dir,
-                        &self.saved,
-                        calendar_day.as_deref(),
-                    )
+                    crate::guard_storage::save_usage_transaction(store, &dir, &self.saved, || {
+                        self.android_app
+                            .as_ref()
+                            .ok_or_else(|| std::io::Error::other("Android Activity unavailable"))
+                            .and_then(crate::platform::storage_calendar)
+                    })
                 });
             #[cfg(not(target_os = "android"))]
-            let result = store.save(&self.saved);
+            let result = store.save(&self.saved).map(|_| self.saved.clone());
             match result {
-                Ok(()) => {
+                Ok(saved) => {
+                    self.saved = saved;
                     self.last_persisted = Some(self.saved.clone());
                     self.last_persist_at = Instant::now();
                     self.storage_error = None;
@@ -1629,11 +1667,12 @@ impl eframe::App for ControlApp {
             self.last_state_reload = Instant::now();
             #[cfg(target_os = "android")]
             let restored = {
-                let day = self
-                    .android_app
-                    .as_ref()
-                    .and_then(|app| crate::platform::current_day(app).ok());
-                crate::guard_storage::load_usage(store, day.as_deref())
+                crate::guard_storage::load_usage_transaction(store, || {
+                    self.android_app
+                        .as_ref()
+                        .ok_or_else(|| std::io::Error::other("Android Activity unavailable"))
+                        .and_then(crate::platform::storage_calendar)
+                })
             };
             #[cfg(not(target_os = "android"))]
             let restored = store.load_and_migrate();
@@ -1777,16 +1816,17 @@ impl eframe::App for ControlApp {
                 .and_then(|app| app.internal_data_path())
                 .ok_or_else(|| std::io::Error::other("Missing Android state directory"))
                 .and_then(|dir| {
-                    crate::guard_storage::save_usage(
-                        store,
-                        &dir,
-                        &self.saved,
-                        calendar_day.as_deref(),
-                    )
+                    crate::guard_storage::save_usage_transaction(store, &dir, &self.saved, || {
+                        self.android_app
+                            .as_ref()
+                            .ok_or_else(|| std::io::Error::other("Android Activity unavailable"))
+                            .and_then(crate::platform::storage_calendar)
+                    })
                 });
             #[cfg(not(target_os = "android"))]
-            let result = store.save(&self.saved);
-            if result.is_ok() {
+            let result = store.save(&self.saved).map(|_| self.saved.clone());
+            if let Ok(saved) = result {
+                self.saved = saved;
                 self.last_persisted = Some(self.saved.clone());
                 storage.remove_string(SAVE_KEY);
             }

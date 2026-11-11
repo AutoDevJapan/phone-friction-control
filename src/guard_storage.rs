@@ -1,5 +1,5 @@
-//! The UI policy and guard checkpoint share one process and one storage lock.
-//! A worker must re-read the UI-owned policy before publishing its checkpoint.
+//! All Android state owners use one lock, then sample the clock, merge and persist.
+//! A failed clock read performs no file operation; a stale caller cannot choose a day.
 use crate::app::SavedState;
 use crate::enforcement::GuardState;
 use crate::persistence::StateStore;
@@ -8,10 +8,54 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 static FILES: Mutex<()> = Mutex::new(());
+pub(crate) type Calendar = (String, i64);
+
+fn transaction<T>(
+    calendar: impl FnOnce() -> io::Result<Calendar>,
+    run: impl FnOnce(&str, i64) -> io::Result<T>,
+) -> io::Result<T> {
+    let _lock = FILES.lock().unwrap_or_else(|p| p.into_inner());
+    let (day, now) = calendar()?;
+    if day.is_empty() {
+        return Err(io::Error::other("Calendar is unavailable"));
+    }
+    run(&day, now)
+}
+
+fn read<T: serde::de::DeserializeOwned>(path: PathBuf) -> io::Result<Option<T>> {
+    StateStore::new(path).load()
+}
+
+fn put<T: serde::Serialize>(path: PathBuf, value: &T) -> io::Result<()> {
+    let canonical = ron::to_string(value).map_err(io::Error::other)?;
+    match std::fs::read_to_string(&path) {
+        Ok(old) if old == canonical => match std::fs::remove_file(path.with_extension("pending")) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        },
+        Ok(_) => crate::persistence::write_atomic(&path, value),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            crate::persistence::write_atomic(&path, value)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn normalize_guard(state: &mut GuardState, config: &SavedState, day: &str, now: i64) {
+    state.prepare_persistence(&config.policy(), Some(day));
+    state.cooldown_until_ms = state.cooldown_until_ms.filter(|until| *until > now);
+    state.last_triggered_day = state
+        .last_triggered_day
+        .clone()
+        .max(config.last_limit_triggered_day.clone());
+    state.import_break(config.cooldown_until_ms, &config.limit_triggered_day, now);
+}
 
 pub(crate) struct GuardStore {
     dir: PathBuf,
     state: StateStore,
+    #[cfg(test)]
     day: Option<String>,
 }
 
@@ -20,125 +64,201 @@ impl GuardStore {
         Self {
             state: StateStore::new(dir.join("guard-state.ron")),
             dir,
+            #[cfg(test)]
             day: None,
         }
     }
-
-    pub fn set_day(&mut self, day: Option<String>) {
-        self.day = day;
-    }
-
     pub fn is_ready(&self) -> bool {
         self.state.is_ready()
     }
 
-    pub fn load(&mut self) -> io::Result<Option<GuardState>> {
-        let _lock = FILES.lock().unwrap_or_else(|p| p.into_inner());
+    pub fn load_transaction(
+        &mut self,
+        calendar: impl FnOnce() -> io::Result<Calendar>,
+    ) -> io::Result<Option<GuardState>> {
         self.state = StateStore::new(self.dir.join("guard-state.ron"));
-        let config = current_config(&self.dir)?;
-        remove_legacy_status(&self.dir)?;
-        self.state.load_and_migrate_with(|state: &mut GuardState| {
-            state.prepare_persistence(&config.policy(), self.day.as_deref());
+        transaction(calendar, |day, now| {
+            let config = read::<SavedState>(self.dir.join("guard-config.ron"))?
+                .ok_or_else(|| io::Error::other("Guard policy unavailable"))?;
+            let result = self.state.load_and_migrate_with(|state: &mut GuardState| {
+                normalize_guard(state, &config, day, now)
+            })?;
+            remove_legacy_status(&self.dir)?;
+            Ok(result)
         })
     }
 
-    pub fn save(&self, state: &GuardState) -> io::Result<GuardState> {
-        self.save_locked(state, || {})
-    }
-
-    fn save_locked(
+    pub fn save_transaction(
         &self,
         state: &GuardState,
-        after_policy_read: impl FnOnce(),
+        calendar: impl FnOnce() -> io::Result<Calendar>,
     ) -> io::Result<GuardState> {
-        let _lock = FILES.lock().unwrap_or_else(|p| p.into_inner());
-        let config = current_config(&self.dir)?;
-        after_policy_read();
-        let mut current = state.clone();
-        // A UsageSnapshot can cross midnight after the loop's calendar read.
-        // Its state already carries that observation's day; never rotate it back.
-        let observed_day = (!state.day.is_empty()).then_some(state.day.as_str());
-        current.prepare_persistence(&config.policy(), observed_day.or(self.day.as_deref()));
-        self.state.save(&current)?;
-        remove_legacy_status(&self.dir)?;
-        Ok(current)
+        self.save_transaction_hook(state, calendar, || {})
+    }
+
+    fn save_transaction_hook(
+        &self,
+        state: &GuardState,
+        calendar: impl FnOnce() -> io::Result<Calendar>,
+        after_read: impl FnOnce(),
+    ) -> io::Result<GuardState> {
+        transaction(calendar, |day, now| {
+            if !self.state.is_ready() {
+                return Err(io::Error::other("Guard state has not been read"));
+            }
+            let config = read::<SavedState>(self.dir.join("guard-config.ron"))?
+                .ok_or_else(|| io::Error::other("Guard policy unavailable"))?;
+            let disk = read::<GuardState>(self.dir.join("guard-state.ron"))?;
+            after_read();
+            let mut current = state.clone();
+            normalize_guard(&mut current, &config, day, now);
+            if let Some(mut disk) = disk {
+                normalize_guard(&mut disk, &config, day, now);
+                current.merge_checkpoint(&disk);
+            }
+            current.cooldown_until_ms = current.cooldown_until_ms.filter(|until| *until > now);
+            put(self.dir.join("guard-state.ron"), &current)?;
+            remove_legacy_status(&self.dir)?;
+            Ok(current)
+        })
+    }
+
+    #[cfg(test)]
+    pub fn set_day(&mut self, day: Option<String>) {
+        self.day = day;
+    }
+    #[cfg(test)]
+    pub fn load(&mut self) -> io::Result<Option<GuardState>> {
+        let day = self.day.clone().unwrap_or_else(|| "2026-11-11".into());
+        self.load_transaction(|| Ok((day, 1000)))
+    }
+    #[cfg(test)]
+    pub fn save(&self, state: &GuardState) -> io::Result<GuardState> {
+        let day = if state.day.is_empty() {
+            self.day.clone().unwrap_or_else(|| "2026-11-11".into())
+        } else {
+            state.day.clone()
+        };
+        self.save_transaction(state, || Ok((day, 1000)))
+    }
+    #[cfg(test)]
+    fn save_locked(&self, state: &GuardState, hook: impl FnOnce()) -> io::Result<GuardState> {
+        let day = self.day.clone().unwrap_or_else(|| state.day.clone());
+        self.save_transaction_hook(state, || Ok((day, 1000)), hook)
     }
 }
 
-#[cfg(test)]
-pub(crate) fn save_policy(dir: &Path, config: &SavedState, day: Option<&str>) -> io::Result<()> {
-    let _lock = FILES.lock().unwrap_or_else(|p| p.into_inner());
-    save_policy_locked(dir, config, day)
-}
-
-fn save_policy_locked(dir: &Path, config: &SavedState, day: Option<&str>) -> io::Result<()> {
-    let mut current = config.clone();
-    if let Some(day) = day {
-        current.retain_current_day(day);
-    }
-    crate::persistence::write_atomic(&dir.join("guard-config.ron"), &current)?;
-    let mut store = StateStore::new(dir.join("guard-state.ron"));
-    store.load_and_migrate_with(|state: &mut GuardState| {
-        state.prepare_persistence(&current.policy(), day);
-    })?;
-    remove_legacy_status(dir)
-}
-
-pub(crate) fn load_usage(
+pub(crate) fn load_usage_transaction(
     store: &mut StateStore,
-    day: Option<&str>,
+    calendar: impl FnOnce() -> io::Result<Calendar>,
 ) -> io::Result<Option<SavedState>> {
-    let _lock = FILES.lock().unwrap_or_else(|p| p.into_inner());
-    store.load_and_migrate_with(|state: &mut SavedState| {
-        if let Some(day) = day {
-            state.retain_current_day(day);
-        }
+    transaction(calendar, |day, _| {
+        store.load_and_migrate_with(|state: &mut SavedState| state.retain_current_day(day))
     })
 }
 
-pub(crate) fn save_usage(
+pub(crate) fn save_usage_transaction(
+    store: &StateStore,
+    dir: &Path,
+    state: &SavedState,
+    calendar: impl FnOnce() -> io::Result<Calendar>,
+) -> io::Result<SavedState> {
+    transaction(calendar, |day, now| {
+        if !store.is_ready() {
+            return Err(io::Error::other("UI state has not been read"));
+        }
+        // Validate all canonical files before the first write. The following writes
+        // are retryable, not a claim of atomic rollback across multiple files.
+        let saved_usage = read::<SavedState>(dir.join("usage-state.ron"))?;
+        let saved_config = read::<SavedState>(dir.join("guard-config.ron"))?;
+        let saved_guard = read::<GuardState>(dir.join("guard-state.ron"))?;
+        let mut current = state.clone();
+        current.retain_current_day(day);
+        current.cooldown_until_ms = current.cooldown_until_ms.filter(|until| *until > now);
+        for saved in [saved_usage, saved_config].iter().flatten() {
+            current.merge_persisted(saved, day, now);
+        }
+        let mut guard = saved_guard;
+        if let Some(guard) = &mut guard {
+            normalize_guard(guard, &current, day, now);
+            current.merge_guard(guard, now);
+        }
+        store.save(&current)?;
+        put(dir.join("guard-config.ron"), &current)?;
+        if let Some(guard) = guard {
+            put(dir.join("guard-state.ron"), &guard)?;
+        }
+        remove_legacy_status(dir)?;
+        Ok(current)
+    })
+}
+
+pub(crate) fn sync_calendar_transaction(
+    dir: &Path,
+    calendar: impl FnOnce() -> io::Result<Calendar>,
+) -> io::Result<Calendar> {
+    transaction(calendar, |day, now| {
+        let usage = read::<SavedState>(dir.join("usage-state.ron"))?;
+        let config = read::<SavedState>(dir.join("guard-config.ron"))?;
+        let guard = read::<GuardState>(dir.join("guard-state.ron"))?;
+        for (name, value) in [
+            ("usage-state.ron", usage),
+            ("guard-config.ron", config.clone()),
+        ] {
+            if let Some(mut value) = value {
+                value.retain_current_day(day);
+                value.cooldown_until_ms = value.cooldown_until_ms.filter(|until| *until > now);
+                put(dir.join(name), &value)?;
+            }
+        }
+        if let (Some(mut state), Some(config)) = (guard, config) {
+            normalize_guard(&mut state, &config, day, now);
+            put(dir.join("guard-state.ron"), &state)?;
+        }
+        remove_legacy_status(dir)?;
+        Ok((day.to_owned(), now))
+    })
+}
+
+fn remove_legacy_status(dir: &Path) -> io::Result<()> {
+    for name in ["guard-status.ron", "guard-status.pending"] {
+        match std::fs::remove_file(dir.join(name)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn test_calendar(day: Option<&str>) -> io::Result<Calendar> {
+    day.filter(|d| !d.is_empty())
+        .map(|d| (d.to_owned(), 1000))
+        .ok_or_else(|| io::Error::other("Calendar unavailable"))
+}
+#[cfg(test)]
+fn load_usage(store: &mut StateStore, day: Option<&str>) -> io::Result<Option<SavedState>> {
+    load_usage_transaction(store, || test_calendar(day))
+}
+#[cfg(test)]
+fn save_usage(
     store: &StateStore,
     dir: &Path,
     state: &SavedState,
     day: Option<&str>,
 ) -> io::Result<()> {
-    let _lock = FILES.lock().unwrap_or_else(|p| p.into_inner());
-    let mut current = state.clone();
-    if let Some(day) = day {
-        current.retain_current_day(day);
-    }
-    store.save(&current)?;
-    save_policy_locked(dir, &current, day)
+    save_usage_transaction(store, dir, state, || test_calendar(day)).map(|_| ())
 }
-
-pub(crate) fn sync_calendar(dir: &Path, day: Option<&str>) -> io::Result<()> {
-    let Some(day) = day.filter(|day| !day.is_empty()) else {
-        return Ok(());
-    };
-    let _lock = FILES.lock().unwrap_or_else(|p| p.into_inner());
-    for file in ["usage-state.ron", "guard-config.ron"] {
-        let mut store = StateStore::new(dir.join(file));
-        store.load_and_migrate_with(|state: &mut SavedState| state.retain_current_day(day))?;
-    }
-    Ok(())
+#[cfg(test)]
+fn sync_calendar(dir: &Path, day: Option<&str>) -> io::Result<()> {
+    sync_calendar_transaction(dir, || test_calendar(day)).map(|_| ())
 }
-
-fn current_config(dir: &Path) -> io::Result<SavedState> {
-    StateStore::new(dir.join("guard-config.ron"))
-        .load()?
-        .ok_or_else(|| io::Error::other("Guard policy is unavailable"))
-}
-
-fn remove_legacy_status(dir: &Path) -> io::Result<()> {
-    // No runtime reader uses this redundant snapshot. Keep live transport in memory only.
-    for name in ["guard-status.ron", "guard-status.pending"] {
-        match std::fs::remove_file(dir.join(name)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
+#[cfg(test)]
+fn save_policy(dir: &Path, config: &SavedState, day: Option<&str>) -> io::Result<()> {
+    let mut store = StateStore::new(dir.join("usage-state.ron"));
+    load_usage(&mut store, day)?;
+    save_usage(&store, dir, config, day)
 }
 
 #[cfg(test)]
@@ -313,7 +433,12 @@ mod tests {
     fn known_day_prunes_metrics_without_usage_permission_and_unknown_day_keeps_them() {
         let fixture = Fixture::new();
         seed(&fixture);
-        save_policy(&fixture.0, &config(&["video"]), None).unwrap();
+        let original = std::fs::read(fixture.0.join("guard-state.ron")).unwrap();
+        assert!(save_policy(&fixture.0, &config(&["video"]), None).is_err());
+        assert_eq!(
+            std::fs::read(fixture.0.join("guard-state.ron")).unwrap(),
+            original
+        );
         assert_eq!(fixture.state().usage_ms["video"], 61_000);
         save_policy(&fixture.0, &config(&["video"]), Some("2026-11-12")).unwrap();
         let current = fixture.state();
@@ -434,6 +559,160 @@ mod tests {
             std::fs::read_to_string(&path)
                 .unwrap()
                 .contains("daily_records:[]")
+        );
+    }
+
+    #[test]
+    fn delayed_ui_reads_clock_only_after_the_new_day_worker_commit() {
+        let fixture = Fixture::new();
+        seed(&fixture);
+        let stale = dated_config();
+        let path = fixture.0.join("usage-state.ron");
+        crate::persistence::write_atomic(&path, &stale).unwrap();
+        save_policy(&fixture.0, &stale, Some("2026-11-11")).unwrap();
+        let mut ui = StateStore::new(path);
+        load_usage(&mut ui, Some("2026-11-11")).unwrap();
+        let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(11));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (sampled_tx, sampled_rx) = std::sync::mpsc::channel();
+        let lock = FILES.lock().unwrap();
+        let dir = fixture.0.clone();
+        let read_clock = clock.clone();
+        let selected = stale.policy();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            save_usage_transaction(&ui, &dir, &stale, || {
+                let day = read_clock.load(Ordering::SeqCst);
+                sampled_tx.send(()).unwrap();
+                Ok((format!("2026-11-{day:02}"), 1000))
+            })
+            .unwrap();
+        });
+        started_rx.recv().unwrap();
+        // The actual storage lock is held by a new-day commit. A clock read by the UI
+        // before releasing it reproduces the old read-before-lock interleaving.
+        let sampled_early = sampled_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_ok();
+        let mut current = old_state();
+        current.prepare_persistence(&selected, Some("2026-11-12"));
+        current.playback_ms.insert("video".into(), 99);
+        crate::persistence::write_atomic(&fixture.0.join("guard-state.ron"), &current).unwrap();
+        clock.store(12, Ordering::SeqCst);
+        drop(lock);
+        writer.join().unwrap();
+        assert!(
+            !sampled_early,
+            "calendar observed before the storage transaction lock"
+        );
+        assert_eq!(fixture.state().day, "2026-11-12");
+        assert_eq!(fixture.state().playback_ms["video"], 99);
+    }
+
+    #[test]
+    fn unknown_calendar_does_not_restore_a_stale_ui_over_a_new_day_checkpoint() {
+        let fixture = Fixture::new();
+        seed(&fixture);
+        let stale = dated_config();
+        let path = fixture.0.join("usage-state.ron");
+        crate::persistence::write_atomic(&path, &stale).unwrap();
+        save_policy(&fixture.0, &stale, Some("2026-11-11")).unwrap();
+        let mut ui = StateStore::new(path.clone());
+        load_usage(&mut ui, Some("2026-11-11")).unwrap();
+        sync_calendar(&fixture.0, Some("2026-11-12")).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let result = save_usage(&ui, &fixture.0, &stale, None);
+        assert!(
+            result.is_err(),
+            "unknown calendar was accepted as a successful save"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn failed_clock_keeps_every_file_then_retry_merges_current_values() {
+        let fixture = Fixture::new();
+        seed(&fixture);
+        let stale = dated_config();
+        let path = fixture.0.join("usage-state.ron");
+        crate::persistence::write_atomic(&path, &stale).unwrap();
+        save_policy(&fixture.0, &stale, Some("2026-11-11")).unwrap();
+        let mut ui = StateStore::new(path);
+        load_usage(&mut ui, Some("2026-11-11")).unwrap();
+        sync_calendar(&fixture.0, Some("2026-11-12")).unwrap();
+        let names = ["usage-state.ron", "guard-config.ron", "guard-state.ron"];
+        let before: Vec<_> = names
+            .iter()
+            .map(|name| std::fs::read(fixture.0.join(name)).unwrap())
+            .collect();
+        assert!(
+            save_usage_transaction(&ui, &fixture.0, &stale, || Err(io::Error::other(
+                "injected clock error"
+            )))
+            .is_err()
+        );
+        for (name, bytes) in names.iter().zip(&before) {
+            assert_eq!(std::fs::read(fixture.0.join(name)).unwrap(), *bytes);
+        }
+        let saved =
+            save_usage_transaction(&ui, &fixture.0, &stale, || Ok(("2026-11-12".into(), 1000)))
+                .unwrap();
+        assert_eq!(saved.current_day_key, "2026-11-12");
+        assert!(
+            std::fs::read_to_string(fixture.0.join("usage-state.ron"))
+                .unwrap()
+                .contains("daily_records:[]")
+        );
+    }
+
+    #[test]
+    fn late_ui_and_worker_saves_keep_new_day_playback_and_do_not_revive_expired_breaks() {
+        let fixture = Fixture::new();
+        seed(&fixture);
+        let stale = dated_config();
+        let path = fixture.0.join("usage-state.ron");
+        crate::persistence::write_atomic(&path, &stale).unwrap();
+        save_policy(&fixture.0, &stale, Some("2026-11-11")).unwrap();
+        let mut ui = StateStore::new(path);
+        load_usage(&mut ui, Some("2026-11-11")).unwrap();
+        let mut worker = GuardStore::new(fixture.0.clone());
+        let mut current = worker
+            .load_transaction(|| Ok(("2026-11-12".into(), 200_000)))
+            .unwrap()
+            .unwrap();
+        current.playback_ms.insert("video".into(), 99);
+        current.cooldown_until_ms = None;
+        current.last_triggered_day = Some("2026-11-12".into());
+        worker
+            .save_transaction(&current, || Ok(("2026-11-12".into(), 200_000)))
+            .unwrap();
+        let saved = save_usage_transaction(&ui, &fixture.0, &stale, || {
+            Ok(("2026-11-12".into(), 200_000))
+        })
+        .unwrap();
+        assert_eq!(saved.cooldown_until_ms, None);
+        assert_eq!(
+            saved.last_limit_triggered_day.as_deref(),
+            Some("2026-11-12")
+        );
+        assert_eq!(fixture.state().playback_ms["video"], 99);
+        let mut late = GuardState::default();
+        late.day = "2026-11-11".into();
+        late.cooldown_until_ms = Some(123_456);
+        worker
+            .save_transaction(&late, || Ok(("2026-11-12".into(), 200_000)))
+            .unwrap();
+        assert_eq!(fixture.state().playback_ms["video"], 99);
+        assert_eq!(fixture.state().cooldown_until_ms, None);
+        assert_eq!(fixture.state().day, "2026-11-12");
+        save_usage_transaction(&ui, &fixture.0, &saved, || {
+            Ok(("2026-11-10".into(), 200_001))
+        })
+        .unwrap();
+        assert_eq!(fixture.state().day, "2026-11-10");
+        assert_eq!(
+            fixture.state().last_triggered_day.as_deref(),
+            Some("2026-11-12")
         );
     }
 }
