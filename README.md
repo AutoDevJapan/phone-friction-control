@@ -39,6 +39,20 @@ Android 37の専用仮想端末とYouTube 20.10.41では、公開動画の再生
 
 iOS版、Family Controls配布許可、製品用広告IDでの配布版、署名付きAPKの一般配布は未完了です。0.4.2ではAPI26仮想端末の通常設定・30分上限から5分休憩・期限前の再入拒否・満了後の起動・HOME設定を確認しました。物理Galaxy S24（API36、arm64-v8a）では起動・設定変更・Back/Home後の復帰描画に加え、テスト用設定と権限によるChromeの実時計30分利用・5分休憩・期限前後の制御を確認しました。物理端末の通常許可導線・回転・メディア停止は未検証です。API37仮想端末ではYouTube Musicの端末内ファイルを通常UIの30分上限・5分休憩で再生し、停止中の分単位表示の保持、休憩中のPAUSED、期限後の再生復帰を確認しました。条件・測定の限界・成果物は [Androidの検証記録](docs/android-verification.md) を参照してください。Androidの制御範囲をiOSへ当てはめず、製品全体は未完了です。iOSの調査結果と未達条件は `docs/ios-status.md` に記録しています。
 
+## iOSの検査用入口
+
+iOSには、架空データを表示する既存のPreview入口と、通常の保存状態を使うRuntime入口があります。Runtimeは `phone-friction-control-ios-runtime` と `ios-runtime` featureで明示的に選びます。保存先はRuntimeが `Documents/usage-state.ron`、Previewが `Documents/preview-usage-state.ron` です。
+
+Apple SDKとRustの `aarch64-apple-ios-sim` ターゲットがある環境でのビルド指定:
+
+```sh
+cargo build --locked --release --target aarch64-apple-ios-sim --features ios-runtime --bin phone-friction-control-ios-runtime
+```
+
+これはSimulator用の実行ファイルを作る指定です。起動には別途Simulator用 `.app` の構成・署名・インストールが必要です。製品ソース `e594c97` の[実行42964706681](https://github.com/AutoDevJapan/phone-friction-control-ios-sdk-audit/actions/runs/42964706681)では、iOS18.5 Simulatorでリンク・起動し、画面で上限を120分から300分へ変更して、実containerの保存値と新しいプロセスでの300分復元を確認しました。物理iOS端末と正式配布は未検証です。
+
+RuntimeもScreen Timeの許可・アプリ選択・計測・監視・遮蔽にはまだ接続していません。Android専用の説明や操作が残るため、iOSの利用手順としては使えません。Previewの架空利用時間を実計測と扱いません。[iOSの検証状況と残作業](docs/ios-status.md)を参照してください。
+
 ## 検査とAPKの作成
 
 PC上の画面:

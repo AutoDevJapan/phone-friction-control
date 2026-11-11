@@ -1,6 +1,10 @@
 #[cfg(any(target_os = "android", test))]
 mod android_lifecycle;
 mod app;
+#[cfg(any(target_os = "ios", all(test, not(target_os = "android"))))]
+mod ios_runtime;
+#[cfg(target_os = "ios")]
+pub use ios_runtime::run as run_ios_runtime;
 #[cfg(all(feature = "ads-test", feature = "ads-production"))]
 compile_error!("ads-test and ads-production are mutually exclusive");
 
@@ -112,24 +116,7 @@ pub fn run_preview() -> eframe::Result {
     };
 
     #[cfg(target_os = "ios")]
-    let options = {
-        let mut options = options;
-        if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup
-        {
-            let original = std::sync::Arc::clone(&setup.device_descriptor);
-            setup.device_descriptor = std::sync::Arc::new(move |adapter| {
-                let mut descriptor = original(adapter);
-                // Metal on the iOS Simulator can expose 15 rather than the
-                // WebGPU default of 16. Keep all other device requirements.
-                descriptor.required_limits.max_inter_stage_shader_variables = descriptor
-                    .required_limits
-                    .max_inter_stage_shader_variables
-                    .min(adapter.limits().max_inter_stage_shader_variables);
-                descriptor
-            });
-        }
-        options
-    };
+    let options = ios_runtime::configure_options(options);
     eframe::run_native(
         "利用制限",
         options,
