@@ -22,41 +22,14 @@ pub(crate) fn reuse_ui_task_and_retire_duplicate(app: &AndroidApp, owner: i32) {
     app.run_on_java_main_thread(Box::new(move || {
         let result = with_activity(&callback_app, |env, activity| {
             let manager = get_system_service(env, activity, "activity")?;
-            let tasks = env
-                .call_method(&manager, "getAppTasks", "()Ljava/util/List;", &[])?
-                .l()?;
-            let count = env.call_method(&tasks, "size", "()I", &[])?.i()?;
-            let mut found = false;
-            for index in 0..count {
-                let task = env
-                    .call_method(
-                        &tasks,
-                        "get",
-                        "(I)Ljava/lang/Object;",
-                        &[JValue::Int(index)],
-                    )?
-                    .l()?;
-                let info = env
-                    .call_method(
-                        &task,
-                        "getTaskInfo",
-                        "()Landroid/app/ActivityManager$RecentTaskInfo;",
-                        &[],
-                    )?
-                    .l()?;
-                // id becomes -1 while a task is not running. persistentId is
-                // the true task identity even while Back has backgrounded it.
-                let task_id = env.get_field(&info, "persistentId", "I")?.i()?;
-                eprintln!("Native UI task candidate={task_id}, owner={owner}");
-                if task_id == owner {
-                    env.call_method(&task, "moveToFront", "()V", &[])?;
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                return Err(jni::errors::Error::NullPtr("Owning UI task"));
-            }
+            // RecentTasks can temporarily hide the live UI after an update.
+            // Use only the task id held by our live native-owner lease.
+            env.call_method(
+                &manager,
+                "moveTaskToFront",
+                "(II)V",
+                &[JValue::Int(owner), JValue::Int(0)],
+            )?;
             let duplicate = env.call_method(activity, "getTaskId", "()I", &[])?.i()?;
             env.call_method(
                 activity,
