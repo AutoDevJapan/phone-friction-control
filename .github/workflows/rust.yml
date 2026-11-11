@@ -26,7 +26,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Linux window libraries
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev
+        run: bash tools/install-ubuntu-deps.sh libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev
       - run: cargo fmt --all -- --check
       - name: Check native storage capture protocol
         shell: bash
