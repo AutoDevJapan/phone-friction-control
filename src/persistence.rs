@@ -95,7 +95,8 @@ fn replace_with(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) ->
         .parent()
         .ok_or_else(|| io::Error::other("Missing state directory"))?;
     fs::create_dir_all(parent)?;
-    // Each path has one writer (UI or serialized guard worker). Never load staging files.
+    // Owning writers serialize each path; Android UI/guard transactions share a lock.
+    // Never load staging files.
     let staging = path.with_extension("pending");
     let mut file = File::create(&staging)?;
     write(&mut file)?;

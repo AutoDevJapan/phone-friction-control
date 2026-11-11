@@ -129,6 +129,8 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
             let _ = env.exception_clear();
         }
         guard_store.set_day(current_day.clone());
+        let calendar_storage_error =
+            crate::guard_storage::sync_calendar(&dir, current_day.as_deref()).is_err();
         if !guard_store.is_ready() && last_load.elapsed() >= Duration::from_secs(5) {
             last_load = Instant::now();
             match guard_store.load() {
@@ -211,6 +213,17 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                             true,
                             Some(&mut tracker),
                         )?;
+                        guard_store.set_day(Some(snapshot.day_key.clone()));
+                        let snapshot_storage_error =
+                            crate::guard_storage::sync_calendar(&dir, Some(&snapshot.day_key))
+                                .is_err();
+                        // The query owns a fresh calendar observation; it may cross midnight
+                        // or a manual clock change after the loop's earlier read.
+                        let changed_day = state.day != snapshot.day_key;
+                        if changed_day {
+                            last_playing = None;
+                        }
+                        state.prepare_persistence(&policy, Some(&snapshot.day_key));
                         let elapsed = last_sample.elapsed().as_millis() as u64;
                         last_sample = Instant::now();
                         if state
@@ -222,7 +235,6 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                         let mut media_available = false;
                         let mut should_interrupt = false;
                         if snapshot.permission_granted {
-                            let changed_day = state.day != snapshot.day_key;
                             state.sample_usage(
                                 &snapshot.day_key,
                                 snapshot.boot_count,
@@ -271,14 +283,18 @@ fn run_guard(vm: jni::JavaVM, service: GlobalRef, generation: u64) {
                                 || old.triggered_day != state.triggered_day
                                 || old.day != state.day
                         });
-                        let mut storage_error = !guard_store.is_ready() || !config_store.is_ready();
+                        let mut storage_error = calendar_storage_error
+                            || snapshot_storage_error
+                            || !guard_store.is_ready()
+                            || !config_store.is_ready();
                         if crate::enforcement::guard_save_due(
                             last_saved.as_ref() != Some(state),
                             critical,
                             last_save.elapsed(),
                         ) {
                             match guard_store.save(state) {
-                                Ok(()) => {
+                                Ok(saved) => {
+                                    *state = saved;
                                     last_saved = Some(state.clone());
                                     last_save = Instant::now();
                                 }

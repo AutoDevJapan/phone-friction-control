@@ -94,7 +94,11 @@ pub(crate) fn persist_selection_prune(
     store: &crate::guard_storage::GuardStore,
 ) -> bool {
     *pending |= state.retain_selected(policy);
-    if *pending && store.is_ready() && store.save(state).is_ok() {
+    if *pending
+        && store.is_ready()
+        && let Ok(saved) = store.save(state)
+    {
+        *state = saved;
         *pending = false;
         true
     } else {

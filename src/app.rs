@@ -138,7 +138,7 @@ impl SavedState {
 
 #[cfg(any(target_os = "android", test))]
 impl SavedState {
-    fn retain_current_day(&mut self, day: &str) {
+    pub(crate) fn retain_current_day(&mut self, day: &str) {
         if day.is_empty() {
             return;
         }
@@ -324,11 +324,7 @@ impl ControlApp {
                 let day = android_app
                     .as_ref()
                     .and_then(|app| crate::platform::current_day(app).ok());
-                store.load_and_migrate_with(|state: &mut SavedState| {
-                    if let Some(day) = &day {
-                        state.retain_current_day(day);
-                    }
-                })
+                crate::guard_storage::load_usage(store, day.as_deref())
             };
             #[cfg(not(target_os = "android"))]
             let restored = store.load_and_migrate();
@@ -542,15 +538,10 @@ impl ControlApp {
 
     #[cfg(any(target_os = "android", test))]
     fn apply_usage_snapshot(&mut self, snapshot: UsageSnapshot) {
+        self.accept_calendar_day(&snapshot.day_key);
         self.permission_granted = snapshot.permission_granted;
         self.measurement_available = snapshot.permission_granted && snapshot.measurement_available;
         self.today_label = snapshot.day_label.clone();
-        if !snapshot.day_key.is_empty() && self.saved.current_day_key != snapshot.day_key {
-            self.saved.current_day_key = snapshot.day_key.clone();
-            self.saved
-                .daily_records
-                .retain(|r| r.day_key == snapshot.day_key);
-        }
         if !snapshot.permission_granted || !snapshot.measurement_available {
             // Losing access does not turn an already recorded day into zero usage.
             return;
@@ -655,6 +646,15 @@ impl ControlApp {
     }
 
     fn persist_changed_state(&mut self, frame: &mut eframe::Frame) {
+        #[cfg(target_os = "android")]
+        let calendar_day = self
+            .android_app
+            .as_ref()
+            .and_then(|app| crate::platform::current_day(app).ok());
+        #[cfg(target_os = "android")]
+        if let Some(day) = &calendar_day {
+            self.accept_calendar_day(day);
+        }
         #[cfg(target_os = "ios")]
         if self.state_store.is_none() {
             return;
@@ -681,27 +681,24 @@ impl ControlApp {
             if !store.is_ready() {
                 return;
             }
-            match store.save(&self.saved) {
+            #[cfg(target_os = "android")]
+            let result = self
+                .android_app
+                .as_ref()
+                .and_then(|app| app.internal_data_path())
+                .ok_or_else(|| std::io::Error::other("Missing Android state directory"))
+                .and_then(|dir| {
+                    crate::guard_storage::save_usage(
+                        store,
+                        &dir,
+                        &self.saved,
+                        calendar_day.as_deref(),
+                    )
+                });
+            #[cfg(not(target_os = "android"))]
+            let result = store.save(&self.saved);
+            match result {
                 Ok(()) => {
-                    #[cfg(target_os = "android")]
-                    if let Some(dir) = self
-                        .android_app
-                        .as_ref()
-                        .and_then(|app| app.internal_data_path())
-                    {
-                        let day = self
-                            .android_app
-                            .as_ref()
-                            .and_then(|app| crate::platform::current_day(app).ok());
-                        if crate::guard_storage::save_policy(&dir, &self.saved, day.as_deref())
-                            .is_err()
-                        {
-                            self.storage_error = Some(
-                                "使用中の制限設定を保存できません。保存を再試行します。".into(),
-                            );
-                            return;
-                        }
-                    }
                     self.last_persisted = Some(self.saved.clone());
                     self.last_persist_at = Instant::now();
                     self.storage_error = None;
@@ -1636,11 +1633,7 @@ impl eframe::App for ControlApp {
                     .android_app
                     .as_ref()
                     .and_then(|app| crate::platform::current_day(app).ok());
-                store.load_and_migrate_with(|state: &mut SavedState| {
-                    if let Some(day) = &day {
-                        state.retain_current_day(day);
-                    }
-                })
+                crate::guard_storage::load_usage(store, day.as_deref())
             };
             #[cfg(not(target_os = "android"))]
             let restored = store.load_and_migrate();
@@ -1763,29 +1756,37 @@ impl eframe::App for ControlApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        #[cfg(target_os = "android")]
+        let calendar_day = self
+            .android_app
+            .as_ref()
+            .and_then(|app| crate::platform::current_day(app).ok());
+        #[cfg(target_os = "android")]
+        if let Some(day) = &calendar_day {
+            self.accept_calendar_day(day);
+        }
         #[cfg(target_os = "ios")]
         if self.state_store.is_none() {
             return;
         }
         if let Some(store) = &self.state_store {
-            if store.save(&self.saved).is_ok() {
-                #[cfg(target_os = "android")]
-                if let Some(dir) = self
-                    .android_app
-                    .as_ref()
-                    .and_then(|app| app.internal_data_path())
-                {
-                    let day = self
-                        .android_app
-                        .as_ref()
-                        .and_then(|app| crate::platform::current_day(app).ok());
-                    if crate::guard_storage::save_policy(&dir, &self.saved, day.as_deref()).is_err()
-                    {
-                        self.storage_error =
-                            Some("使用中の制限設定を保存できません。保存を再試行します。".into());
-                        return;
-                    }
-                }
+            #[cfg(target_os = "android")]
+            let result = self
+                .android_app
+                .as_ref()
+                .and_then(|app| app.internal_data_path())
+                .ok_or_else(|| std::io::Error::other("Missing Android state directory"))
+                .and_then(|dir| {
+                    crate::guard_storage::save_usage(
+                        store,
+                        &dir,
+                        &self.saved,
+                        calendar_day.as_deref(),
+                    )
+                });
+            #[cfg(not(target_os = "android"))]
+            let result = store.save(&self.saved);
+            if result.is_ok() {
                 self.last_persisted = Some(self.saved.clone());
                 storage.remove_string(SAVE_KEY);
             }
@@ -2406,6 +2407,22 @@ mod tests {
             model.saved.last_limit_triggered_day.as_deref(),
             Some("2026-10-01")
         );
+    }
+
+    #[test]
+    fn unavailable_next_day_snapshot_before_calendar_cannot_retrigger_yesterday() {
+        let mut model = app();
+        model.apply_usage_snapshot(snapshot(1, 44));
+        model.saved.daily_limit_minutes = 30;
+        model.saved.last_limit_triggered_day = Some("2026-10-01".into());
+        let mut next = snapshot(2, 0);
+        next.measurement_available = false;
+        model.apply_usage_snapshot(next);
+        model.accept_calendar_day("2026-10-02");
+        model.open_target_app(model.saved.target_apps[0].clone(), egui::Context::default());
+        assert_eq!(model.saved.cooldown_until_ms, None);
+        assert!(model.saved.daily_records.is_empty());
+        assert_eq!(model.today_usage_ms(), 0);
     }
 
     #[test]
