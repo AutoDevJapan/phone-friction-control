@@ -3,7 +3,7 @@
 
 pub struct SelectionBytes {
     committed: Option<Vec<u8>>,
-    load_failed: bool,
+    load_failed: std::cell::Cell<bool>,
 }
 
 pub(crate) struct SelectionStore {
@@ -16,7 +16,7 @@ impl SelectionStore {
         let mut disk = crate::persistence::StateStore::new(path);
         // Vec<u8> contains only bytes supplied by the public codec, never a
         // serialized Swift allocation or reconstructed opaque token.
-        let saved = disk.load_and_migrate::<Vec<u8>>()?;
+        let saved = disk.load::<Vec<u8>>()?;
         Ok(Self {
             disk,
             bytes: SelectionBytes::loaded::<std::io::Error>(Ok(saved))?,
@@ -27,7 +27,10 @@ impl SelectionStore {
         &self,
         decode: impl FnOnce(&[u8]) -> std::io::Result<T>,
     ) -> std::io::Result<Option<T>> {
-        self.bytes.restore(decode)
+        self.bytes.restore(decode).map_err(|error| match error {
+            RestoreError::Blocked => std::io::Error::other("Selection recovery required"),
+            RestoreError::Decode(error) => error,
+        })
     }
 
     pub(crate) fn save<T>(
@@ -48,7 +51,7 @@ impl SelectionBytes {
         encode: impl FnOnce(&T) -> Result<Vec<u8>, E>,
         atomic_write: impl FnOnce(&[u8]) -> Result<(), E>,
     ) -> Result<(), PublishError<E>> {
-        if self.load_failed {
+        if self.load_failed.get() {
             return Err(PublishError::LoadFailed);
         }
         let bytes = encode(selection).map_err(PublishError::Encode)?;
@@ -58,7 +61,7 @@ impl SelectionBytes {
         match read {
             Ok(committed) => Ok(Self {
                 committed,
-                load_failed: false,
+                load_failed: std::cell::Cell::new(false),
             }),
             Err(error) => Err(error),
         }
@@ -67,15 +70,22 @@ impl SelectionBytes {
     pub fn blocked_after_load_failure() -> Self {
         Self {
             committed: None,
-            load_failed: true,
+            load_failed: std::cell::Cell::new(true),
         }
     }
 
     pub fn restore<T, E>(
         &self,
         decode: impl FnOnce(&[u8]) -> Result<T, E>,
-    ) -> Result<Option<T>, E> {
-        self.committed.as_deref().map(decode).transpose()
+    ) -> Result<Option<T>, RestoreError<E>> {
+        if self.load_failed.get() {
+            return Err(RestoreError::Blocked);
+        }
+        let result = self.committed.as_deref().map(decode).transpose();
+        if result.is_err() {
+            self.load_failed.set(true);
+        }
+        result.map_err(RestoreError::Decode)
     }
 
     pub fn publish<E>(
@@ -83,18 +93,26 @@ impl SelectionBytes {
         encoded: Vec<u8>,
         atomic_write: impl FnOnce(&[u8]) -> Result<(), E>,
     ) -> Result<(), PublishError<E>> {
-        if self.load_failed {
+        if self.load_failed.get() {
             return Err(PublishError::LoadFailed);
         }
         if encoded.is_empty() {
             return Err(PublishError::EmptyEncoding);
         }
-        atomic_write(&encoded).map_err(PublishError::Write)?;
+        if let Err(error) = atomic_write(&encoded) {
+            self.load_failed.set(true);
+            return Err(PublishError::Write(error));
+        }
         self.committed = Some(encoded);
         Ok(())
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub enum RestoreError<E> {
+    Blocked,
+    Decode(E),
+}
 #[derive(Debug, PartialEq)]
 pub enum PublishError<E> {
     Encode(E),
@@ -106,6 +124,66 @@ pub enum PublishError<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn opening_invalid_codec_preserves_noncanonical_disk_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "ios-codec-readonly-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("selection.ron");
+        let original = b"[ 9, 8, ]\n";
+        std::fs::write(&path, original).unwrap();
+        let mut store = SelectionStore::open(path.clone()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(
+            store
+                .restore::<()>(|_| Err(std::io::Error::other("invalid codec")))
+                .is_err()
+        );
+        assert!(store.save(&7u8, |v| Ok(vec![*v])).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+    #[test]
+    fn publish_then_error_and_decode_error_block_further_use() {
+        let mut state = SelectionBytes::loaded::<()>(Ok(Some(vec![1, 2]))).unwrap();
+        let mut disk = vec![1, 2];
+        assert!(
+            state
+                .publish(vec![3], |bytes| {
+                    disk = bytes.to_vec();
+                    Err("sync after rename")
+                })
+                .is_err()
+        );
+        assert_eq!(disk, vec![3]);
+        assert_eq!(
+            state.restore::<(), ()>(|_| panic!("uncertain bytes")),
+            Err(RestoreError::Blocked)
+        );
+        assert_eq!(
+            state.publish::<()>(vec![4], |_| panic!("blocked write")),
+            Err(PublishError::LoadFailed)
+        );
+        let reopened = SelectionBytes::loaded::<()>(Ok(Some(disk))).unwrap();
+        assert_eq!(reopened.restore::<_, ()>(|b| Ok(b[0])).unwrap(), Some(3));
+        let mut invalid = SelectionBytes::loaded::<()>(Ok(Some(vec![9]))).unwrap();
+        assert_eq!(
+            invalid.restore::<(), _>(|_| Err("decode")),
+            Err(RestoreError::Decode("decode"))
+        );
+        assert_eq!(
+            invalid.publish::<()>(vec![8], |_| panic!("decode blocked write")),
+            Err(PublishError::LoadFailed)
+        );
+    }
     #[test]
     fn disk_restart_restores_codec_bytes_and_failed_encode_keeps_file() {
         let root = std::env::temp_dir().join(format!(
@@ -173,8 +251,8 @@ mod tests {
             Err(PublishError::Write("disk"))
         );
         assert_eq!(
-            state.restore::<_, ()>(|bytes| Ok(bytes.to_vec())).unwrap(),
-            Some(vec![1, 2])
+            state.restore::<_, ()>(|bytes| Ok(bytes.to_vec())),
+            Err(RestoreError::Blocked)
         );
     }
     #[test]
@@ -182,11 +260,11 @@ mod tests {
         let state = SelectionBytes::loaded::<()>(Ok(Some(vec![1, 2]))).unwrap();
         assert_eq!(
             state.restore::<(), _>(|_| Err("invalid codec bytes")),
-            Err("invalid codec bytes")
+            Err(RestoreError::Decode("invalid codec bytes"))
         );
         assert_eq!(
-            state.restore::<_, ()>(|bytes| Ok(bytes.len())).unwrap(),
-            Some(2)
+            state.restore::<_, ()>(|bytes| Ok(bytes.len())),
+            Err(RestoreError::Blocked)
         );
     }
     #[test]
