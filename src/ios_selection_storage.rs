@@ -4,6 +4,7 @@
 struct SelectionBytes {
     committed: Option<Vec<u8>>,
     load_failed: std::cell::Cell<bool>,
+    verified: std::cell::Cell<bool>,
 }
 
 pub(crate) struct SelectionStore {
@@ -68,7 +69,7 @@ impl SelectionBytes {
         encode: impl FnOnce(&T) -> Result<Vec<u8>, E>,
         atomic_write: impl FnOnce(&[u8]) -> Result<(), E>,
     ) -> Result<(), PublishError<E>> {
-        if self.load_failed.get() {
+        if self.load_failed.get() || !self.verified.get() {
             return Err(PublishError::LoadFailed);
         }
         let bytes = encode(selection).map_err(PublishError::Encode)?;
@@ -77,6 +78,7 @@ impl SelectionBytes {
     fn loaded<E>(read: Result<Option<Vec<u8>>, E>) -> Result<Self, E> {
         match read {
             Ok(committed) => Ok(Self {
+                verified: std::cell::Cell::new(committed.is_none()),
                 committed,
                 load_failed: std::cell::Cell::new(false),
             }),
@@ -87,6 +89,7 @@ impl SelectionBytes {
     fn blocked_after_load_failure() -> Self {
         Self {
             committed: None,
+            verified: std::cell::Cell::new(false),
             load_failed: std::cell::Cell::new(true),
         }
     }
@@ -102,6 +105,9 @@ impl SelectionBytes {
         if result.is_err() {
             self.load_failed.set(true);
         }
+        if result.is_ok() {
+            self.verified.set(true);
+        }
         result.map_err(RestoreError::Decode)
     }
 
@@ -110,7 +116,7 @@ impl SelectionBytes {
         encoded: Vec<u8>,
         atomic_write: impl FnOnce(&[u8]) -> Result<(), E>,
     ) -> Result<(), PublishError<E>> {
-        if self.load_failed.get() {
+        if self.load_failed.get() || !self.verified.get() {
             return Err(PublishError::LoadFailed);
         }
         if encoded.is_empty() {
@@ -141,6 +147,23 @@ pub enum PublishError<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn existing_file_requires_its_own_codec_validation_before_replacement() {
+        let mut state = SelectionBytes::loaded::<()>(Ok(Some(vec![9, 8]))).unwrap();
+        assert_eq!(
+            state.encode_and_publish::<_, ()>(
+                &7,
+                |_| panic!("unverified encode"),
+                |_| panic!("unverified write")
+            ),
+            Err(PublishError::LoadFailed)
+        );
+        state.restore::<_, ()>(|b| Ok(b.to_vec())).unwrap();
+        state
+            .encode_and_publish(&7u8, |v| Ok::<_, ()>(vec![*v]), |_| Ok(()))
+            .unwrap();
+        assert_eq!(state.restore::<_, ()>(|b| Ok(b[0])).unwrap(), Some(7));
+    }
     #[test]
     fn checked_codec_rejects_mismatch_before_disk_publication() {
         let root = std::env::temp_dir().join(format!(
@@ -210,6 +233,7 @@ mod tests {
     #[test]
     fn publish_then_error_and_decode_error_block_further_use() {
         let mut state = SelectionBytes::loaded::<()>(Ok(Some(vec![1, 2]))).unwrap();
+        state.restore::<_, ()>(|b| Ok(b.to_vec())).unwrap();
         let mut disk = vec![1, 2];
         assert!(
             state
@@ -278,6 +302,7 @@ mod tests {
     #[test]
     fn codec_consumer_only_publishes_successful_encoding() {
         let mut state = SelectionBytes::loaded::<()>(Ok(Some(vec![9]))).unwrap();
+        state.restore::<_, ()>(|b| Ok(b.to_vec())).unwrap();
         assert_eq!(
             state.encode_and_publish(&(), |_| Err("codec"), |_| panic!("must not write")),
             Err(PublishError::Encode("codec"))
@@ -302,6 +327,7 @@ mod tests {
     #[test]
     fn failed_publication_keeps_previous_restorable_bytes() {
         let mut state = SelectionBytes::loaded::<()>(Ok(Some(vec![1, 2]))).unwrap();
+        state.restore::<_, ()>(|b| Ok(b.to_vec())).unwrap();
         assert_eq!(
             state.publish(vec![3], |_| Err("disk")),
             Err(PublishError::Write("disk"))
