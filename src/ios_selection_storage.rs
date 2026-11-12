@@ -12,6 +12,23 @@ pub(crate) struct SelectionStore {
 }
 
 impl SelectionStore {
+    pub(crate) fn save_checked<T>(
+        &mut self,
+        selection: &T,
+        encode: impl FnOnce(&T) -> std::io::Result<Vec<u8>>,
+        decode_and_compare: impl FnOnce(&[u8], &T) -> std::io::Result<bool>,
+    ) -> Result<(), PublishError<std::io::Error>> {
+        self.save(selection, |value| {
+            let bytes = encode(value)?;
+            if bytes.is_empty() || !decode_and_compare(&bytes, value)? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Selection codec roundtrip mismatch",
+                ));
+            }
+            Ok(bytes)
+        })
+    }
     pub(crate) fn open(path: std::path::PathBuf) -> std::io::Result<Self> {
         let mut disk = crate::persistence::StateStore::new(path);
         // Vec<u8> contains only bytes supplied by the public codec, never a
@@ -124,6 +141,45 @@ pub enum PublishError<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn checked_codec_rejects_mismatch_before_disk_publication() {
+        let root = std::env::temp_dir().join(format!(
+            "ios-roundtrip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("selection.ron");
+        let mut store = SelectionStore::open(path.clone()).unwrap();
+        store
+            .save_checked(&7u8, |v| Ok(vec![*v]), |b, v| Ok(b == [*v]))
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            store
+                .save_checked(&8u8, |_| Ok(vec![9]), |b, v| Ok(b == [*v]))
+                .is_err()
+        );
+        assert!(
+            store
+                .save_checked(
+                    &8u8,
+                    |_| Ok(vec![8]),
+                    |_, _| Err(std::io::Error::other("decode"))
+                )
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(store);
+        let reopened = SelectionStore::open(path.clone()).unwrap();
+        assert_eq!(reopened.restore(|b| Ok(b[0])).unwrap(), Some(7));
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
     #[test]
     fn opening_invalid_codec_preserves_noncanonical_disk_bytes() {
         let root = std::env::temp_dir().join(format!(
