@@ -1,7 +1,7 @@
 //! Unconnected product candidate: bytes must come from the public native codec.
 //! No Swift layout, token construction, or native codec implementation here.
 
-pub struct SelectionBytes {
+struct SelectionBytes {
     committed: Option<Vec<u8>>,
     load_failed: std::cell::Cell<bool>,
 }
@@ -50,7 +50,7 @@ impl SelectionStore {
         })
     }
 
-    pub(crate) fn save<T>(
+    fn save<T>(
         &mut self,
         selection: &T,
         encode: impl FnOnce(&T) -> std::io::Result<Vec<u8>>,
@@ -62,7 +62,7 @@ impl SelectionStore {
 }
 
 impl SelectionBytes {
-    pub fn encode_and_publish<T, E>(
+    fn encode_and_publish<T, E>(
         &mut self,
         selection: &T,
         encode: impl FnOnce(&T) -> Result<Vec<u8>, E>,
@@ -74,7 +74,7 @@ impl SelectionBytes {
         let bytes = encode(selection).map_err(PublishError::Encode)?;
         self.publish(bytes, atomic_write)
     }
-    pub fn loaded<E>(read: Result<Option<Vec<u8>>, E>) -> Result<Self, E> {
+    fn loaded<E>(read: Result<Option<Vec<u8>>, E>) -> Result<Self, E> {
         match read {
             Ok(committed) => Ok(Self {
                 committed,
@@ -84,14 +84,14 @@ impl SelectionBytes {
         }
     }
 
-    pub fn blocked_after_load_failure() -> Self {
+    fn blocked_after_load_failure() -> Self {
         Self {
             committed: None,
             load_failed: std::cell::Cell::new(true),
         }
     }
 
-    pub fn restore<T, E>(
+    fn restore<T, E>(
         &self,
         decode: impl FnOnce(&[u8]) -> Result<T, E>,
     ) -> Result<Option<T>, RestoreError<E>> {
@@ -105,7 +105,7 @@ impl SelectionBytes {
         result.map_err(RestoreError::Decode)
     }
 
-    pub fn publish<E>(
+    fn publish<E>(
         &mut self,
         encoded: Vec<u8>,
         atomic_write: impl FnOnce(&[u8]) -> Result<(), E>,
