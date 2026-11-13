@@ -43,7 +43,7 @@ run_bounded typecheck xcrun swiftc "${ARGS[@]}" -typecheck "${INPUTS[@]}" \
 run_bounded tests xcrun swiftc "${ARGS[@]}" -typecheck "${INPUTS[@]}" ios/SelectionCodecTests.swift \
   -F "$(xcode-select -p)/Platforms/iPhoneSimulator.platform/Developer/Library/Frameworks" \
   > "$OUT/tests.stdout.txt" 2> "$OUT/tests.stderr.txt"
-run_bounded ir xcrun swiftc "${ARGS[@]}" -emit-ir "${INPUTS[@]}" \
+run_bounded ir xcrun swiftc "${ARGS[@]}" -whole-module-optimization -emit-ir "${INPUTS[@]}" \
   -emit-objc-header-path "$OUT/PFCSelection-Swift.h" -o "$OUT/selection.ll" \
   > "$OUT/ir.stdout.txt" 2> "$OUT/ir.stderr.txt"
 run_bounded object xcrun swiftc "${ARGS[@]}" -whole-module-optimization -emit-object "${INPUTS[@]}" \
