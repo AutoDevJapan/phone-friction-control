@@ -1,5 +1,57 @@
 use crate::ControlApp;
 
+#[allow(dead_code)]
+pub(crate) struct NativeSelectionSession {
+    store: crate::ios_selection_storage::RuntimeSelectionStore<
+        crate::ios_selection_bridge::NativeCodec,
+    >,
+    codec: crate::ios_selection_bridge::NativeCodec,
+    selection: Option<crate::ios_selection_bridge::NativeSelection>,
+    recovery_required: bool,
+}
+
+impl NativeSelectionSession {
+    /// Same admission and main-thread requirements as open_native_selection.
+    pub(crate) unsafe fn open(
+        path: std::path::PathBuf,
+        api: crate::ios_selection_bridge::NativeApi,
+    ) -> std::io::Result<Self> {
+        let (store, selection) = unsafe { open_native_selection(path, api) }?;
+        Ok(Self {
+            store,
+            codec: unsafe { crate::ios_selection_bridge::NativeCodec::from_verified_api(api) },
+            selection,
+            recovery_required: false,
+        })
+    }
+
+    /// Consumes exactly one +1 Picker handle from the admitted provider, even
+    /// when publication fails. A failed session must be dropped before reopen.
+    pub(crate) unsafe fn commit_picker_handle(
+        &mut self,
+        handle: std::ptr::NonNull<std::ffi::c_void>,
+    ) -> std::io::Result<()> {
+        let proposed = unsafe { self.codec.adopt_owned_handle(handle) };
+        if self.recovery_required {
+            return Err(std::io::Error::other("Selection recovery required"));
+        }
+        if let Err(error) = self.store.commit(&proposed) {
+            self.recovery_required = true;
+            // Do not expose potentially stale state after uncertain publication.
+            self.selection = None;
+            return Err(std::io::Error::other(format!(
+                "Selection publication failed: {error:?}"
+            )));
+        }
+        self.selection = Some(proposed);
+        Ok(())
+    }
+
+    pub(crate) fn selection(&self) -> Option<&crate::ios_selection_bridge::NativeSelection> {
+        self.selection.as_ref()
+    }
+}
+
 /// Candidate Runtime callsite. The caller must admit the compiled provider ABI
 /// and main-thread/image lifetime before supplying its function table. Ordinary
 /// startup does not call this while Apple linkage remains unverified.

@@ -180,6 +180,18 @@ mod tests {
         // Synthetic provider implements this header's contract, not Apple ABI.
         let codec = unsafe { NativeCodec::from_verified_api(api) };
         let selected = codec.decode(&[7]).unwrap();
+        let mut runtime =
+            unsafe { crate::ios_runtime::NativeSelectionSession::open(path.clone(), api) }.unwrap();
+        assert!(runtime.selection().is_none());
+        let transferred = NonNull::new(unsafe { decode_fixture([7].as_ptr(), 1) }).unwrap();
+        unsafe { runtime.commit_picker_handle(transferred) }.unwrap();
+        assert!(runtime.selection().is_some_and(|value| value == &selected));
+        drop(runtime);
+        let runtime =
+            unsafe { crate::ios_runtime::NativeSelectionSession::open(path.clone(), api) }.unwrap();
+        assert!(runtime.selection().is_some_and(|value| value == &selected));
+        drop(runtime);
+        std::fs::remove_file(&path).unwrap();
         let (mut session, initial) =
             unsafe { crate::ios_runtime::open_native_selection(path.clone(), api) }.unwrap();
         assert!(initial.is_none());
