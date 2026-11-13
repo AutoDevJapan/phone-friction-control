@@ -5,6 +5,7 @@ test "$#" = 1
 OUT="$1"
 test ! -e "$OUT"
 mkdir -p "$OUT"
+OUT=$(cd "$OUT" && pwd)
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 git rev-parse HEAD > "$OUT/source.txt"
