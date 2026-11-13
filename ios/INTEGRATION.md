@@ -66,3 +66,20 @@ symbol resolver or raw Rust session pointer is enabled. The app owner must keep
 the session alive through all Binding copies, close callbacks before teardown,
 then demonstrate restoration using the real codec. Source unit tests with a
 synthetic provider do not certify that embedding or the native destructor path.
+
+## Existing workflow connection
+
+The SDK compiler caller must check out the product into a separate subdirectory
+at an explicitly supplied full commit SHA, verify `git rev-parse HEAD` against
+that SHA, and invoke `bash ios/compile-selection-codec.sh` from that product
+checkout. The output argument must be a new directory under the existing runner
+temporary directory. Upload that entire output directory with `if: always()`;
+preserve a failed stage's status/diagnostics and do not replace its exit code
+with the upload result. Include this driver and both C headers in the input hash
+manifest. The existing SDK ownership compiler job and its old outputs remain a
+separate mode: no existing successful inspection is relabeled as codec proof.
+
+This specifies the producer/consumer wiring only. The original SDK workflow is
+not modified by this product documentation; its exact source access and remote
+OAuth workflow scope remain separate dependencies. No additional remote run or
+authentication action is authorized or performed by this file.
