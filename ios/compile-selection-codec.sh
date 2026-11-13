@@ -20,17 +20,26 @@ shasum -a 256 "${INPUTS[@]}" ios/SelectionSession.h ios/SelectionBridge.h \
   ios/SelectionBridgeABI.c Cargo.lock > "$OUT/inputs-sha256.txt"
 ARGS=(-target "$TARGET" -sdk "$SDK" -swift-version 6 -parse-as-library
   -module-name PFCSelection -import-objc-header ios/SelectionSession.h)
-run_bounded() { perl -e 'alarm 60; exec @ARGV; die "exec failed\n"' "$@"; }
+run_bounded() {
+  local stage status started ended
+  stage="$1"; shift
+  started=$(date +%s)
+  if perl -e 'alarm 60; exec @ARGV; die "exec failed\n"' "$@"; then status=0; else status=$?; fi
+  ended=$(date +%s)
+  printf 'stage=%s\nstarted_epoch=%s\nended_epoch=%s\nstatus=%s\nlimit_seconds=60\nlimit_sufficiency_measured=false\n' \
+    "$stage" "$started" "$ended" "$status" > "$OUT/$stage-status.txt"
+  return "$status"
+}
 # Each full diagnostic stream is retained; a failed stage stops compilation.
-run_bounded xcrun swiftc "${ARGS[@]}" -typecheck "${INPUTS[@]}" \
+run_bounded typecheck xcrun swiftc "${ARGS[@]}" -typecheck "${INPUTS[@]}" \
   > "$OUT/typecheck.stdout.txt" 2> "$OUT/typecheck.stderr.txt"
-run_bounded xcrun swiftc "${ARGS[@]}" -typecheck "${INPUTS[@]}" ios/SelectionCodecTests.swift \
+run_bounded tests xcrun swiftc "${ARGS[@]}" -typecheck "${INPUTS[@]}" ios/SelectionCodecTests.swift \
   -F "$(xcode-select -p)/Platforms/iPhoneSimulator.platform/Developer/Library/Frameworks" \
   > "$OUT/tests.stdout.txt" 2> "$OUT/tests.stderr.txt"
-run_bounded xcrun swiftc "${ARGS[@]}" -emit-ir "${INPUTS[@]}" \
+run_bounded ir xcrun swiftc "${ARGS[@]}" -emit-ir "${INPUTS[@]}" \
   -emit-objc-header-path "$OUT/PFCSelection-Swift.h" -o "$OUT/selection.ll" \
   > "$OUT/ir.stdout.txt" 2> "$OUT/ir.stderr.txt"
-run_bounded xcrun clang -target "$TARGET" -isysroot "$SDK" -fsyntax-only \
+run_bounded c xcrun clang -target "$TARGET" -isysroot "$SDK" -fsyntax-only \
   -std=c11 -Wall -Wextra -Werror ios/SelectionBridgeABI.c \
   > "$OUT/c.stdout.txt" 2> "$OUT/c.stderr.txt"
 # Generated-header export presence is an observation, not assumed ABI proof.
