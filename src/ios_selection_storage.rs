@@ -25,6 +25,9 @@ pub(crate) trait SelectionCodec {
 pub(crate) struct RuntimeSelectionStore<C: SelectionCodec> {
     store: SelectionStore,
     codec: C,
+    // The sidecar is deliberately retained on disk: removing a locked inode
+    // would allow a new opener to lock a different file at the same pathname.
+    _ownership: std::fs::File,
 }
 
 impl<C: SelectionCodec> RuntimeSelectionStore<C> {
@@ -32,9 +35,32 @@ impl<C: SelectionCodec> RuntimeSelectionStore<C> {
         path: std::path::PathBuf,
         codec: C,
     ) -> std::io::Result<(Self, Option<C::Selection>)> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("missing parent"))?;
+        std::fs::create_dir_all(parent)?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("missing filename"))?;
+        let mut lock_name = name.to_os_string();
+        lock_name.push(".owner-lock");
+        let ownership = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(parent.join(lock_name))?;
+        ownership.try_lock().map_err(std::io::Error::other)?;
         let store = SelectionStore::open(path)?;
         let restored = store.restore(|bytes| codec.decode(bytes))?;
-        Ok((Self { store, codec }, restored))
+        Ok((
+            Self {
+                store,
+                codec,
+                _ownership: ownership,
+            },
+            restored,
+        ))
     }
 
     pub(crate) fn commit(
@@ -212,10 +238,12 @@ mod tests {
         let path = root.join("selection.ron");
         let (mut session, initial) = RuntimeSelectionStore::open(path.clone(), Codec).unwrap();
         assert_eq!(initial, None);
+        assert!(RuntimeSelectionStore::open(path.clone(), Codec).is_err());
         session.commit(&7).unwrap();
         drop(session);
         let (mut reopened, restored) = RuntimeSelectionStore::open(path.clone(), Codec).unwrap();
         assert_eq!(restored, Some(7));
+        assert!(RuntimeSelectionStore::open(path.clone(), Codec).is_err());
         reopened.commit(&8).unwrap();
         drop(reopened);
         std::fs::write(&path, "[1,2]").unwrap();
@@ -223,6 +251,7 @@ mod tests {
         assert!(RuntimeSelectionStore::open(path.clone(), Codec).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
         std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(root.join("selection.ron.owner-lock")).unwrap();
         std::fs::remove_dir(root).unwrap();
     }
     #[test]
