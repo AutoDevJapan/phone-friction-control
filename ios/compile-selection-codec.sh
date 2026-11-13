@@ -18,12 +18,18 @@ TARGET=arm64-apple-ios18.5-simulator
 INPUTS=(ios/SelectionCodec.swift ios/SelectionBridge.swift ios/SelectionPicker.swift
   ios/SelectionEmbedding.swift ios/SelectionSessionAdapter.swift)
 shasum -a 256 "${INPUTS[@]}" ios/SelectionSession.h ios/SelectionBridge.h \
-  ios/SelectionBridgeABI.c Cargo.lock > "$OUT/inputs-sha256.txt"
+  ios/SelectionBridgeABI.c ios/SelectionCodecTests.swift \
+  ios/compile-selection-codec.sh Cargo.lock > "$OUT/inputs-sha256.txt"
 ARGS=(-target "$TARGET" -sdk "$SDK" -swift-version 6 -parse-as-library
   -module-name PFCSelection -import-objc-header ios/SelectionSession.h)
 run_bounded() {
   local stage status started ended
   stage="$1"; shift
+  # NUL-separated argv is exact even for spaces/newlines; %q is a readable
+  # shell rendering of the same arguments, not an executable reconstruction.
+  printf '%s\0' "$@" > "$OUT/$stage-argv.nul"
+  printf '%q ' "$@" > "$OUT/$stage-command.txt"
+  printf '\n' >> "$OUT/$stage-command.txt"
   started=$(date +%s)
   if perl -e 'alarm 60; exec @ARGV; die "exec failed\n"' "$@"; then status=0; else status=$?; fi
   ended=$(date +%s)
