@@ -37,13 +37,18 @@ effect. These source candidates do not establish an additional build service.
 
 ## Compiler handoff
 
-Fixed implementation input: commit
-`19b537d045130a4a7087a2d70a2bfaddc2231f2c` (parent `1a61336f`).
+Reviewed implementation input: commit
+`645780a8068e0685f02cd51f5d58ce84ddd39277`. The driver at that version
+does not yet enforce generated-header ABI comparison; its success must not be
+accepted as completion of the compiler contract below.
 Use the tracked source bytes and Cargo.lock from that commit, not a working-tree
 copy. Swift inputs are SelectionCodec.swift, SelectionBridge.swift,
-SelectionPicker.swift and SelectionCodecTests.swift. C inputs are
-SelectionBridge.h and SelectionBridgeABI.c. Rust consumers are
-src/ios_selection_bridge.rs, src/ios_selection_storage.rs and src/ios_runtime.rs.
+SelectionPicker.swift, SelectionEmbedding.swift, SelectionSessionAdapter.swift
+and SelectionCodecTests.swift. C inputs are SelectionBridge.h,
+SelectionSession.h and SelectionBridgeABI.c. Rust consumers are
+src/ios_selection_bridge.rs, src/ios_selection_session_ffi.rs,
+src/ios_selection_storage.rs and src/ios_runtime.rs; src/lib.rs supplies cfg
+connections. The compiler driver itself is ios/compile-selection-codec.sh.
 
 The existing authorized Apple compiler job must preserve compiler/SDK versions,
 target triple, source hashes, full diagnostics, generated Objective-C header,
