@@ -12,6 +12,83 @@ pub(crate) struct SelectionStore {
     bytes: SelectionBytes,
 }
 
+/// Native implementations must return owned bytes and decoded owned values.
+/// Neither operation may retain a borrowed Data/NSData buffer after returning.
+pub(crate) trait SelectionCodec {
+    type Selection: PartialEq;
+    fn encode(&self, value: &Self::Selection) -> std::io::Result<Vec<u8>>;
+    fn decode(&self, bytes: &[u8]) -> std::io::Result<Self::Selection>;
+}
+
+/// Binds restoration and publication to one codec instance. Opening an existing
+/// file always validates it before the caller can publish a replacement.
+pub(crate) struct RuntimeSelectionStore<C: SelectionCodec> {
+    store: SelectionStore,
+    codec: C,
+    // The sidecar is deliberately retained on disk: removing a locked inode
+    // would allow a new opener to lock a different file at the same pathname.
+    _ownership: std::fs::File,
+}
+
+impl<C: SelectionCodec> RuntimeSelectionStore<C> {
+    pub(crate) fn open(
+        path: std::path::PathBuf,
+        codec: C,
+    ) -> std::io::Result<(Self, Option<C::Selection>)> {
+        // StateStore reserves the sibling `.pending` name for atomic staging.
+        // Restrict this consumer to `.ron` state files so another admitted
+        // Selection session cannot use that staging pathname as its own state.
+        if path.extension() != Some(std::ffi::OsStr::new("ron")) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Selection state requires a .ron pathname",
+            ));
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("missing parent"))?;
+        std::fs::create_dir_all(parent)?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("missing filename"))?;
+        let mut lock_name = name.to_os_string();
+        lock_name.push(".owner-lock");
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_SHARE_READ | FILE_SHARE_WRITE, deliberately no DELETE.
+            // Keep the locked directory entry pinned throughout the session.
+            options.share_mode(0x1 | 0x2);
+        }
+        let ownership = options.open(parent.join(lock_name))?;
+        ownership.try_lock().map_err(std::io::Error::other)?;
+        let store = SelectionStore::open(path)?;
+        let restored = store.restore(|bytes| codec.decode(bytes))?;
+        Ok((
+            Self {
+                store,
+                codec,
+                _ownership: ownership,
+            },
+            restored,
+        ))
+    }
+
+    pub(crate) fn commit(
+        &mut self,
+        selection: &C::Selection,
+    ) -> Result<(), PublishError<std::io::Error>> {
+        let codec = &self.codec;
+        self.store.save_checked(
+            selection,
+            |value| codec.encode(value),
+            |bytes, original| Ok(codec.decode(bytes)? == *original),
+        )
+    }
+}
+
 impl SelectionStore {
     pub(crate) fn save_checked<T>(
         &mut self,
@@ -147,6 +224,55 @@ pub enum PublishError<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn runtime_adapter_restores_before_commit_and_rejects_invalid_disk() {
+        struct Codec;
+        impl SelectionCodec for Codec {
+            type Selection = u8;
+            fn encode(&self, value: &u8) -> std::io::Result<Vec<u8>> {
+                Ok(vec![*value])
+            }
+            fn decode(&self, bytes: &[u8]) -> std::io::Result<u8> {
+                match bytes {
+                    [value] => Ok(*value),
+                    _ => Err(std::io::Error::other("invalid codec bytes")),
+                }
+            }
+        }
+        let root = std::env::temp_dir().join(format!(
+            "ios-runtime-codec-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("selection.ron");
+        assert!(RuntimeSelectionStore::open(root.join("selection.pending"), Codec).is_err());
+        assert!(!root.join("selection.pending").exists());
+        let (mut session, initial) = RuntimeSelectionStore::open(path.clone(), Codec).unwrap();
+        assert_eq!(initial, None);
+        #[cfg(windows)]
+        assert!(std::fs::remove_file(root.join("selection.ron.owner-lock")).is_err());
+        assert!(RuntimeSelectionStore::open(path.clone(), Codec).is_err());
+        assert!(RuntimeSelectionStore::open(root.join(".").join("selection.ron"), Codec).is_err());
+        session.commit(&7).unwrap();
+        drop(session);
+        let (mut reopened, restored) = RuntimeSelectionStore::open(path.clone(), Codec).unwrap();
+        assert_eq!(restored, Some(7));
+        assert!(RuntimeSelectionStore::open(path.clone(), Codec).is_err());
+        assert!(RuntimeSelectionStore::open(root.join(".").join("selection.ron"), Codec).is_err());
+        reopened.commit(&8).unwrap();
+        drop(reopened);
+        std::fs::write(&path, "[1,2]").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(RuntimeSelectionStore::open(path.clone(), Codec).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(root.join("selection.ron.owner-lock")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
     #[test]
     fn existing_file_requires_its_own_codec_validation_before_replacement() {
         let mut state = SelectionBytes::loaded::<()>(Ok(Some(vec![9, 8]))).unwrap();
