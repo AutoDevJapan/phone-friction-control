@@ -7,6 +7,14 @@ private final class OwnedSelection {
     init(_ value: FamilyActivitySelection) { self.value = value }
 }
 
+/// Native Picker integration transfers an owned handle, never the layout of
+/// FamilyActivitySelection. The receiver must eventually call release once.
+@available(iOS 16.0, *)
+@MainActor
+func retainSelectionForRuntime(_ selection: FamilyActivitySelection) -> UnsafeMutableRawPointer {
+    Unmanaged.passRetained(OwnedSelection(selection)).toOpaque()
+}
+
 // Only bridge-produced handles are accepted. Arbitrary addresses cannot be
 // validated by Unmanaged; callers must preserve the header's ownership contract.
 @available(iOS 16.0, *)

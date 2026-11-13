@@ -14,6 +14,15 @@ pub(crate) struct NativeApi {
     pub release: unsafe extern "C" fn(*mut c_void),
 }
 
+impl NativeApi {
+    fn same_provider(self, other: Self) -> bool {
+        std::ptr::fn_addr_eq(self.decode, other.decode)
+            && std::ptr::fn_addr_eq(self.encode, other.encode)
+            && std::ptr::fn_addr_eq(self.equal, other.equal)
+            && std::ptr::fn_addr_eq(self.release, other.release)
+    }
+}
+
 pub(crate) struct NativeSelection {
     handle: NonNull<c_void>,
     api: NativeApi,
@@ -29,9 +38,7 @@ impl Drop for NativeSelection {
 
 impl PartialEq for NativeSelection {
     fn eq(&self, other: &Self) -> bool {
-        if !std::ptr::fn_addr_eq(self.api.equal, other.api.equal)
-            || !std::ptr::fn_addr_eq(self.api.release, other.api.release)
-        {
+        if !self.api.same_provider(other.api) {
             return false;
         }
         unsafe { (self.api.equal)(self.handle.as_ptr(), other.handle.as_ptr()) == 1 }
@@ -49,6 +56,16 @@ impl NativeCodec {
     pub(crate) unsafe fn from_verified_api(api: NativeApi) -> Self {
         Self {
             api,
+            _main_thread: PhantomData,
+        }
+    }
+
+    /// Transfer one +1 handle from this exact admitted provider, on the main
+    /// thread. The caller must not release or use that ownership afterward.
+    pub(crate) unsafe fn adopt_owned_handle(&self, handle: NonNull<c_void>) -> NativeSelection {
+        NativeSelection {
+            handle,
+            api: self.api,
             _main_thread: PhantomData,
         }
     }
@@ -84,9 +101,7 @@ impl SelectionCodec for NativeCodec {
     type Selection = NativeSelection;
 
     fn encode(&self, value: &NativeSelection) -> io::Result<Vec<u8>> {
-        if !std::ptr::fn_addr_eq(self.api.release, value.api.release)
-            || !std::ptr::fn_addr_eq(self.api.encode, value.api.encode)
-        {
+        if !self.api.same_provider(value.api) {
             return Err(io::Error::other("Selection provider mismatch"));
         }
         let mut transfer = Transfer {
