@@ -154,6 +154,70 @@ mod tests {
         assert_eq!(offset_of!(NativeApi, equal), 2 * slot);
         assert_eq!(offset_of!(NativeApi, release), 3 * slot);
     }
+
+    #[test]
+    fn encoding_error_keeps_handle_owned_and_each_drop_releases_once() {
+        use std::cell::Cell;
+        // Dedicated provider counters are thread-local: parallel tests cannot
+        // turn another provider's releases into this test's lifetime evidence.
+        thread_local! {
+            static COUNTS: Cell<(usize, usize, usize, bool)> = const {
+                Cell::new((0, 0, 0, true))
+            };
+        }
+        unsafe extern "C" fn decode(bytes: *const u8, count: isize) -> *mut c_void {
+            if bytes.is_null() || count != 1 {
+                return std::ptr::null_mut();
+            }
+            COUNTS.with(|state| {
+                let (allocated, released, encoded, fail) = state.get();
+                state.set((allocated + 1, released, encoded, fail));
+            });
+            Box::into_raw(Box::new(unsafe { *bytes })).cast()
+        }
+        unsafe extern "C" fn encode(handle: *mut c_void, context: *mut c_void, sink: Sink) -> i32 {
+            let fail = COUNTS.with(|state| {
+                let (allocated, released, encoded, fail) = state.get();
+                state.set((allocated, released, encoded + 1, fail));
+                fail
+            });
+            if fail {
+                return -2;
+            }
+            unsafe { sink(context, handle.cast(), 1) }
+        }
+        unsafe extern "C" fn release(handle: *mut c_void) {
+            drop(unsafe { Box::from_raw(handle.cast::<u8>()) });
+            COUNTS.with(|state| {
+                let (allocated, released, encoded, fail) = state.get();
+                state.set((allocated, released + 1, encoded, fail));
+            });
+        }
+        let api = NativeApi {
+            decode,
+            encode,
+            equal: equal_fixture,
+            release,
+        };
+        {
+            let codec = unsafe { NativeCodec::from_verified_api(api) };
+            let selection = codec.decode(&[7]).unwrap();
+            assert!(codec.encode(&selection).is_err());
+            assert_eq!(COUNTS.with(Cell::get), (1, 0, 1, true));
+            COUNTS.with(|state| state.set((1, 0, 1, false)));
+            assert_eq!(codec.encode(&selection).unwrap(), [7]);
+            assert_eq!(COUNTS.with(Cell::get), (1, 0, 2, false));
+            drop(selection);
+            assert_eq!(COUNTS.with(Cell::get), (1, 1, 2, false));
+
+            let transferred = NonNull::new(unsafe { decode([9].as_ptr(), 1) }).unwrap();
+            let adopted = unsafe { codec.adopt_owned_handle(transferred) };
+            assert_eq!(COUNTS.with(Cell::get), (2, 1, 2, false));
+            drop(adopted);
+            assert_eq!(COUNTS.with(Cell::get), (2, 2, 2, false));
+        }
+        assert_eq!(COUNTS.with(Cell::get), (2, 2, 2, false));
+    }
     unsafe extern "C" fn decode_fixture(bytes: *const u8, count: isize) -> *mut c_void {
         if count != 1 || bytes.is_null() {
             return std::ptr::null_mut();
