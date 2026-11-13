@@ -142,6 +142,18 @@ impl SelectionCodec for NativeCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn provider_table_has_c_pointer_slots_in_declared_order() {
+        use std::mem::{align_of, offset_of, size_of};
+        type Entry = unsafe extern "C" fn();
+        let slot = size_of::<Entry>();
+        assert_eq!(size_of::<NativeApi>(), 4 * slot);
+        assert_eq!(align_of::<NativeApi>(), align_of::<Entry>());
+        assert_eq!(offset_of!(NativeApi, decode), 0);
+        assert_eq!(offset_of!(NativeApi, encode), slot);
+        assert_eq!(offset_of!(NativeApi, equal), 2 * slot);
+        assert_eq!(offset_of!(NativeApi, release), 3 * slot);
+    }
     unsafe extern "C" fn decode_fixture(bytes: *const u8, count: isize) -> *mut c_void {
         if count != 1 || bytes.is_null() {
             return std::ptr::null_mut();
