@@ -126,6 +126,60 @@ impl SelectionCodec for NativeCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    unsafe extern "C" fn decode_fixture(bytes: *const u8, count: isize) -> *mut c_void {
+        if count != 1 || bytes.is_null() {
+            return std::ptr::null_mut();
+        }
+        Box::into_raw(Box::new(unsafe { *bytes })).cast()
+    }
+    unsafe extern "C" fn encode_fixture(
+        handle: *mut c_void,
+        context: *mut c_void,
+        sink: Sink,
+    ) -> i32 {
+        unsafe { sink(context, handle.cast(), 1) }
+    }
+    unsafe extern "C" fn equal_fixture(a: *mut c_void, b: *mut c_void) -> i32 {
+        i32::from(unsafe { *a.cast::<u8>() == *b.cast::<u8>() })
+    }
+    unsafe extern "C" fn release_fixture(handle: *mut c_void) {
+        drop(unsafe { Box::from_raw(handle.cast::<u8>()) });
+    }
+    #[test]
+    fn runtime_callsite_roundtrips_owned_provider_and_reopens_disk() {
+        let api = NativeApi {
+            decode: decode_fixture,
+            encode: encode_fixture,
+            equal: equal_fixture,
+            release: release_fixture,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "ios-native-consumer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("selection.ron");
+        // Synthetic provider implements this header's contract, not Apple ABI.
+        let codec = unsafe { NativeCodec::from_verified_api(api) };
+        let selected = codec.decode(&[7]).unwrap();
+        let (mut session, initial) =
+            unsafe { crate::ios_runtime::open_native_selection(path.clone(), api) }.unwrap();
+        assert!(initial.is_none());
+        session.commit(&selected).unwrap();
+        drop(session);
+        let (session, restored) =
+            unsafe { crate::ios_runtime::open_native_selection(path.clone(), api) }.unwrap();
+        assert!(restored.as_ref().is_some_and(|value| value == &selected));
+        drop(restored);
+        drop(selected);
+        drop(session);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(root.join("selection.ron.owner-lock")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
     #[test]
     fn transfer_copies_and_rejects_duplicate_or_missing_bytes() {
         let mut transfer = Transfer {

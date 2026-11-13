@@ -1,5 +1,20 @@
 use crate::ControlApp;
 
+/// Candidate Runtime callsite. The caller must admit the compiled provider ABI
+/// and main-thread/image lifetime before supplying its function table. Ordinary
+/// startup does not call this while Apple linkage remains unverified.
+#[allow(dead_code)]
+pub(crate) unsafe fn open_native_selection(
+    path: std::path::PathBuf,
+    api: crate::ios_selection_bridge::NativeApi,
+) -> std::io::Result<(
+    crate::ios_selection_storage::RuntimeSelectionStore<crate::ios_selection_bridge::NativeCodec>,
+    Option<crate::ios_selection_bridge::NativeSelection>,
+)> {
+    let codec = unsafe { crate::ios_selection_bridge::NativeCodec::from_verified_api(api) };
+    crate::ios_selection_storage::RuntimeSelectionStore::open(path, codec)
+}
+
 fn create_app(context: &eframe::CreationContext<'_>) -> ControlApp {
     ControlApp::new(context, None)
 }
