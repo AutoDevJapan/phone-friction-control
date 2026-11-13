@@ -10,14 +10,24 @@ encodes, decodes, compares the decoded selection, and only then saves. An
 uncertain write blocks the existing instance; reconstruction requires another
 read and successful decode.
 
-Not connected: the native implementation of the Rust codec trait, Data/NSData
-cross-language ownership bridge, build/link configuration and Runtime picker
-callsite. No foreign signature is inferred from the Swift source. The current
-Runtime remains unchanged and cannot select, monitor or shield applications.
+The candidate C bridge owns Swift Selection handles and synchronously copies
+encoded bytes into Rust. The Rust codec consumer and Runtime session use a
+verified-provider function table. `SelectionPickerModel` wires the existing
+system Picker setter to a consuming commit callback, retaining the new Swift
+value only after successful publication. The callback must consume the handle
+on every result; the embedding owner must outlive every copied Binding.
+
+Not connected: build/link configuration, verified provider admission, actual
+app hosting and lifetime ownership. No ordinary Runtime startup enables these
+candidates; it cannot select, monitor or shield applications yet.
 
 Required Apple validation: compile these sources and tests with the same pinned
 SDK as the native Selection host; inspect the actual encode/decode and Data
-lowering before introducing a Rust foreign call. Then run a nonempty selected
+lowering before introducing a Rust foreign call. Generate the Swift Objective-C
+header with `-emit-objc-header` and compare the exported C declarations and
+integer widths with SelectionBridge.h and NativeApi; compilation must reject
+any mismatch. This is an existing compiler-job dependency, not permission to
+change workflow authentication or enable untested calls. Then run a nonempty selected
 value through encode, decode/equality, checked publication, termination and
 restoration. Empty-selection and synthetic host tests cannot replace that run.
 
