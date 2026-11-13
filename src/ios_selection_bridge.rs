@@ -181,6 +181,47 @@ mod tests {
         // Synthetic provider implements this header's contract, not Apple ABI.
         let codec = unsafe { NativeCodec::from_verified_api(api) };
         let selected = codec.decode(&[7]).unwrap();
+        let encoded_path = path.to_str().unwrap().as_bytes();
+        let ffi = unsafe {
+            crate::ios_selection_session_ffi::pfc_selection_session_open(
+                encoded_path.as_ptr(),
+                encoded_path.len() as isize,
+                &api,
+            )
+        };
+        assert!(!ffi.is_null());
+        let mut transfer = Transfer {
+            bytes: None,
+            rejected: false,
+        };
+        assert_eq!(
+            unsafe {
+                crate::ios_selection_session_ffi::pfc_selection_session_restored(
+                    ffi,
+                    (&mut transfer as *mut Transfer).cast(),
+                    Some(copy_bytes),
+                )
+            },
+            1
+        );
+        let owned = unsafe { decode_fixture([7].as_ptr(), 1) };
+        assert_eq!(
+            unsafe { crate::ios_selection_session_ffi::pfc_selection_session_commit(ffi, owned) },
+            0
+        );
+        assert_eq!(
+            unsafe {
+                crate::ios_selection_session_ffi::pfc_selection_session_restored(
+                    ffi,
+                    (&mut transfer as *mut Transfer).cast(),
+                    Some(copy_bytes),
+                )
+            },
+            0
+        );
+        assert_eq!(transfer.bytes, Some(vec![7]));
+        unsafe { crate::ios_selection_session_ffi::pfc_selection_session_release(ffi) };
+        std::fs::remove_file(&path).unwrap();
         let mut runtime =
             unsafe { crate::ios_runtime::NativeSelectionSession::open(path.clone(), api) }.unwrap();
         assert!(runtime.selection().is_none());
