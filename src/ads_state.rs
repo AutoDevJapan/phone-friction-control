@@ -279,6 +279,69 @@ mod tests {
     }
 
     #[test]
+    fn every_inflight_stage_stays_canceled_when_old_results_arrive() {
+        for stage in [
+            Stage::Update,
+            Stage::Form,
+            Stage::Check,
+            Stage::Init,
+            Stage::Ready,
+            Stage::Loading,
+            Stage::Shown,
+            Stage::PrivacyUpdate,
+            Stage::PrivacyForm,
+        ] {
+            let mut m = Manager::<()>::new();
+            m.begin(stage);
+            m.view = Some(());
+            let old = m.epoch;
+            assert!(matches!(m.step(false, SLOT), Step::Cleanup(())));
+            for event in [
+                Event::UpdateOk,
+                Event::UpdateFailed,
+                Event::Dismissed { error: false },
+                Event::Dismissed { error: true },
+                Event::Loaded,
+                Event::LoadFailed,
+            ] {
+                m.event(old, event);
+            }
+            m.checked(old, true);
+            m.init_done(true);
+            assert_eq!(m.stage, Stage::Idle, "canceled {stage:?}");
+            assert!(m.view.is_none());
+            assert_eq!(next(&mut m), None, "returning home is not a new request");
+        }
+    }
+
+    #[test]
+    fn duplicate_consent_results_do_not_queue_another_load() {
+        let mut m = Manager::<()>::new();
+        m.begin(Stage::Update);
+        assert_eq!(next(&mut m), Some(Op::Update));
+        assert_eq!(next(&mut m), None);
+        m.event(m.epoch, Event::UpdateOk);
+        assert_eq!(next(&mut m), Some(Op::Form { privacy: false }));
+        m.event(m.epoch, Event::UpdateOk);
+        assert_eq!(next(&mut m), None);
+        m.event(m.epoch, Event::Dismissed { error: false });
+        assert_eq!(next(&mut m), Some(Op::Check));
+        m.checked(m.epoch, true);
+        assert_eq!(next(&mut m), Some(Op::Init));
+        m.checked(m.epoch, true);
+        assert_eq!(next(&mut m), None);
+        m.init_done(true);
+        place(&mut m);
+        m.init_done(true);
+        m.event(m.epoch, Event::Dismissed { error: false });
+        m.event(m.epoch, Event::UpdateOk);
+        assert_eq!(m.stage, Stage::Loading);
+        assert_eq!(next(&mut m), None);
+        m.event(m.epoch, Event::Loaded);
+        assert_eq!(next(&mut m), None);
+    }
+
+    #[test]
     fn consent_error_or_denial_never_initializes_or_loads() {
         let mut m = Manager::<()>::new();
         m.begin(Stage::Update);
