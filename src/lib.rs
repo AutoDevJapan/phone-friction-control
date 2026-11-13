@@ -5,6 +5,9 @@ mod app;
 mod ios_runtime;
 #[cfg(any(target_os = "ios", all(test, not(target_os = "android"))))]
 #[allow(dead_code)]
+mod ios_selection_bridge;
+#[cfg(any(target_os = "ios", all(test, not(target_os = "android"))))]
+#[allow(dead_code)]
 mod ios_selection_storage;
 #[cfg(target_os = "ios")]
 pub use ios_runtime::run as run_ios_runtime;
