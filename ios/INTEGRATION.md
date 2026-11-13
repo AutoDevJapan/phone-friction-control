@@ -34,3 +34,30 @@ restoration. Empty-selection and synthetic host tests cannot replace that run.
 Local Swift compiler and Apple runtime validation have not been performed.
 The existing authentication stop and workflow permission restriction remain in
 effect. These source candidates do not establish an additional build service.
+
+## Compiler handoff
+
+Fixed implementation input: commit
+`19b537d045130a4a7087a2d70a2bfaddc2231f2c` (parent `1a61336f`).
+Use the tracked source bytes and Cargo.lock from that commit, not a working-tree
+copy. Swift inputs are SelectionCodec.swift, SelectionBridge.swift,
+SelectionPicker.swift and SelectionCodecTests.swift. C inputs are
+SelectionBridge.h and SelectionBridgeABI.c. Rust consumers are
+src/ios_selection_bridge.rs, src/ios_selection_storage.rs and src/ios_runtime.rs.
+
+The existing authorized Apple compiler job must preserve compiler/SDK versions,
+target triple, source hashes, full diagnostics, generated Objective-C header,
+exported symbol list and its exact command lines. Typecheck production Swift
+inputs first, then compile the test input in the same module; compile a C
+translation unit against the actual generated declarations as well as the
+handwritten header. If C exports are absent from the generated header, report
+that absence and retain compiler IR/C export definitions rather than claiming
+a comparison succeeded. No such compiler job has run for this candidate.
+
+Connection gap: RuntimeSelectionPicker invokes an injected Swift closure, while
+NativeSelectionSession consumes a Rust owned handle. No app embedding currently
+supplies that closure with a verified provider/session lifetime. No linked C
+symbol resolver or raw Rust session pointer is enabled. The app owner must keep
+the session alive through all Binding copies, close callbacks before teardown,
+then demonstrate restoration using the real codec. Source unit tests with a
+synthetic provider do not certify that embedding or the native destructor path.
