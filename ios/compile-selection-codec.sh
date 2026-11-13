@@ -42,6 +42,27 @@ run_bounded ir xcrun swiftc "${ARGS[@]}" -emit-ir "${INPUTS[@]}" \
 run_bounded c xcrun clang -target "$TARGET" -isysroot "$SDK" -fsyntax-only \
   -std=c11 -Wall -Wextra -Werror ios/SelectionBridgeABI.c \
   > "$OUT/c.stdout.txt" 2> "$OUT/c.stderr.txt"
-# Generated-header export presence is an observation, not assumed ABI proof.
-grep -n 'pfc_selection_' "$OUT/PFCSelection-Swift.h" > "$OUT/generated-c-exports.txt" || true
-printf 'swift_typecheck=true\nlinked=false\nruntime_executed=false\n' > "$OUT/result.txt"
+# A header without C exports is not an ABI comparison. Stop honestly rather
+# than treating the handwritten-header syntax check as generated ABI evidence.
+for SYMBOL in decode encode equal release; do
+  if ! grep -Eq "pfc_selection_${SYMBOL}[[:space:]]*\\(" "$OUT/PFCSelection-Swift.h"; then
+    printf 'swift_typecheck=true\ngenerated_abi_compared=false\nreason=generated_export_missing\n' > "$OUT/result.txt"
+    exit 1
+  fi
+done
+printf '#include "%s/PFCSelection-Swift.h"\n#include "%s/ios/SelectionBridgeABI.c"\n' \
+  "$OUT" "$ROOT" > "$OUT/generated-consumer.m"
+run_bounded generated_abi xcrun clang -target "$TARGET" -isysroot "$SDK" \
+  -fsyntax-only -x objective-c -Wall -Wextra -Werror "$OUT/generated-consumer.m" \
+  > "$OUT/generated-abi.stdout.txt" 2> "$OUT/generated-abi.stderr.txt"
+# Non-vacuous rejection control using the same actual generated declarations.
+printf '#include "%s/PFCSelection-Swift.h"\nvoid pfc_selection_decode(void);\n' \
+  "$OUT" > "$OUT/generated-mismatch.m"
+if run_bounded signature_negative xcrun clang -target "$TARGET" -isysroot "$SDK" \
+  -fsyntax-only -x objective-c -Wall -Wextra -Werror "$OUT/generated-mismatch.m" \
+  > "$OUT/signature-negative.stdout.txt" 2> "$OUT/signature-negative.stderr.txt"; then
+  echo 'signature mismatch unexpectedly accepted' >&2
+  exit 1
+fi
+grep -Eq 'conflicting types|conflicting.*declaration' "$OUT/signature-negative.stderr.txt"
+printf 'swift_typecheck=true\ngenerated_abi_compared=true\nsignature_negative_rejected=true\nlinked=false\nruntime_executed=false\n' > "$OUT/result.txt"
