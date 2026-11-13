@@ -46,6 +46,13 @@ run_bounded tests xcrun swiftc "${ARGS[@]}" -typecheck "${INPUTS[@]}" ios/Select
 run_bounded ir xcrun swiftc "${ARGS[@]}" -emit-ir "${INPUTS[@]}" \
   -emit-objc-header-path "$OUT/PFCSelection-Swift.h" -o "$OUT/selection.ll" \
   > "$OUT/ir.stdout.txt" 2> "$OUT/ir.stderr.txt"
+run_bounded object xcrun swiftc "${ARGS[@]}" -whole-module-optimization -emit-object "${INPUTS[@]}" \
+  -o "$OUT/selection.o" > "$OUT/object.stdout.txt" 2> "$OUT/object.stderr.txt"
+run_bounded symbols xcrun nm -gU "$OUT/selection.o" \
+  > "$OUT/exported-symbols.txt" 2> "$OUT/symbols.stderr.txt"
+for SYMBOL in decode encode equal release; do
+  grep -Eq "[[:space:]]_pfc_selection_${SYMBOL}$" "$OUT/exported-symbols.txt"
+done
 run_bounded c xcrun clang -target "$TARGET" -isysroot "$SDK" -fsyntax-only \
   -std=c11 -Wall -Wextra -Werror ios/SelectionBridgeABI.c \
   > "$OUT/c.stdout.txt" 2> "$OUT/c.stderr.txt"

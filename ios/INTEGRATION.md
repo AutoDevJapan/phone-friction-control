@@ -37,12 +37,13 @@ effect. These source candidates do not establish an additional build service.
 
 ## Compiler handoff
 
-Reviewed implementation input: commit
-`645780a8068e0685f02cd51f5d58ce84ddd39277`. The driver at that version
-does not yet enforce generated-header ABI comparison; its success must not be
-accepted as completion of the compiler contract below.
-Use the tracked source bytes and Cargo.lock from that commit, not a working-tree
-copy. Swift inputs are SelectionCodec.swift, SelectionBridge.swift,
+Historical input `645780a8068e0685f02cd51f5d58ce84ddd39277` lacked generated
+ABI comparison and is not an executable acceptance input. The current compiler
+input is the full product commit and driver blob asserted by the SDK caller;
+after each repair both caller pins must be updated before execution. SDK896
+still pins the older cbff version and must not be run as acceptance of repairs.
+Use tracked source bytes and Cargo.lock from that caller-pinned commit, not a
+working-tree copy. Swift inputs are SelectionCodec.swift, SelectionBridge.swift,
 SelectionPicker.swift, SelectionEmbedding.swift, SelectionSessionAdapter.swift
 and SelectionCodecTests.swift. C inputs are SelectionBridge.h,
 SelectionSession.h and SelectionBridgeABI.c. Rust consumers are
