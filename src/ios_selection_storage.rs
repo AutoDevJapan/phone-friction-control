@@ -44,12 +44,16 @@ impl<C: SelectionCodec> RuntimeSelectionStore<C> {
             .ok_or_else(|| std::io::Error::other("missing filename"))?;
         let mut lock_name = name.to_os_string();
         lock_name.push(".owner-lock");
-        let ownership = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(parent.join(lock_name))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_SHARE_READ | FILE_SHARE_WRITE, deliberately no DELETE.
+            // Keep the locked directory entry pinned throughout the session.
+            options.share_mode(0x1 | 0x2);
+        }
+        let ownership = options.open(parent.join(lock_name))?;
         ownership.try_lock().map_err(std::io::Error::other)?;
         let store = SelectionStore::open(path)?;
         let restored = store.restore(|bytes| codec.decode(bytes))?;
@@ -238,6 +242,8 @@ mod tests {
         let path = root.join("selection.ron");
         let (mut session, initial) = RuntimeSelectionStore::open(path.clone(), Codec).unwrap();
         assert_eq!(initial, None);
+        #[cfg(windows)]
+        assert!(std::fs::remove_file(root.join("selection.ron.owner-lock")).is_err());
         assert!(RuntimeSelectionStore::open(path.clone(), Codec).is_err());
         assert!(RuntimeSelectionStore::open(root.join(".").join("selection.ron"), Codec).is_err());
         session.commit(&7).unwrap();
