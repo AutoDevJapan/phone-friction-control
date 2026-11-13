@@ -7,6 +7,7 @@ pub(crate) type Sink = unsafe extern "C" fn(*mut c_void, *const u8, isize) -> i3
 /// Function table is admitted only after the compiled C/Swift ABI is verified.
 /// Supplying a table is unsafe: all entries must obey SelectionBridge.h.
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub(crate) struct NativeApi {
     pub decode: unsafe extern "C" fn(*const u8, isize) -> *mut c_void,
     pub encode: unsafe extern "C" fn(*mut c_void, *mut c_void, Sink) -> i32,

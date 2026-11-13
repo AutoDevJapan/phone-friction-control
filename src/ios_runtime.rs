@@ -50,6 +50,17 @@ impl NativeSelectionSession {
     pub(crate) fn selection(&self) -> Option<&crate::ios_selection_bridge::NativeSelection> {
         self.selection.as_ref()
     }
+
+    pub(crate) fn encoded_selection(&self) -> std::io::Result<Option<Vec<u8>>> {
+        use crate::ios_selection_storage::SelectionCodec;
+        if self.recovery_required {
+            return Err(std::io::Error::other("Selection recovery required"));
+        }
+        self.selection
+            .as_ref()
+            .map(|value| self.codec.encode(value))
+            .transpose()
+    }
 }
 
 /// Candidate Runtime callsite. The caller must admit the compiled provider ABI
