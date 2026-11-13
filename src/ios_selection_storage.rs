@@ -239,11 +239,13 @@ mod tests {
         let (mut session, initial) = RuntimeSelectionStore::open(path.clone(), Codec).unwrap();
         assert_eq!(initial, None);
         assert!(RuntimeSelectionStore::open(path.clone(), Codec).is_err());
+        assert!(RuntimeSelectionStore::open(root.join(".").join("selection.ron"), Codec).is_err());
         session.commit(&7).unwrap();
         drop(session);
         let (mut reopened, restored) = RuntimeSelectionStore::open(path.clone(), Codec).unwrap();
         assert_eq!(restored, Some(7));
         assert!(RuntimeSelectionStore::open(path.clone(), Codec).is_err());
+        assert!(RuntimeSelectionStore::open(root.join(".").join("selection.ron"), Codec).is_err());
         reopened.commit(&8).unwrap();
         drop(reopened);
         std::fs::write(&path, "[1,2]").unwrap();
