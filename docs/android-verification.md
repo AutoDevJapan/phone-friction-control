@@ -15,6 +15,22 @@ PR1のAndroid実装を確認した記録です。製品全体の完成を示す�
 
 この候補のインストール・起動・Test Ad表示・同意フォーム・保存復元・サービス制御は未実施です。クラスやシグネチャの包含は実行成功を証明せず、code20の通常30分/5分や旧code14のUMPエラー時の動作をcode21の受入へ置き換えません。同意メッセージは未公開のままで、候補画像の確認、実ID経路のTest Ad、ストア紐付け・審査・実配信・配布は別の残条件です。
 
+## HOME・ランチャー入口の修復と版の対応（2026-11-14整理）
+
+[Issue28](https://github.com/AutoDevJapan/phone-friction-control/issues/28)は、通常ランチャーで起動後に旧公開HOME入口へ移ると、同じプロセスで二つ目のNativeActivityを作り、イベントループの再作成に失敗する問題です。以下は既存の修復・受入結果の対応整理で、新しい端末検査の実施を意味しません。
+
+[PR29](https://github.com/AutoDevJapan/phone-friction-control/pull/29)でnative画面を`singleInstance`にしましたが、API26では旧HOME aliasからサービスの明示起動先へ移る経路に重複が残りました。[PR30](https://github.com/AutoDevJapan/phone-friction-control/pull/30)の固定ソース`f29101e2f1148e8193c4ae81282aaf13fd176d7c`は、公開名`android.app.NativeActivity`を非nativeの`ControlHomeActivity`へ転送し、そこから正規のnative画面を起動して転送画面を必ず終了します。転送画面を残した途中候補では、HOMEを通常ランチャーへ戻した後のBackで画面が再び開いたため、その失敗も最終結果と区別しています。
+
+| 経路・版 | 確認した結果と限界 |
+| --- | --- |
+| API26 x86_64、PR30署名候補0.4.2/code13 | 通常ランチャー→HOME→サービス起動先、HOME→ランチャー、旧公開名の明示起動、通常ランチャーをHOMEに戻した後のBackを確認。同じnative ActivityとPIDを保持し、Chrome選択・30分/5分・Usage許可・サービスBoundを保持。fontScale変更時は同PIDでOSのrelaunchと再描画を確認し、元の値へ戻した。個々のDestroy/Create時間は未計測 |
+| 通常版と広告版の生成入口 | 旧公開aliasは両方とも非native転送先を使い、生成classの明示先は通常版`ControlActivity`、広告版`ControlAdsActivity`。通常packのD8入力と広告packのclass出力に転送classを含める。24件のbridgeテストと必要CIが成功。生成・包含の確認は広告版の実行成功とは別 |
+| 後続code20、API37 x86_64 | 同じHOME転送処理を保持し、更新後に復帰する旧taskはlive UI所有taskへ戻す追加修復を含む。上書き更新・Back、4回の同PID再作成、設定復元・サービス接続の実受入は下記のcode20記録に限る。API26のPR30実測をcode20全経路の再実行とはしない |
+
+PR30候補のAPK SHA-256は、x86_64が`D61BE8AD392E3BF07D604E88B647C50533897DF1A82275E48894DDA3991533D0`、arm64-v8aが`1F3E6B793E5F477DCC93057594FB143C061EB11C0551536640BD17050476F1C4`です。変更のないnativeライブラリを使って再packした当時の未公開候補で、後続code20/21のAPKとは異なります。
+
+物理S24の旧候補で記録したloop-admission失敗は、Robo全体のSUCCESSで解消した扱いにしません。PR30の新manifest版・code20のHOME経路の物理ARM実行、API28–34の実挙動、通常インストーラー導入は未確認です。単一nativeイベントループのguardは維持し、hostテストやmanifestの指定だけで全端末の正常遷移を保証しません。
+
 ## code20の通常再生・休憩の追加受入（2026-11-12）
 
 下記の広告なし `0.4.3-recovery-candidate` / code20のx86_64署名APKを変更せず、API37の専用仮想端末で確認しました。端末に導入したAPK全体のSHA-256は `C57A71745B74B82C231B925771506E60D0EDE5BDD001A2D66A15F7D895A7703C` と一致しています。生成元は固定コミット `c966e4b` です。後続mainのiOS入口とCI専用変更を、このAPKの再生成や全ソースtree一致の証拠にはしません。
