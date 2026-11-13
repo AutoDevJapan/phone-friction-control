@@ -10,6 +10,8 @@ final class SelectionCodecTests: XCTestCase {
         let encoded = try SelectionCodec.encode(value)
         XCTAssertFalse(encoded.isEmpty)
         XCTAssertEqual(try SelectionCodec.decode(encoded), value)
+        let bridged = try SelectionCodec.encodeNSData(value)
+        XCTAssertEqual(try SelectionCodec.decode(bridged), value)
     }
 
     func testInvalidSavedDataDoesNotPublishDefaults() {

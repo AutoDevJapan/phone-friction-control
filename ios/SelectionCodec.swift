@@ -18,6 +18,22 @@ enum SelectionCodec {
         try JSONDecoder().decode(FamilyActivitySelection.self, from: data)
     }
 
+    /// Copy synchronously from the public Objective-C bridge. This also avoids
+    /// retaining mutable NSData subclasses as the source of future decoding.
+    static func decode(_ data: NSData) throws -> FamilyActivitySelection {
+        let owned = Data(bytes: data.bytes, count: data.length)
+        return try decode(owned)
+    }
+
+    /// The returned object owns its bytes; consumers must retain the object,
+    /// rather than keep its `bytes` pointer beyond the object's lifetime.
+    static func encodeNSData(_ selection: FamilyActivitySelection) throws -> NSData {
+        let data = try encode(selection)
+        return data.withUnsafeBytes { bytes in
+            NSData(bytes: bytes.baseAddress, length: bytes.count)
+        }
+    }
+
     enum CodecError: Error {
         case roundtripMismatch
         case recoveryRequired
