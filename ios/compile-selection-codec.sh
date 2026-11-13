@@ -19,7 +19,7 @@ INPUTS=(ios/SelectionCodec.swift ios/SelectionBridge.swift ios/SelectionPicker.s
   ios/SelectionEmbedding.swift ios/SelectionSessionAdapter.swift)
 shasum -a 256 "${INPUTS[@]}" ios/SelectionSession.h ios/SelectionBridge.h \
   ios/SelectionBridgeABI.c ios/SelectionCodecTests.swift \
-  ios/compile-selection-codec.sh Cargo.lock > "$OUT/inputs-sha256.txt"
+  ios/compile-selection-codec.sh ios/check-compiler-evidence.sh Cargo.lock > "$OUT/inputs-sha256.txt"
 ARGS=(-target "$TARGET" -sdk "$SDK" -swift-version 6 -parse-as-library
   -module-name PFCSelection -import-objc-header ios/SelectionSession.h)
 run_bounded() {
@@ -80,3 +80,4 @@ if run_bounded signature_negative xcrun clang -target "$TARGET" -isysroot "$SDK"
 fi
 grep -Eq 'conflicting types|conflicting.*declaration' "$OUT/signature-negative.stderr.txt"
 printf 'swift_typecheck=true\ngenerated_abi_compared=true\nsignature_negative_rejected=true\nlinked=false\nruntime_executed=false\n' > "$OUT/result.txt"
+bash ios/check-compiler-evidence.sh "$OUT"
