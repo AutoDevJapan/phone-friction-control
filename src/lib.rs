@@ -3,6 +3,9 @@ mod android_lifecycle;
 mod app;
 #[cfg(any(target_os = "ios", all(test, not(target_os = "android"))))]
 mod ios_runtime;
+#[cfg(any(target_os = "ios", all(test, not(target_os = "android"))))]
+#[allow(dead_code)]
+mod ios_selection_storage;
 #[cfg(target_os = "ios")]
 pub use ios_runtime::run as run_ios_runtime;
 #[cfg(all(feature = "ads-test", feature = "ads-production"))]
