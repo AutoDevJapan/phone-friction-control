@@ -255,7 +255,7 @@ mod tests {
             bytes: None,
             rejected: false,
         };
-        let mut source = vec![7, 8];
+        let mut source = [7, 8];
         let context = (&mut transfer as *mut Transfer).cast();
         assert_eq!(unsafe { copy_bytes(context, source.as_ptr(), 2) }, 0);
         source[0] = 9;
