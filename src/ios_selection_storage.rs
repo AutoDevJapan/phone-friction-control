@@ -35,6 +35,15 @@ impl<C: SelectionCodec> RuntimeSelectionStore<C> {
         path: std::path::PathBuf,
         codec: C,
     ) -> std::io::Result<(Self, Option<C::Selection>)> {
+        // StateStore reserves the sibling `.pending` name for atomic staging.
+        // Restrict this consumer to `.ron` state files so another admitted
+        // Selection session cannot use that staging pathname as its own state.
+        if path.extension() != Some(std::ffi::OsStr::new("ron")) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Selection state requires a .ron pathname",
+            ));
+        }
         let parent = path
             .parent()
             .ok_or_else(|| std::io::Error::other("missing parent"))?;
@@ -240,6 +249,8 @@ mod tests {
         ));
         std::fs::create_dir(&root).unwrap();
         let path = root.join("selection.ron");
+        assert!(RuntimeSelectionStore::open(root.join("selection.pending"), Codec).is_err());
+        assert!(!root.join("selection.pending").exists());
         let (mut session, initial) = RuntimeSelectionStore::open(path.clone(), Codec).unwrap();
         assert_eq!(initial, None);
         #[cfg(windows)]
