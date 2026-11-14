@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fall back once to official Ubuntu archives with the existing signing keys.
+# Fall back once after a primary index error, with the existing signing keys.
 # Keep the hosted runner's source files and third-party repositories unchanged.
 set -euo pipefail
 if (( $# == 0 )); then
@@ -21,7 +21,31 @@ esac
 keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
 [[ -r "$keyring" ]] || { printf 'Ubuntu archive keyring is missing\n' >&2; exit 2; }
 sources="$(mktemp)"
-trap 'rm -- "$sources"' EXIT
+phase=preparation
+phase_active=false
+collection_unknown=false
+cleanup_sources() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  if [[ "$phase_active" == true || "$collection_unknown" == true ]]; then
+    # A timeout/signal status cannot establish that APT's descendants drained.
+    # The outer job owner must reconcile that flight; do not reuse or unlink
+    # its source file, signal an old numeric PID, or start another APT command.
+    printf 'source_cleanup=retained ownership=unknown phase=%s source_file=%q next_owner=outer-job\n' \
+      "$phase" "$sources" >&2
+  else
+    rm -- "$sources" || { if (( status == 0 )); then status=1; fi; }
+  fi
+  exit "$status"
+}
+on_signal() {
+  collection_unknown=true
+  exit "$1"
+}
+trap cleanup_sources EXIT
+trap 'on_signal 129' HUP
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 architecture=$(dpkg --print-architecture)
 case "$architecture" in
   amd64|i386)
@@ -54,24 +78,53 @@ apt_options=(
 )
 root=()
 if (( EUID != 0 )); then root=(sudo); fi
-install_from_current_source() {
-  timeout --kill-after=10s 180s "${root[@]}" apt-get "${apt_options[@]}" update || return $?
-  timeout --kill-after=10s 600s "${root[@]}" apt-get "${apt_options[@]}" install --yes "$@"
+run_apt_phase() {
+  phase=$1
+  local limit=$2
+  local ownership=command-returned
+  shift 2
+  phase_active=true
+  apt_status=0
+  timeout --kill-after=10s "$limit" "${root[@]}" apt-get "${apt_options[@]}" "$@" || apt_status=$?
+  case "$apt_status" in
+    0|100) phase_active=false ;;
+    *) collection_unknown=true; ownership=unknown ;;
+  esac
+  # 0/100 describe the monitored command, not whole-job/descendant collection.
+  # Only ordinary APT completion (0/100) is classified here. In particular,
+  # 124/125/126/127/137 and signal statuses are not child-collection receipts.
+  printf 'phase=%s command_status=%s ownership=%s\n' \
+    "$phase" "$apt_status" "$ownership" >&2
+  return "$apt_status"
 }
 primary_url=https://mirrors.edge.kernel.org/ubuntu/
 write_sources "$primary_url" "$primary_url"
 printf 'Ubuntu dependency archive: %s, suite=%s, architecture=%s\n' \
   "$primary_url" "$VERSION_CODENAME" "$architecture"
-if install_from_current_source "$@"; then
+selected_source=primary
+if run_apt_phase primary-update 180s update; then
   :
 else
-  printf 'Primary Ubuntu acquisition failed; using official archives once\n' >&2
+  status=$?
+  if [[ "$collection_unknown" == true ]]; then exit "$status"; fi
+  printf 'Primary Ubuntu update failed; using official archives once\n' >&2
   write_sources "$archive_url" "$security_url"
+  selected_source=official
   printf 'Ubuntu dependency archive: %s, security=%s, suite=%s, architecture=%s\n' \
     "$archive_url" "$security_url" "$VERSION_CODENAME" "$architecture"
-  if ! install_from_current_source "$@"; then
-    printf 'Both Ubuntu acquisition paths failed\n' >&2
-    exit 100
+  if run_apt_phase official-update 180s update; then
+    :
+  else
+    status=$?
+    printf 'Official Ubuntu update failed\n' >&2
+    exit "$status"
   fi
+fi
+if run_apt_phase "${selected_source}-install" 600s install --yes "$@"; then
+  :
+else
+  status=$?
+  printf 'Ubuntu installation failed; installation is not retried\n' >&2
+  exit "$status"
 fi
 dpkg-query -W -f='${Package}\t${Version}\t${Status}\n' "$@"
