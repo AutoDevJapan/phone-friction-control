@@ -24,6 +24,9 @@ jobs:
           components: rustfmt, clippy
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
+      - name: Check Ubuntu dependency recovery controls
+        if: runner.os == 'Linux'
+        run: bash tools/test-install-ubuntu-deps.sh
       - name: Linux window libraries
         if: runner.os == 'Linux'
         run: bash tools/install-ubuntu-deps.sh libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev
