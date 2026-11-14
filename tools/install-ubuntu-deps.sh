@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Use one Ubuntu archive mirror with the distribution's existing signing keys.
+# Fall back once to official Ubuntu archives with the existing signing keys.
 # Keep the hosted runner's source files and third-party repositories unchanged.
 set -euo pipefail
 if (( $# == 0 )); then
@@ -22,11 +22,28 @@ keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
 [[ -r "$keyring" ]] || { printf 'Ubuntu archive keyring is missing\n' >&2; exit 2; }
 sources="$(mktemp)"
 trap 'rm -- "$sources"' EXIT
-for pocket in '' -updates -security -backports; do
-  printf 'deb [signed-by=%s] https://mirrors.edge.kernel.org/ubuntu/ %s%s main restricted universe multiverse\n' \
-    "$keyring" "$VERSION_CODENAME" "$pocket" >> "$sources"
-done
-chmod 644 "$sources"
+architecture=$(dpkg --print-architecture)
+case "$architecture" in
+  amd64|i386)
+    archive_url=https://archive.ubuntu.com/ubuntu/
+    security_url=https://security.ubuntu.com/ubuntu/
+    ;;
+  *)
+    archive_url=https://ports.ubuntu.com/ubuntu-ports/
+    security_url=$archive_url
+    ;;
+esac
+write_sources() {
+  local archive=$1 security=$2 pocket uri
+  : > "$sources"
+  for pocket in '' -updates -security -backports; do
+    uri=$archive
+    if [[ "$pocket" == -security ]]; then uri=$security; fi
+    printf 'deb [signed-by=%s] %s %s%s main restricted universe multiverse\n' \
+      "$keyring" "$uri" "$VERSION_CODENAME" "$pocket" >> "$sources"
+  done
+  chmod 644 "$sources"
+}
 apt_options=(
   -o "Dir::Etc::sourcelist=$sources"
   -o Dir::Etc::sourceparts=-
@@ -37,8 +54,24 @@ apt_options=(
 )
 root=()
 if (( EUID != 0 )); then root=(sudo); fi
+install_from_current_source() {
+  timeout --kill-after=10s 180s "${root[@]}" apt-get "${apt_options[@]}" update || return $?
+  timeout --kill-after=10s 600s "${root[@]}" apt-get "${apt_options[@]}" install --yes "$@"
+}
+primary_url=https://mirrors.edge.kernel.org/ubuntu/
+write_sources "$primary_url" "$primary_url"
 printf 'Ubuntu dependency archive: %s, suite=%s, architecture=%s\n' \
-  'https://mirrors.edge.kernel.org/ubuntu/' "$VERSION_CODENAME" "$(dpkg --print-architecture)"
-timeout --kill-after=10s 180s "${root[@]}" apt-get "${apt_options[@]}" update
-timeout --kill-after=10s 600s "${root[@]}" apt-get "${apt_options[@]}" install --yes "$@"
+  "$primary_url" "$VERSION_CODENAME" "$architecture"
+if install_from_current_source "$@"; then
+  :
+else
+  printf 'Primary Ubuntu acquisition failed; using official archives once\n' >&2
+  write_sources "$archive_url" "$security_url"
+  printf 'Ubuntu dependency archive: %s, security=%s, suite=%s, architecture=%s\n' \
+    "$archive_url" "$security_url" "$VERSION_CODENAME" "$architecture"
+  if ! install_from_current_source "$@"; then
+    printf 'Both Ubuntu acquisition paths failed\n' >&2
+    exit 100
+  fi
+fi
 dpkg-query -W -f='${Package}\t${Version}\t${Status}\n' "$@"
