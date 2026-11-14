@@ -55,7 +55,13 @@ final class SelectionCodecTests: XCTestCase {
         var original: Binding<FamilyActivitySelection>? = model!.binding
         var copy = original
 
-        copy!.wrappedValue = FamilyActivitySelection()
+        let initialFlag = copy!.wrappedValue.includeEntireCategory
+        let committed = FamilyActivitySelection(
+            includeEntireCategory: !initialFlag
+        )
+        XCTAssertNotEqual(committed.includeEntireCategory, initialFlag)
+        copy!.wrappedValue = committed
+        XCTAssertEqual(copy!.wrappedValue.includeEntireCategory, committed.includeEntireCategory)
         XCTAssertEqual(probe.commits, 1)
         XCTAssertEqual(probe.candidateReleaseCalls, 1)
         XCTAssertFalse(model!.recoveryRequired)
@@ -73,10 +79,15 @@ final class SelectionCodecTests: XCTestCase {
         original = nil
         XCTAssertNotNil(weakEmbedding)
         XCTAssertNotNil(weakModel)
-        XCTAssertEqual(copy!.wrappedValue, FamilyActivitySelection())
+        XCTAssertEqual(copy!.wrappedValue, committed)
 
         // A copied Binding can outlive close, but cannot use the retired session.
-        copy!.wrappedValue = FamilyActivitySelection()
+        let rejected = FamilyActivitySelection(
+            includeEntireCategory: !committed.includeEntireCategory
+        )
+        XCTAssertNotEqual(rejected.includeEntireCategory, committed.includeEntireCategory)
+        copy!.wrappedValue = rejected
+        XCTAssertEqual(copy!.wrappedValue.includeEntireCategory, committed.includeEntireCategory)
         XCTAssertEqual(probe.commits, 1)
         XCTAssertEqual(probe.invalidSessionUses, 0)
         XCTAssertEqual(probe.releases, 1)
@@ -150,15 +161,25 @@ final class SelectionCodecTests: XCTestCase {
         )
         defer { embedding.close() }
         let model = embedding.makePickerModel()
+        let initial = model.selection
+        let proposed = FamilyActivitySelection(
+            includeEntireCategory: !initial.includeEntireCategory
+        )
         let original = model.binding
         let copy = original
+        XCTAssertNotEqual(proposed.includeEntireCategory, initial.includeEntireCategory)
 
-        original.wrappedValue = FamilyActivitySelection()
+        original.wrappedValue = proposed
         XCTAssertTrue(model.recoveryRequired)
         XCTAssertEqual(probe.commits, 1)
         XCTAssertEqual(probe.candidateReleaseCalls, 1)
 
-        copy.wrappedValue = FamilyActivitySelection()
+        XCTAssertEqual(model.selection, initial)
+        XCTAssertEqual(original.wrappedValue.includeEntireCategory, initial.includeEntireCategory)
+
+        copy.wrappedValue = proposed
+        XCTAssertEqual(model.selection.includeEntireCategory, initial.includeEntireCategory)
+        XCTAssertEqual(copy.wrappedValue.includeEntireCategory, initial.includeEntireCategory)
         XCTAssertEqual(probe.commits, 1)
         XCTAssertEqual(probe.candidateReleaseCalls, 1)
         XCTAssertEqual(probe.releases, 0)
